@@ -627,7 +627,7 @@ def _cli() -> None:
     print("  ✓ 每个场景都能在事件里找到（不是幻觉）")
 
     # -- Day 2：重新检索，冷却是否生效 --
-    # 记忆切片必须像 pipeline_demo.build_plan_request() 那样**从 store 读**。
+    # 记忆切片必须像 loop.build_request() 那样**从 store 读**。
     # 这里曾经只传了 minutes/materials 就断言冷却会触发，结果断言失败 ——
     # 检索器看的是 req.refusal_counts，而测试从没往里放东西。
     # 测试数据必须自己经得起交叉核对（statemachine.py 的 soc-004 教训）。

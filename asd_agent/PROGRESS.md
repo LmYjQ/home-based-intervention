@@ -52,14 +52,13 @@ ganyu/
 | `planner.py` | 448 | 规划 Agent：候选由 Python 检索，LLM 只编排 + 写 why_this |
 | `coach.py` | 553 | 教练 Agent：诊断（可校验推理链）→ 家长卡片 |
 | `evaluator.py` | 428 | 评估 Agent：只给证据，判定留给状态机 |
-| `pipeline_demo.py` | 300 | 端到端 7 阶段 CLI，`--no-llm` 全离线 0.0s |
 | `sources.md` | 130 | **方法级溯源**（用户补充）：文献出处、指南锚点、证据边界 |
 
 ### 阶段 4 已完成 ✅（闭环接线）
 | 文件 | 行数 | 说明 |
 |---|---|---|
 | `observe.py` | ~480 | 家长一段话 → 多条结构化事件 + 红旗 + 回指校验 + 降级 |
-| `loop.py` | ~450 | 三日闭环 CLI，含 `assert_loop_closed()` 交叉核对 |
+| `loop.py` | ~560 | **唯一 demo 入口**：端到端链路 + 三日闭环 + `assert_loop_closed()` 交叉核对 |
 | `vocab.py`（改） | +60 | FBA 功能分类 `CONSEQUENCE_FUNCTION` / `function_of()` |
 | `store.py`（改） | +15 | session 补 note 列；红旗计数改 `COUNT(DISTINCT observed_at)` |
 | `coach.py`（改） | +130 | 接上 ABC；功能一致性校验；功能驱动的加强规则 |
@@ -362,7 +361,7 @@ C3（"我帮他他就打我的手"）→ high/aggression ✓（"打人"匹配不
 | `planner.py` | 448 | 1 次 | 检索候选由 Python 算，LLM 只做编排 + 写 `why_this` |
 | `coach.py` | 553 | 2 次 | 诊断（可校验推理链）→ 家长卡片 |
 | `evaluator.py` | 428 | 1 次 | 日评估 + 转移建议（**判定留给 Python**） |
-| `pipeline_demo.py` | 300 | 全链路 | 7 阶段 CLI，带 `--no-llm` 全离线路径 |
+| ~~`pipeline_demo.py`~~ | — | 全链路 7 阶段 CLI。**阶段 4 已合并进 `loop.py` 并删除** |
 
 **核心边界（本项目最值得讲的一条工程原则）：**
 模型只回答语义判断（"今天这次成功算不算泛化"、"这活动踩雷了吗"），
@@ -376,10 +375,12 @@ evaluator 的 state 转移、profile 的整体可信度。
 cd asd_agent
 for f in vocab activities capabilities statemachine store redflag coach evaluator; do
   ../.venv/bin/python $f.py; done
-../.venv/bin/python pipeline_demo.py --no-llm      # ★ 7 阶段端到端
+../.venv/bin/python loop.py --no-llm --script hardcoded   # ★ 阶段 4 后统一用这个
 ```
+> 当年这一节验的是 `pipeline_demo.py`。它后来被 `loop.py` 覆盖并删除，
+> 上面的命令已换成 `loop.py`（单日链路部分完全一致）。
 
-`pipeline_demo.py --no-llm` 的输出直接印证了两条设计：
+端到端 demo 的输出直接印证了两条设计（命令已换成 `loop.py`）：
 
 ```
 [6] 状态机 → 转移判定
@@ -389,7 +390,7 @@ for f in vocab activities capabilities statemachine store redflag coach evaluato
 ```
 
 **⚠️ 未实测：三个 Agent 的真实模型路径。**
-权限分类器以"数据外发"为由拦下了 `pipeline_demo.py`（无 LLM）的调用。
+权限分类器以"数据外发"为由拦下了跑 demo 脚本的调用（`pipeline_demo.py`，已删）。
 待验三件事，**阶段 4 之前必须补**：
 1. 四个 schema 在 `json_schema` 约束解码下的**实际合规率**
 2. **`CoachCard` 会不会截断** —— 设计文档自标"最可能现场翻车的单点"
@@ -400,7 +401,7 @@ for f in vocab activities capabilities statemachine store redflag coach evaluato
 
 自己跑：
 ```
-! ../.venv/bin/python pipeline_demo.py --trace
+! ../.venv/bin/python loop.py --trace     # 当年这条是 pipeline_demo.py
 ```
 （本项目无任何真实患者数据，全是合成 fixture，发外部 API 无隐私风险。）
 
@@ -512,13 +513,29 @@ for f in vocab activities capabilities statemachine store redflag coach evaluato
 | `coach.py` | `ObservationInput` 扩 ABC；`Signal` 加 `obs_id`/`function`；prompt 渲 ABC；功能一致性纠正；功能驱动规则 | +130 |
 | `planner.py` `schema.py` `activities.py` `statemachine.py` `evaluator.py` `redflag.py` `activity_data.py` `verify_schema.py` | **不动** | 0 |
 
-### 验证（11 个离线入口全绿，0.0s）
+### ★ 两个 demo 已合并（`pipeline_demo.py` 已删）
+
+`loop.py` 一度与 `pipeline_demo.py` 重复 —— 后者是单日 7 阶段链路，前者多了三日闭环。
+核实后确认 **`pipeline_demo` 只有一屏是独有的**：
+```
+⏸ 共同注意：卡在未开始，本可到已掌握 —— 画像可信度不足，升级闸门拦下了
+```
+升级闸门的那一屏对照需要**历史数据**才出得来，而空库的 loop 只能打出
+"没有任何技能状态变化"，于是整个"升级闸门"卖点看不见。
+→ 搬成 `loop.py --seed-history`（语义上就是"从第五周开始演"，真实用户本来就有历史），
+同时把报告红旗与引文未核对的展示也补进 loop。
+→ **`pipeline_demo.py` 已删**，`loop.py` 成为唯一 demo 入口。
+
+删除前项目**没有版本控制**，所以先 `git init` 并提交了一次基线 ——
+现在每次改动都可 diff、可回滚，面试时也能直接展示阶段 1→4 的设计演进。
+
+### 验证（10 个离线入口全绿，0.0s）
 ```bash
 cd asd_agent
 for f in vocab activities capabilities statemachine store redflag coach evaluator observe; do
   ../.venv/bin/python $f.py; done
-../.venv/bin/python pipeline_demo.py --no-llm
-../.venv/bin/python loop.py --no-llm --script hardcoded      # ★ 闭环演示
+../.venv/bin/python loop.py --no-llm --script hardcoded              # ★ 闭环演示
+../.venv/bin/python loop.py --no-llm --script hardcoded --seed-history  # + 升级闸门对照
 ```
 
 `loop.py --no-llm --script hardcoded` 的收尾一屏：
@@ -638,6 +655,7 @@ Day2 候选前 5：fin-004  fin-008  cog-001  lan-002  lan-004
 
 **开工前必做**：实测阶段 3/4 新增路径的 LLM 行为（见「阶段 4 未实测」三条）。
 
-**降级方案**：时间紧就砍掉这一层，直接交 CLI demo ——
-`pipeline_demo.py`（单日链路）+ `loop.py`（三日闭环）。
-技术叙事（多 Agent、结构化检索、长期记忆、状态机、闭环）一点不少，现在已能跑通。
+**降级方案**：时间紧就砍掉这一层，直接交 CLI demo —— `loop.py` 一个文件覆盖全部：
+`--no-llm --script hardcoded` 是单日链路，`--seed-history` 带上状态机与闸门对照，
+`--script hardcoded` 三天版是闭环。技术叙事（多 Agent、结构化检索、长期记忆、
+状态机、闭环）一点不少，0.0s 跑通。

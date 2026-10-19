@@ -116,10 +116,10 @@ class DayResult:
 def seed_demo_history(conn, child_id: str, confidence: float) -> int:
     """给这个孩子灌一段"已经用了五周"的真实练习历史。
 
-    ★ 这一段是从 `pipeline_demo.py` 搬过来的。合并两个 demo 时，
-      它是 pipeline_demo **唯一**独有的一屏：
+    ★ 这一段原先在 `pipeline_demo.py` 里（已删，合并进本文件）。
+      它当时是那个 demo **唯一**独有的一屏：
           ⏸ 共同注意：卡在未开始，本可到已掌握 —— 画像可信度不足，升级闸门拦下了
-      那个对照需要历史数据才能出现，而空库的 loop 只���打出"没有任何技能状态变化"，
+      那个对照需要历史数据才能出现，而空库只��打出"没有任何技能状态变化"，
       于是"升级闸门"这个卖点整个看不见。
 
     语义上也说得通：真实用户用了几周之后当然是有历史的，
@@ -145,9 +145,9 @@ def seed_demo_history(conn, child_id: str, confidence: float) -> int:
 def build_request(conn, child_id: str, prof: AbilityProfile) -> PlanRequest:
     """把画像 + 状态机 + 记忆库拼成检索请求。**这是整个系统的接缝。**
 
-    刻意与 `pipeline_demo.build_plan_request()` 同构 —— 两处都必须从 store 读记忆，
-    曾经在这里只传 minutes/materials 就断言冷却会触发，断言直接失败
-    （检索器看的是 req.refusal_counts，而测试从没往里放东西）。
+    ★ 必须像 pipeline_demo 当年那样**从 store 读记忆**。
+      曾经在别处只传 minutes/materials 就断言冷却会触发，断言直接失败 ——
+      检索器看的是 req.refusal_counts，而那段测试从没往里放东西。
     """
     pc = prof.parent_constraints
     states = store.current_states(conn, child_id)
