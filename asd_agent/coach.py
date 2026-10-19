@@ -254,7 +254,8 @@ _ANALYSIS_SYSTEM = f"""你是一名自闭症儿童干预经验丰富的行为分
    你在描述观察说明了什么，不是在评判谁做得不对。"""
 
 
-def _analysis_user(observations: list[ObservationInput], cands: list[ScoredActivity]) -> str:
+def _analysis_user(observations: list[ObservationInput], cands: list[ScoredActivity],
+                   recent_summary: list[dict] | None = None) -> str:
     lines = ["【家长最近的观察记录（系统已结构化，你不必自己从头读一遍）】"]
     for o in observations:
         lines.append(f"[{o.obs_id}] 场景:{SCENE.get(o.scene, o.scene) or '未记录'}"
@@ -269,6 +270,23 @@ def _analysis_user(observations: list[ObservationInput], cands: list[ScoredActiv
     if not observations:
         lines.append("（今天没有新的观察记录 —— 这本身就是一条信息：他可能还没开始练，"
                      "或者上一条记录还在。impact 就选 keep。）")
+    if recent_summary:
+        # ★ 这是教练 Agent 第一次能读到"方向"，而不只是计数。
+        #   之前记忆切片只有 refusal_counts / recent_scenes / target_states
+        #   三个数字，教练只能看见"他昨天抗拒了 gro-007"，
+        #   看不见"精细动作连续三天没进展"这种整体判断。
+        lines += ["", "【最近几天的日结（这是系统对上几天的整体判断）】"]
+        for s in recent_summary[-3:]:
+            for d in s.get("domain_updates", []):
+                cn = ABILITY_DOMAIN.get(d.get("domain", ""), d.get("domain", ""))
+                arrow = {"up": "在往上走", "flat": "和平时差不多",
+                         "down": "在往下走"}.get(d.get("direction", ""), "")
+                lines.append(f"- {s.get('date','')} {cn} {arrow}"
+                             f"：{d.get('rationale','')}")
+            for f in s.get("flags", []):
+                lines.append(f"- {s.get('date','')} ⚠ {f}")
+            if s.get("parent_note"):
+                lines.append(f"- {s.get('date','')} 给家长的上一天总结：{s['parent_note']}")
     lines += ["", "【今天原本打算做的活动】"]
     for s in cands[:5]:
         lines.append(f"- {s.activity.brief()}  || {s.activity.title}")
@@ -504,8 +522,64 @@ def card_from_activity(activity: Activity, prefs: PreferenceSet = PreferenceSet(
                            "这不算失败",
         ),
         success_check=activity.success_criteria[:3],
-        record_prompt="做完记一下：他做到了几步、有没有不配合",
+        record_prompt=record_prompt_for(activity, len(steps)),
     )
+
+
+def record_prompt_for(activity: Activity, n_steps: int) -> str:
+    """这张卡片结束后请家长填什么。**由活动定义生成，不再是一句通用话。**
+
+    原先是一句静态的 `"做完记一下：他做到了几步、有没有不配合"`，
+    它对 50 条活动全都一样，所以家长面对"翻书找东西"和"踢罐子进门"
+    被问的是同一个问题。逐条反馈之后，家长端的输入是**结构化的**，
+    问题就必须具体到这条活动的判据 —— 否则家长得自己把"做到几步"
+    翻译成"这条活动的几步是什么意思"。
+
+    三个字段对应 `feedback.ActivityFeedback`：
+      结果    → activity.success_criteria[0]
+      提示层级 → len(activity.prompt_hierarchy)，取自活动自己的阶梯
+      做到几步 → n_steps（卡片上实际印了几步）
+
+    ★ 判据只出现一次。早先的写法把它在整句里重复了两遍
+      （"填「X」做没做到、X用了几级提示、几/N 步"），
+      一条判据 20 字就撑爆了 CoachCard 的 max_length=60 ——
+      "能在等待 5 秒内主动停下的比例明显提高"这种长判据直接 Pydantic 报错。
+      现在判据截断到 18 字且只说一次，剩下的用字段名表达。
+    """
+    crit = (activity.success_criteria or ["完成"])[0]
+    crit = crit if len(crit) <= 18 else crit[:17] + "…"
+    n_lvl = len(activity.prompt_hierarchy[:4]) or 4
+    return f"「{crit}」做没做到 · 用了几级提示(共{n_lvl}级) · 几步/{n_steps}"
+
+
+def render_feedback_form(activity: Activity, n_steps: int) -> str:
+    """家长端这一条活动的输入框。**CLI 版长这样，产品上它是一个卡片组件。**
+
+    ★ 为什么"结果"是四个按钮而不是一个输入框：
+      outcome 是状态机的直接输入（refused/skipped 都不进能力计算，
+      success/partial 进），让它可枚举就消除了"把不配合说成没做完"这一整类错误。
+      而"做到几步 / 用了几级提示"才是需要模型从自由文本里判断的部分 ——
+      所以它们分成「结构化选项」+「选填补充」两栏，而不是全塞进一个文本框。
+    """
+    crit = (activity.success_criteria or ["完成这条活动"])[0]
+    ladder = activity.prompt_hierarchy[:4] or ["不用提示", "手势提示", "示范", "动手辅助"]
+    L = [f"  活动：{activity.activity_id} {activity.title}",
+         f"  判断标准：{crit}",
+         "",
+         "  结果（点一个）：",
+         "    [独立做到]  [提示一下能做到]  [只做到一部分]  [不配合]",
+         "    [没做成 · 生病/太晚了]",
+         "",
+         "  用到第几级提示："]
+    L += [f"    {i}. {p}" for i, p in enumerate(ladder, 1)]
+    L += ["",
+          f"  做到几步：____ / {n_steps}",
+          "",
+          "  补充（选填，可以只写一句）：",
+          "    ________________________________",
+          "",
+          "  [跳过这条]"]
+    return "\n".join(L)
 
 
 # ================================================================== 主入口
@@ -516,9 +590,16 @@ def coach_today(
     observations: list[ObservationInput] | None = None,
     preferences: PreferenceSet | None = None,
     req: PlanRequest | None = None,
+    recent_summary: list[dict] | None = None,
     on_step=None,
 ) -> CoachOutcome:
-    """今天的家长卡片。**两步 LLM 调用；任一步失败都返回一张完整可用的卡片。**"""
+    """今天的家长卡片。**两步 LLM 调用；任一步失败都返回一张完整可用的卡片。**
+
+    recent_summary 是最近几天的日结（store.latest_summary）。
+    ★ 它只喂给 Step 1 诊断，不喂给 Step 2 出卡片 —— 出卡片要的是
+      "这条活动怎么做"，方向判断与它无关，混进去只会让 7B 写出
+      "因为他社交在进步所以今天做这个"这种倒因为果的话。
+    """
     observations = observations or []
     prefs = preferences or (req.preferences if req else PreferenceSet())
 
@@ -550,7 +631,7 @@ def coach_today(
         try:
             draft, t = llm.chat_json(
                 system=_ANALYSIS_SYSTEM,
-                user=_analysis_user(observations, cands),
+                user=_analysis_user(observations, cands, recent_summary),
                 model_cls=CoachAnalysis, name="coach_analysis",
                 stage="coach_analysis", max_tokens=1500,
                 timeout_s=llm.TIMEOUT_S * 2, on_step=on_step,

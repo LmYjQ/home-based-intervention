@@ -133,6 +133,20 @@ def _init(c: sqlite3.Connection) -> None:
         logged_at   TEXT NOT NULL,
         items       TEXT NOT NULL       -- JSON list
     );
+
+    -- 日结：能区方向 / 跨天异常 / 给家长的一句话。
+    -- ★ 这张表是"日结"第一次真正落地。原先 DomainEvidence / flags / parent_note
+    --   只在 DailyEval 里被 render() 打印，然后丢掉 —— 全项目无人消费、不落库。
+    --   也就是说，"今天整体在往哪走"这句话从头到尾没进过记忆。
+    --   现在它落库，明天的 build_request 会读（loop.build_request 的 recent_summary），
+    --   教练 Agent 第一次能拿到方向而不只是三个数字。
+    CREATE TABLE IF NOT EXISTS daily_summary (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        child_id    TEXT NOT NULL REFERENCES children(child_id),
+        on_date     TEXT NOT NULL,
+        payload     TEXT NOT NULL      -- DailySummary 的 JSON
+    );
+    CREATE INDEX IF NOT EXISTS idx_dsum_child ON daily_summary(child_id, on_date DESC);
     """)
 
 
@@ -367,6 +381,45 @@ def successes_outside_routine(conn: sqlite3.Connection, child_id: str) -> dict[s
         "WHERE child_id=? AND outcome='success' AND out_of_routine=1 GROUP BY activity_id",
         (child_id,)).fetchall()
     return {r["activity_id"]: r["n"] for r in rows}
+
+
+# ================================================================== 日结
+def save_summary(conn: sqlite3.Connection, child_id: str, summary) -> int:
+    """存一天的日结。summary 是 summary.DailySummary。
+
+    同一天可以有多条（重跑），取用时按 on_date 取 id 最大的一条 ——
+    与 ability_profile 同样的口径，不做 UPDATE。
+    """
+    with _LOCK:
+        cur = conn.execute(
+            "INSERT INTO daily_summary(child_id,on_date,payload) VALUES(?,?,?)",
+            (child_id, summary.date,
+             summary.model_dump_json() if hasattr(summary, "model_dump_json")
+             else json.dumps(summary, ensure_ascii=False)))
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def latest_summary(conn: sqlite3.Connection, child_id: str, *,
+                   days: int = 7, before: str | None = None) -> list[dict]:
+    """最近 N 天的日结，按日期升序。**纯 SQL，不调 LLM。**
+
+    before 用来排除"今天"：明天的教练 Agent 不该读到今天刚写的日结 ——
+    那等于用今天的结果去解释今天要做什么，方向反了。反馈影响的是明天。
+    """
+    end = before or date.today().isoformat()
+    start = (date.fromisoformat(end) - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        "SELECT on_date,payload FROM daily_summary WHERE child_id=? "
+        "AND on_date>=? AND on_date<? ORDER BY on_date, id",
+        (child_id, start, end)).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        try:
+            out.append(json.loads(r["payload"]))
+        except Exception:
+            continue
+    return out
 
 
 # ================================================================== 三个必需查询

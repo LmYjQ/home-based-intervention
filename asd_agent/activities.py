@@ -251,6 +251,13 @@ class PlanRequest:
     recent_scenes: list[str] = field(default_factory=list)        # 最近高频场景（来自记忆库）
     successes_outside_home: dict[str, int] = field(default_factory=dict)  # 泛化判定用
     preferences: PreferenceSet = field(default_factory=PreferenceSet)
+    # ★ 刻意**不参与打分**，只进教练 Agent 的 prompt。
+    #   它是"这周在往哪走"的语义判断，而打分全是可判定的计数 ——
+    #   把一段 LLM 写的话混进 0.30/0.15/0.14 那套权重里，
+    #   就等于把检索的正确性交给一个不可复现的字符串。
+    #   位置对了，它才有价值：让教练知道"精细动作连着三天没进展"，
+    #   然后由教练在**今天做什么**这一层体现调整。
+    recent_summary: list[dict] = field(default_factory=list)     # store.latest_summary
 
     def state_of(self, domain: str) -> str:
         return self.target_states.get(domain, "not_started")

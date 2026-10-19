@@ -57,11 +57,14 @@ ganyu/
 ### 阶段 4 已完成 ✅（闭环接线）
 | 文件 | 行数 | 说明 |
 |---|---|---|
-| `observe.py` | ~480 | 家长一段话 → 多条结构化事件 + 红旗 + 回指校验 + 降级 |
-| `loop.py` | ~560 | **唯一 demo 入口**：端到端链路 + 三日闭环 + `assert_loop_closed()` 交叉核对 |
+| `observe.py` | ~752 | 家长一段话 → 多条结构化事件 + 红旗 + 回指校验 + 降级。**（阶段 4b 改：加逐条模式的 `SYSTEM_SINGLE`，`refusal_sessions` 收敛到单条）** |
+| `loop.py` | ~801 | **唯一 demo 入口**：端到端链路 + **五日**闭环 + `assert_loop_closed()` 交叉核对 |
 | `vocab.py`（改） | +60 | FBA 功能分类 `CONSEQUENCE_FUNCTION` / `function_of()` |
 | `store.py`（改） | +15 | session 补 note 列；红旗计数改 `COUNT(DISTINCT observed_at)` |
-| `coach.py`（改） | +130 | 接上 ABC；功能一致性校验；功能驱动的加强规则 |
+| `coach.py`（改） | +130 | 接上 ABC；功能一致性校验；功能驱动的加强规则。**（阶段 4b 加 `render_feedback_form()`）** |
+
+> 阶段 4b 又新增了 `feedback.py` / `summary.py`，并把 `evaluator.py` 从 428 行砍到 166 行。
+> 详见下方「阶段 4b」一节。
 
 
 ---
@@ -366,7 +369,7 @@ C3（"我帮他他就打我的手"）→ high/aggression ✓（"打人"匹配不
 **核心边界（本项目最值得讲的一条工程原则）：**
 模型只回答语义判断（"今天这次成功算不算泛化"、"这活动踩雷了吗"），
 凡是可判定的（时长够不够、换哪条活动、该不该升级）全部交给 Python。
-同一��原则落在四处：planner 的时长与预算校验、coach 的 impact 落地、
+同一条原则落在四处：planner 的时长与预算校验、coach 的 impact 落地、
 evaluator 的 state 转移、profile 的整体可信度。
 
 ### 阶段 3 实测结果（**全部离线，0.0s，9 个入口全绿**）
@@ -625,6 +628,166 @@ Day2 候选前 5：fin-004  fin-008  cog-001  lan-002  lan-004
 **没有冷却期结束条件** —— 抗拒两次，这条活动一个月不再出现。
 对 demo 是好事（变化可见），对产品是缺陷。引入 `cooldown_until` 列
 属于改检索器语义，本阶段不做。
+
+---
+
+## 阶段 4b：家长反馈改成逐任务 + 日结接活 ✅（2026-10-19）
+
+### 为什么改（四个问题，同一个根因）
+
+家长原来用**一整段话**描述整天，由此暴露：
+
+1. **抗拒归属是无中生有的。** `observe.refusal_sessions(out, attempted_ids)`
+   收的是当天**计划**的全集，在其中做「事件 × 活动」的笛卡尔积匹配。
+   家长明说"今天玩一二三木头人"（只玩了 gro-007），fin-001 / gro-006 却各白得
+   1 次 refused 记录 —— 只因为它们恰好也含 `refusal` 且都在 `indoor_play`。
+   实测 4 条 refused session 里 **2 条是无中生有**。
+   当年（`observe.py:391`）把 `attempted_ids` 从可选改成必填是对的，
+   但**粒度选错了 —— 用"计划"而不是"执行"**。
+2. **质量信息被丢弃。** "后来我拉着他才停下"（成人的物理辅助 = 提示阶梯第 3 级）
+   会大幅降低 quality，"我一看都六点了就没再玩了"其实是 `skipped` 不是 `refused`
+   —— 两段都埋在长句子里被丢掉。
+3. **评估 Agent 在猜家长可以直接回答的问题。** `EvalActivityInput.materials` 的
+   注释写"降级模式靠它把家长的话对上活动"，而 `_fallback_eval` 实际只匹配
+   `title`/`activity_id` —— **这个字段从来没被读过**，注释与代码脱节。
+4. **日结结果对明天的计划零影响。** `DailyEval.domain_updates` / `.flags` /
+   `.parent_note` grep 全项目：**只被 `render()` 打印，无人消费、不落库**，
+   `store.py` 里没有 `daily_eval` 表。
+
+### 改成了什么
+
+家长端：**当天排了几条就逐条填几条**，每条是
+`结果（5 个按钮）+ 用到第几级提示 + 做到几步 + 选填自由补充`，
+外加一个当天的「其他观察」框。
+
+```
+【2026-10-17 的家长反馈】
+  gro-007 → refused（质量 0.00）      note=家长选「不配合」
+  fin-001 → skipped（质量 0.00）      note=家长选「跳过这条」
+  gro-006 → skipped（质量 0.00）
+```
+
+`refusal_counts = {'gro-007': 1}` —— **fin-001 / gro-006 是 0**。
+改动前这三者都会各记至少 1 次。
+
+### 评估 Agent 被拆成两半
+
+| 部分 | 原位置 | 现在 | 为什么 |
+|---|---|---|---|
+| **A. 逐活动判定**<br>outcome / quality / 判据命中 | `evaluator.py` | `feedback.py` | 家长**直接点选项**回答了这个问题。模型再猜一遍不只是浪费 token，是**把一个确定的答案变成一个可能有错的答案**（家长点了「不配合」，模型可能判成 partial） |
+| **B. 日级聚合**<br>能区方向 / 跨天 flags / 给家长一句话 | `evaluator.py`（**死代码**） | `summary.py` + **`daily_summary` 表** | 需要跨样本归纳，单条反馈推不出来。而且它原先只被 print 后丢弃 —— 现在真落库、真被读 |
+
+`evaluator.py` **428 行 → 184 行**，只留 `apply_transitions`
+（按 `target_skill_items` 反查技能归属的那套逻辑，一行没改）。
+被删掉的 `_repair` 四条校验里有三条是为 A 兜底的，逐条反馈下**物理上不可能发生**
+（不存在幻觉 id、不存在漏条、quality 由函数算）——
+它们那条"这个字段不能由模型自由裁量"的核心思路变成了 `feedback.quality_for()`
+里一张写死的映射表。**quality 从提示词里的自由裁量变成了确定性函数，可重放** ——
+原先同一档位不同天能差 0.15，而状态机的升级闸门要拿平均 quality 比 0.5 / 0.75。
+
+### 这次改动最值钱的一屏
+
+```
+★ 日结：这三天的方向判断落库了（改动前它们只被打印然后丢掉）
+  2026-10-15  大运动 ↓  今天1条都不配合
+  2026-10-16  精细动作 ↑  今天2条都做出来了
+  ...
+  ★ 明天 build_request 会读这些（recent_summary），
+    教练 Agent 第一次能拿到「方向」，而不只是三个数字。
+```
+
+`PlanRequest.recent_summary` 刻意**不参与打分**，只进教练 Step 1 诊断的 prompt ——
+它是 LLM 写的一段话，混进 0.30/0.15/0.14 那套权重就等于把检索的正确性
+交给一个不可复现的字符串。位置对了才有价值。
+
+### 演示从 3 天改成 5 天（冷却阈值的语义变了）
+
+逐条反馈下一条反馈**最多产生 1 条** refused session（家长已点「不配合」时
+`apply_feedbacks` 会跳过桥接，否则一次练习就够 `MAX_REFUSALS_PER_DAY=2`）。
+所以 `refusal_counts >= 2` 从"同一天两次"变成"**两天都拒**" ——
+临床上更合理（隔两天各拒一次才是真该换掉它的信号），
+代价是演示要多跑两天。冷却是这条链上最有说服力的一屏，值得。
+
+Day 4 第二次拒 gro-007 → Day 5：
+```
+【7】明天的候选（重新检索）
+  ★ 因家长反馈而退出候选：
+    ✗ gro-007 —— 没推荐：已连续抗拒 2 次，进入冷却期
+```
+
+### 新增/改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `feedback.py` **新** | `ActivityFeedback` + `apply_feedbacks` + `quality_for`（纯 Python，零 token） |
+| `summary.py` **新** | 日结 Agent，`DomainEvidence` 从 evaluator 搬来；`_repair` 三条校验 |
+| `store.py` | 新增 `daily_summary` 表 + `save_summary` / `latest_summary(before=)` |
+| `observe.py` | `extract_observations(activity=...)` + `SYSTEM_SINGLE`（规则 7/8 分支）；`refusal_sessions(activity_id: str \| None)` 去掉笛卡尔积 |
+| `evaluator.py` | 428 → 184 行，只留 `apply_transitions` + `TransitionsInput` |
+| `coach.py` | `record_prompt_for()` 按活动判据动态生成 + `render_feedback_form()`；诊断 prompt 读 `recent_summary` |
+| `activities.py` | `PlanRequest.recent_summary`（不参与打分） |
+| `loop.py` | `DayInput.feedbacks` 重构、5 天剧本、`run_day` 七步重排、`_hardcoded_outcome` 删除、两条新断言 |
+
+### 验证结果（全部通过）
+
+```bash
+cd asd_agent
+for f in activities observe store statemachine coach evaluator feedback summary planner; do
+  ../.venv/bin/python $f.py; done          # 12/12 OK
+../.venv/bin/python activities.py --validate   # ✓ 50 条
+../.venv/bin/python loop.py --no-llm --script hardcoded   # 0.0s
+```
+
+```
+✓ 0 天出现「重算结果与实际取用不一致」（检索是纯函数，正常应为 0）
+★ 3 天候选因家长反馈被剔除，其中 1 天进了冷却期
+★ 抗拒只记在家长亲手填过的那条活动上，「其他观察」框贡献 0 条
+★ 日结落库 5 行，且报的每个能区今天都真的练过
+```
+
+`record_prompt_for()` 对全部 50 条活动实测，最长 45 字，无一超 `max_length=60`。
+
+### 本阶段踩到的坑（已修，勿回退）
+
+1. **交叉核对的索引跨了两次重算。** 原断言比 `days[i-1].cands_in`（第 i 天开头）
+   与 `days[i].cands_tomorrow`（第 i+1 天结尾）—— 中间隔着两次重算，
+   于是三处该有的原因"全都查不到"。正确是 `days[i-1].cands_tomorrow` 对
+   `days[i].cands_in`：检索是纯函数，两者**本该相同**，
+   不同的部分必须能被 `days[i-1]` 的剔除清单解释。
+   （而它们恒等这件事本身是个**好消息**：证明第 7 步重算与第 1 步取用同一套逻辑。）
+
+2. **反查"冷却有没有依据"的对象换人了。** 原断言问"当天有没有事件归属到它" ——
+   那在旧形态下对，因为抗拒只从事件桥接来。逐条反馈下**主要来源是家长点的
+   「不配合」**，而那条恰好会让桥接被跳过（防重复计数），于是 `d.hits` 是空的，
+   断言误报"冷却了但查不到事件"。正确的反查对象是 sessions 表里那天那条
+   `outcome='refused'` 的记录 —— 两个来源都包含。
+
+3. **`record_prompt` 会被长判据撑爆。** 初版把判据在句子里说了两遍，
+   "能在等待 5 秒内主动停下的比例明显提高"（21 字）直接超 `CoachCard.max_length=60`，
+   Pydantic 当场报错。改成判据截断到 18 字且**只说一次**，
+   其余用字段名表达。**已对 50 条活动全量验证。**
+
+4. **写 `apply_feedbacks` 时差点用 zip 配对。** 早先把 `(activity_id, outcome)`
+   存进一个列表、过滤出另一个列表再 `zip` 回来，靠"两个列表过滤条件相同"配对 ——
+   改一处过滤就静默错位，而错位的后果是**抗拒记到错误的活动头上**，
+   正是本次要修的那个 bug 的另一个版本。改成直接存 `(feedback, outcome)` 对象。
+
+5. **`EvalActivityInput.materials` 的注释是假的。** 写它的时候注释说
+   "降级模式靠它把家长的话对上活动，因为家长说的是「小汽车」不会说活动标题"，
+   但 `_fallback_eval` 的 `corpus` 匹配写的是 `a.title in corpus`，
+   **materials 从头到尾没被读过**。删掉时才发现 —— 这是"注释描述意图、
+   代码做别的事"的典型。逐条反馈后断点自然消失（每条反馈自带 activity_id）。
+
+### 尚未解决 / 下一步
+
+- **`refusal_counts >= 2` 没有冷却期结束条件**（老问题，语义变了但问题还在）：
+  抗两天，这条活动一个月不再出现。对 demo 是好事，对产品是缺陷。
+- **抽取质量仍未验证。** 这次改动完全绕开了它（outcome 由家长点），
+  但"从家长补充描述里抽事件"这条路的准确率依然只有 live/capture 才测得到。
+- **`--no-llm` 下状态机仍被闸门冻结**（降级画像 `overall_confidence=0.1`）。
+  这是对的 —— 闸门该关的时候就得关。要看真的转移需要真实画像（18-47s）。
+- **阶段 5-6（API 与前端包装层）** 的 `server.py` 路由建议需要按新形态改：
+  `POST /api/observations` 应该变成"逐条反馈"+"其他观察"两个入口。
 
 ---
 
