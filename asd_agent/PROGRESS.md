@@ -5,6 +5,40 @@
 
 ---
 
+## 🔖 换 session 先看这一屏（2026-10-19 更新）
+
+**已提交到 `d513dac`，工作区干净。** 阶段 1-4b 全部完成并验证通过。
+
+**下一步：阶段 5 —— Vue 3 + Vite 前端 + FastAPI 后端，手动点测试。**
+详细方案见本文末尾「下一步：阶段 5」一节（含目录结构、8 条路由、
+9 条手动测试清单）。**动手前先读那一节和「阶段 4b」一节。**
+
+**当前唯一入口**：
+```bash
+cd asd_agent
+../.venv/bin/python loop.py --no-llm --script hardcoded   # 0.0s，五日闭环
+../.venv/bin/python loop.py --no-llm --script hardcoded --seed-history   # + 闸门对照
+```
+
+**三条最容易被回退的正确设计**（下面每条都有专门章节，别顺手改回去）：
+
+1. **家长端是逐条填的，不是一段话**（阶段 4b）。`refusal_sessions` 收单个
+   `activity_id: str | None`，不做「事件 × 活动」的笛卡尔积。
+   改回 `set[str]` 会让没做过的活动白得抗拒记录。
+2. **outcome/quality 由家长点，不让模型猜**（阶段 4b）。`quality_for()` 是
+   确定性函数。改回提示词里的自由裁量，状态机闸门就形同虚设。
+3. **模型给证据，Python 做判定**（贯穿全项目）。状态转移只由
+   `statemachine.propose_transition()` 的计数规则决定，日结的方向判断
+   只是证据、不是结论。
+
+**最容易踩的坑**（写断言/接线前必读）：
+- 写断言前先读一遍被断言的函数 —— 阶段 4 的三条断言全是按直觉写的，
+  第一次跑就误报 3 条，挡住的全是正确行为（阶段 4 坑 2）
+- `skip 了 build_request 的 before=` → 今天的反馈会回过头来解释今天
+- `card.record_prompt` 里判据说两遍 → 超 60 字，Pydantic 直接报错
+
+---
+
 ## 一句话定位
 
 把医生的评估报告转成家长每天在家能执行的干预计划，并根据每天反馈动态调整。
@@ -363,14 +397,15 @@ C3（"我帮他他就打我的手"）→ high/aggression ✓（"打人"匹配不
 |---|---|---|---|
 | `planner.py` | 448 | 1 次 | 检索候选由 Python 算，LLM 只做编排 + 写 `why_this` |
 | `coach.py` | 553 | 2 次 | 诊断（可校验推理链）→ 家长卡片 |
-| `evaluator.py` | 428 | 1 次 | 日评估 + 转移建议（**判定留给 Python**） |
+| `evaluator.py` | ~~428~~ → 166 | — | 日评估。**阶段 4b：只留 `apply_transitions`，逐活动判定挪到 `feedback.py`、日级聚合挪到 `summary.py`** |
 | ~~`pipeline_demo.py`~~ | — | 全链路 7 阶段 CLI。**阶段 4 已合并进 `loop.py` 并删除** |
 
 **核心边界（本项目最值得讲的一条工程原则）：**
 模型只回答语义判断（"今天这次成功算不算泛化"、"这活动踩雷了吗"），
 凡是可判定的（时长够不够、换哪条活动、该不该升级）全部交给 Python。
 同一条原则落在四处：planner 的时长与预算校验、coach 的 impact 落地、
-evaluator 的 state 转移、profile 的整体可信度。
+evaluator→statemachine 的 state 转移、profile 的整体可信度、
+summary 的方向判断（它也只给 direction + rationale，不产出"所以该升级"）。
 
 ### 阶段 3 实测结果（**全部离线，0.0s，9 个入口全绿**）
 
@@ -790,35 +825,106 @@ for f in activities observe store statemachine coach evaluator feedback summary 
   `POST /api/observations` 应该变成"逐条反馈"+"其他观察"两个入口。
 
 ---
+### 下一步：阶段 5（Vue 前端 + FastAPI，手动测试）
 
-### 下一步：阶段 5-6（API 与前端包装层）
+**2026-10-19 定：前端用 Vue 3 + Vite，后端 FastAPI，验证方式是手动点。**
+不再是 `static/index.html` 原生 JS —— Vue 组件化更适合"逐条反馈卡片"
+这种一个活动一个组件的结构。
 
-**代码层面阶段 4 已完成** —— 闭环由 `loop.py` 承担，不再是 API 层面的事。
-剩下的是包装层：
+当前仓库**没有任何前端文件**（无 package.json / .vue / vite.config），
+后端也没有 server.py。阶段 1-4b 的成果全部是 Python，`loop.py` 是唯一入口。
 
-- **`server.py`**（~300）。同步路由 + JobManager + SSE。
-  **所有 LLM 路径一律 job_id + SSE，绝不让前端同步等。**
-  建议路由（`observe.py` 已经把接口切好了）：
-  ```
-  POST /api/profile           → {job_id}      建档 ~45s，必须走 job
-  GET  /api/jobs/{id}/stream                 SSE 逐步进度
-  POST /api/observations     → Observation + redflag_report
-  GET  /api/plan/{cid}        → 候选 + 每条的"为什么推/为什么不推"
-  POST /api/sessions/{cid}/coach → 家长卡片
-  GET  /api/progress/{cid}    → what_progressed（纯 SQL，秒回）
-  ```
-  红旗按 `Depends(check_redflag)` 挂在 `/api/observations` 上，
-  不存在"某条路径忘了调"。加 pytest：C11 原文打这个 endpoint 必须 200 且
-  `redflag_triggered=true`。
-- **`static/index.html`**（~450）。原生 JS 三 tab + Agent Trace 面板，
-  **不引任何 CDN**（现场无网会白屏）。
-- **fixtures 回放 + 演示脚本。** 回放文件**必须用 `DEMO_MODE=capture`
-  从真实 live 输出逐字落盘**，手工编的 fixture 是这类 demo 最常见的
-  "看起来能跑一换数据就崩"的来源。
+#### 目录结构建议
+```
+ganyu/
+├── asd_agent/            后端，纯 Python，不动
+├── server.py             FastAPI，~300
+└── frontend/             Vue 3 + Vite（新建）
+    ├── package.json
+    ├── vite.config.js    ← proxy /api → localhost:8000
+    └── src/
+        ├── App.vue
+        ├── api.js        唯一的接口出口，fetch 全在这里
+        └── components/
+            ├── ProfileForm.vue      建档（慢，走 job）
+            ├── PlanView.vue         一周计划 + 候选理由
+            ├── CoachCard.vue        ★ 家长卡片，逐条反馈的主界面
+            ├── FeedbackItem.vue     ★ 一条活动的反馈（结果按钮+提示层级+补充）
+            ├── OtherNotes.vue       ★ 当天的「其他观察」框
+            ├── ProgressView.vue     状态机 + 日结
+            └── AgentTrace.vue       llm.LLMTrace 的展示面板
+```
 
-**开工前必做**：实测阶段 3/4 新增路径的 LLM 行为（见「阶段 4 未实测」三条）。
+#### 路由（对应阶段 4b 的新形态）
+```
+POST /api/profile              → {job_id}       建档 18-47s，必须 job
+GET  /api/jobs/{id}/stream                    SSE 进度（llm.py 的 on_step 已经够用）
+POST /api/plan/{cid}           → 候选 + 每条"为什么推/为什么不推"
+POST /api/card/{cid}           → CoachCard     今天做哪条 + 怎么退路
 
-**降级方案**：时间紧就砍掉这一层，直接交 CLI demo —— `loop.py` 一个文件覆盖全部：
-`--no-llm --script hardcoded` 是单日链路，`--seed-history` 带上状态机与闸门对照，
-`--script hardcoded` 三天版是闭环。技术叙事（多 Agent、结构化检索、长期记忆、
-状态机、闭环）一点不少，0.0s 跑通。
+POST /api/feedbacks            → ★ 逐条反馈，body = {date, feedbacks:[
+                                    {activity_id, outcome, prompt_level,
+                                     steps_done, note}], other_notes}
+                              → DayFeedbackResult（sessions + observations 落库）
+POST /api/summary/{cid}        → ★ 日结，落 daily_summary
+GET  /api/sessions/{cid}/transitions → 状态转移（纯 Python，秒回）
+GET  /api/progress/{cid}       → what_progressed（纯 SQL，秒回）
+GET  /api/summaries/{cid}      → ★ recent_summary，教练 Agent 读的那批
+```
+
+**★ `POST /api/feedbacks` 是唯一有业务语义的新路由**，它直接对应
+`feedback.apply_feedbacks(conn, child_id, date, feedbacks, other_notes=...)`。
+注意它**不调 LLM**（outcome/quality 全是纯 Python 映射），
+只有 `note` 非空的那些条目会各触发一次 `extract_observations`。
+所以这个接口是"秒回 + 可选慢路径"，前端要能显示"正在抽取 3 条描述…"。
+
+#### ★ 三条不能破的接线约定（写给下一个 session）
+
+1. **`build_request(before=...)` 的 `before` 参数。**
+   同一天里"发卡片"和"算明天候选"读的是**两份不同的记忆**：
+   `build_request(conn, cid, prof, before=day.date)` 会把当天刚写的日结
+   排除在外。不传 `before` 会让今天的反馈回过头来解释今天要做什么，方向反了。
+
+2. **`latest_summary(before=)` 的 `before` 同理。**
+   `store.latest_summary(conn, cid, days=7, before=<明天>)` 才是教练该读的那批。
+
+3. **前端不要自己算 quality。**
+   家长只传 `outcome` + `prompt_level`，`feedback.quality_for()` 是唯一的
+   quality 来源。前端算一遍就出现了第二套口径，而状态机的升级闸门
+   拿平均 quality 比 0.5/0.75 —— 两套口径必然打架。
+
+#### 手动测试清单（阶段 5 开工时按这个点）
+
+不写 pytest，**手动点**。每一条对应一个曾经真实踩过的坑：
+
+- [ ] 建档：贴报告原文 → 等 18-47s → 看 SSE 进度条 → 出画像
+      （空库会降级成 level=0/可信度 0.1，**这是对的**，闸门该关就关）
+- [ ] 建档红旗：贴含 C11"会去咬自己的袖子"的原文 → 必须出现 urgent/self_injury
+- [ ] 卡片：`record_prompt` **不能出现两次判据**（超 60 字会 Pydantic 报错，
+      已对 50 条活动全量验证过最长 45 字）
+- [ ] 逐条反馈：Day1 只填 gro-007，fin-001/gro-006 点「跳过」
+      → **Network 面板看 `POST /api/feedbacks` 的响应里 `refusal_counts`
+      应该是 `{'gro-007': 1}`**，另两条必须是 0。这是本次改动的核心断言。
+- [ ] 「其他观察」框：填超市捂耳朵那段 → 事件进 observations，
+      但 `refusal_counts` **一条都不加**
+- [ ] 逐条 + note：note 非空的那条才会调 LLM，**观察 Network 里这条慢**，
+      其余是秒回。前端要能区分这两种等待
+- [ ] 日结：跑完一天看 `GET /api/summaries/{cid}` 有返回，
+      再看 `daily_summary` 表行数 +1
+- [ ] 冷却：连续两天拒同一条活动 → 第三天那条从候选里消失，
+      理由是"已连续抗拒 2 次，进入冷却期"
+- [ ] 进度：`GET /api/progress/{cid}` 显示"卡在未开始，本可到入门 ——
+      画像可信度不足，升级闸门拦下了"（降级画像下**这是正确输出**）
+
+#### 降级方案
+
+时间紧就**直接交 CLI demo**，前端可以整个砍掉 ——
+`loop.py --no-llm --script hardcoded`（0.0s，五日闭环 + 冷却 + 日结落库）
+加 `--seed-history`（状态机与闸门对照）已经覆盖全部技术叙事：
+多 Agent、结构化检索、长期记忆、状态机、闭环。
+
+#### 开工前必做
+
+实测阶段 3/4/4b 新增路径的真实模型行为（见各处「未实测」）：
+`ObservationBatch` 在 `SYSTEM_SINGLE` 下的合规率、
+多事件会不会截断（max_tokens=4000）、真实耗时。
