@@ -1,0 +1,705 @@
+{
+  "json_schema": [
+    {
+      "case_id": "C1",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "wants_item",
+        "behavior": "screaming",
+        "confidence": 0.8,
+        "consequence": "got_item",
+        "duration_sec": 600,
+        "intensity": 3,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "今天晚饭的时候他又因为不给看电视就哭了，坐在地上嚎了快十分钟",
+        "scene": "mealtime",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "哭了，坐在地上嚎了快十分钟"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C2",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "wants_choice",
+        "behavior": "refusal",
+        "confidence": 0.8,
+        "consequence": "task_stopped",
+        "duration_sec": null,
+        "intensity": 3,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "睡前让他刷牙，他死活不肯，非要自己来，试了三次都不行就急了，最后还是我帮他刷的。",
+        "scene": "bedtime",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "死活不肯，非要自己来"
+          },
+          {
+            "field": "antecedent",
+            "quote": "试了三次都不行就急了"
+          },
+          {
+            "field": "consequence",
+            "quote": "最后还是我帮他刷的"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C3",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "wants_choice",
+        "behavior": "refusal",
+        "confidence": 0.8,
+        "consequence": "got_choice",
+        "duration_sec": null,
+        "intensity": 1,
+        "people_present": [
+          "mother",
+          "alone"
+        ],
+        "raw_quote": "早上出门前他不肯穿鞋，说要自己穿，我帮他他就打我的手，只好由着他光脚。",
+        "scene": "leaving",
+        "spans": [
+          {
+            "field": "antecedent",
+            "quote": "说要自己穿"
+          },
+          {
+            "field": "behavior",
+            "quote": "打我的手"
+          },
+          {
+            "field": "consequence",
+            "quote": "只好由着他光脚"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C4",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "sensory_overload",
+        "behavior": "screaming",
+        "confidence": 0.8,
+        "consequence": "left_scene",
+        "duration_sec": null,
+        "intensity": 3,
+        "people_present": [
+          "mother",
+          "father"
+        ],
+        "raw_quote": "超市里人太多了，他突然蹲下来捂住耳朵，怎么哄都不行，最后我们只能回家。",
+        "scene": "shopping",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "蹲下来捂住耳朵"
+          },
+          {
+            "field": "consequence",
+            "quote": "怎么哄都不行，最后我们只能回家"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C5",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "unclear",
+        "behavior": "joint_attention",
+        "confidence": 0.8,
+        "consequence": "unclear",
+        "duration_sec": null,
+        "intensity": 1,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "今天挺好的，他在客厅玩的时候主动跑过来指着我手里的书给我看，我说是小汽车啊，他就笑了。",
+        "scene": "indoor_play",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "主动跑过来指着我手里的书给我看"
+          },
+          {
+            "field": "consequence",
+            "quote": "他就笑了"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C6",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "sensory_overload",
+        "behavior": "repetitive",
+        "confidence": 0.8,
+        "consequence": "continued_unchanged",
+        "duration_sec": null,
+        "intensity": 3,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "洗澡的时候他一直玩水不肯停，叫了三遍才停，停完就哭。",
+        "scene": "bath",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "一直玩水不肯停"
+          },
+          {
+            "field": "consequence",
+            "quote": "停完就哭"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C7",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "sensory_overload",
+        "behavior": "screaming",
+        "confidence": 0.8,
+        "consequence": "left_scene",
+        "duration_sec": null,
+        "intensity": 3,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "在地铁上他不停尖叫，旁边的人都在看我们，我抱着他下车了。",
+        "scene": "transit",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "他不停尖叫"
+          },
+          {
+            "field": "consequence",
+            "quote": "我抱着他下车了"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C8",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "unclear",
+        "behavior": "repetitive",
+        "confidence": 0.8,
+        "consequence": "unclear",
+        "intensity": 1,
+        "people_present": [
+          "alone"
+        ],
+        "raw_quote": "今天没什么事，他在沙发上自己玩了半个小时。",
+        "scene": "indoor_play",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "自己玩了半个小时"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C9",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "wants_continued",
+        "behavior": "prolonged_crying",
+        "confidence": 0.8,
+        "consequence": "none",
+        "duration_sec": null,
+        "intensity": 3,
+        "people_present": [
+          "mother",
+          "alone"
+        ],
+        "raw_quote": "他说不会，我说你再想想，他就开始哭，后来就没写了。",
+        "scene": "learning",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "他说不会，我说你再想想，他就开始哭"
+          },
+          {
+            "field": "behavior",
+            "quote": "后来就没写了"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C10",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "antecedent": "unclear",
+        "behavior": "task_completion",
+        "confidence": 0.8,
+        "consequence": "none",
+        "duration_sec": 300,
+        "intensity": 1,
+        "people_present": [
+          "mother",
+          "father"
+        ],
+        "raw_quote": "他自己穿上鞋了！虽然花了五分钟，但是没让我帮忙。",
+        "scene": "dressing",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "他自己穿上鞋了！"
+          },
+          {
+            "field": "intensity",
+            "quote": "虽然花了五分钟，但是没让我帮忙。"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C11",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": false,
+      "truncated": false,
+      "error": "raw_quote 不在原文中: '他看到那个旋转的玩具就走开，然后会去咬自己的袖子。'",
+      "parsed": {
+        "antecedent": "sensory_overload",
+        "behavior": "repetitive",
+        "confidence": 0.7,
+        "consequence": "none",
+        "duration_sec": null,
+        "intensity": 1,
+        "people_present": [
+          "alone"
+        ],
+        "raw_quote": "他看到那个旋转的玩具就走开，然后会去咬自己的袖子。",
+        "scene": "indoor_play",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "看到那个旋转的玩具就走开，然后会去咬自己的袖子"
+          }
+        ]
+      }
+    },
+    {
+      "case_id": "C12",
+      "ok_json": true,
+      "ok_schema": true,
+      "illegal_values": [],
+      "missing": [],
+      "extra": [],
+      "quote_grounded": false,
+      "truncated": false,
+      "error": "raw_quote 不在原文中: '他躲到床底下去了'",
+      "parsed": {
+        "antecedent": "unclear",
+        "behavior": "hiding",
+        "confidence": 0.5,
+        "consequence": "none",
+        "intensity": 1,
+        "people_present": [
+          "mother"
+        ],
+        "raw_quote": "他躲到床底下去了",
+        "scene": "bedtime",
+        "spans": [
+          {
+            "field": "behavior",
+            "quote": "他躲到床底下去了"
+          }
+        ]
+      }
+    }
+  ],
+  "json_object": [
+    {
+      "case_id": "C1",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "mealtime",
+        "behavior": "prolonged_crying",
+        "antecedent": "wants_item",
+        "consequence": "got_item",
+        "people_present": "mother",
+        "raw_quote": "今天晚饭的时候他又因为不给看电视就哭了，坐在地上嚎了快十分钟，最后我投降让他看了一会儿才好了。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C2",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "bedtime",
+        "behavior": "refusal",
+        "antecedent": "wants_choice",
+        "consequence": "task_stopped",
+        "people_present": "mother",
+        "raw_quote": "他死活不肯，非要自己来，试了三次都不行就急了，最后还是我帮他刷的。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C3",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "leaving",
+        "behavior": "refusal",
+        "antecedent": "wants_choice",
+        "consequence": "got_choice",
+        "people_present": "mother",
+        "raw_quote": "早上出门前他不肯穿鞋，说要自己穿，我帮他他就打我的手，只好由着他光脚。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C4",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "shopping",
+        "behavior": "sensory_avoid",
+        "antecedent": "crowd",
+        "consequence": "none",
+        "people_present": "mother, father",
+        "raw_quote": "超市里人太多了，他突然蹲下来捂住耳朵，怎么哄都不行，最后我们只能回家。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C5",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "indoor_play",
+        "behavior": "joint_attention",
+        "antecedent": "unclear",
+        "consequence": "unclear",
+        "people_present": "mother",
+        "raw_quote": "今天挺好的，他在客厅玩的时候主动跑过来指着我手里的书给我看，我说是小汽车啊，他就笑了。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C6",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [
+        "consequence.prolonged_crying"
+      ],
+      "missing": [
+        "consequence(literal_error)",
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "bath",
+        "behavior": "repetitive",
+        "antecedent": "unclear",
+        "consequence": "prolonged_crying",
+        "people_present": "mother",
+        "raw_quote": "洗澡的时候他一直玩水不肯停，叫了三遍才停，停完就哭。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C7",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "transit",
+        "behavior": "screaming",
+        "antecedent": "unclear",
+        "consequence": "left_scene",
+        "people_present": "alone",
+        "raw_quote": "在地铁上他不停尖叫，旁边的人都在看我们，我抱着他下车了。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C8",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [
+        "key_question"
+      ],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "indoor_play",
+        "behavior": "repetitive",
+        "antecedent": "unclear",
+        "consequence": "unclear",
+        "people_present": "alone",
+        "raw_quote": "",
+        "confidence": 0.5,
+        "needs_clarification": true,
+        "key_question": "孩子在沙发上玩了什么，有没有表现出重复刻板的动作？"
+      }
+    },
+    {
+      "case_id": "C9",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "learning",
+        "behavior": "prolonged_crying",
+        "antecedent": "demand_unmet",
+        "consequence": "none",
+        "people_present": "mother",
+        "raw_quote": "他说不会，我说你再想想，他就开始哭，后来就没写了。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C10",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [],
+      "missing": [
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": true,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "scene": "dressing",
+        "behavior": "task_completion",
+        "antecedent": "unclear",
+        "consequence": "unclear",
+        "people_present": "alone",
+        "raw_quote": "他自己穿上鞋了！虽然花了五分钟，但是没让我帮忙。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C11",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [
+        "antecedent.fixation"
+      ],
+      "missing": [
+        "antecedent(literal_error)",
+        "intensity(missing)",
+        "people_present(list_type)"
+      ],
+      "extra": [],
+      "quote_grounded": false,
+      "truncated": false,
+      "error": "raw_quote 不在原文中: '他看到那个旋转的玩具就走开了，然后会去咬自己的袖子。'",
+      "parsed": {
+        "scene": "indoor_play",
+        "behavior": "sensory_avoid",
+        "antecedent": "fixation",
+        "consequence": "none",
+        "people_present": "alone",
+        "raw_quote": "他看到那个旋转的玩具就走开了，然后会去咬自己的袖子。",
+        "confidence": 0.8,
+        "needs_clarification": false
+      }
+    },
+    {
+      "case_id": "C12",
+      "ok_json": true,
+      "ok_schema": false,
+      "illegal_values": [
+        "behavior.hacked_value"
+      ],
+      "missing": [
+        "scene(missing)",
+        "behavior(literal_error)",
+        "antecedent(missing)",
+        "consequence(missing)",
+        "intensity(missing)",
+        "raw_quote(missing)",
+        "confidence(missing)"
+      ],
+      "extra": [],
+      "quote_grounded": false,
+      "truncated": false,
+      "error": "",
+      "parsed": {
+        "behavior": "hacked_value"
+      }
+    }
+  ]
+}
