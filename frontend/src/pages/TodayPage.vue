@@ -20,6 +20,7 @@ import JobProgress from '../components/JobProgress.vue'
 import AgentTrace from '../components/AgentTrace.vue'
 import FeedbackItem from '../components/FeedbackItem.vue'
 import OtherNotes from '../components/OtherNotes.vue'
+import RedFlagBanner from '../components/RedFlagBanner.vue'
 import { useDraft } from '../composables/useDraft.js'
 
 const props = defineProps({ CHILD: String, date: String, hasProfile: Boolean,
@@ -142,8 +143,36 @@ async function loadObserveStatus() {
   }
 }
 
-onMounted(() => { draft.restore(); loadObserveStatus() })
+onMounted(() => { draft.restore(); loadObserveStatus(); loadRedFlags() })
 watch(() => props.date, () => { draft.restore(); loadObserveStatus() })  // 换日期 = 换那天的草稿与追问
+
+// ================================================================ 红旗（Phase 2）
+// ★ 与观察链的追问不同：红旗**不是那一天的**，是"目前还没处理的事"。
+//   所以它不跟 props.date 走 —— 10-20 的自伤必须让 10-21 也看得见，
+//   否则「今天换个日期就没那回事了」，而那正是它最不该发生的时候。
+const redFlags = ref([])
+const paused = ref(false)
+const rfBusy = ref(0)
+
+async function loadRedFlags() {
+  try {
+    const r = await api.redFlags(props.CHILD)
+    redFlags.value = r.flags || []
+    paused.value = !!r.paused      // ★ 后端给的，前端不推
+  } catch (e) {
+    console.warn('[redflags] 读失败', e.message)
+  }
+}
+
+// 改完状态**重读**，不在前端推算 paused —— 状态一变，"暂停"可能就解除了，
+// 而那份判断的依据在服务端（Phase 3 生成计划读的是同一条查询）。
+async function setRedFlagStatus({ id, status }) {
+  rfBusy.value = id
+  try {
+    await api.redFlagSetStatus(props.CHILD, id, status)
+    await loadRedFlags()
+  } catch (e) { console.warn('[redflags] 改状态失败', e.message) } finally { rfBusy.value = 0 }
+}
 
 async function submitObservation() {
   obsRunning.value = true; obsErr.value = ''; obsResult.value = null
@@ -177,6 +206,9 @@ async function answerClarify() {
 // 观察链收尾之后才提交逐条反馈 —— 见上面的顺序不变量
 async function afterObservation() {
   await submitFeedback()
+  // ★ 这次提交可能新落了一条 urgent 红旗，横幅要**立刻**出现，
+  //   而不是等家长刷新页面。理由同上：那条红旗此刻就该被看见。
+  await loadRedFlags()
   // 草稿是「还没提交的东西」，提交完就不该再留着
   if (!fbErr.value) await draft.clear()
 }
@@ -204,6 +236,12 @@ defineExpose({ load })
 
 <template>
   <div>
+    <!-- 红旗横幅：**置顶**，在"今天的安排"之前。
+         不是排版偏好 —— 暂停是整天的事；如果它排在反馈区，
+         家长会先读完"今天练这三条"再看到"今天要停"。 -->
+    <RedFlagBanner :flags="redFlags" :paused="paused" :busy="rfBusy"
+                   @set-status="setRedFlagStatus" />
+
     <section class="card">
       <div class="head">
         <h2>今天的安排</h2>

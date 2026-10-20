@@ -55,6 +55,18 @@ export const api = {
   draftDelete: (cid, date) =>
     req(`/api/draft?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`,
         { method: 'DELETE' }),
+
+  // ---- 红旗（Phase 2）----
+  // ★ 返回的 `paused` 直接用后端给的，**不要在前端从 flags 推** ——
+  //   后端那个定义（存在 urgent 且未关闭）是 Phase 3 生成计划时读的同一条查询，
+  //   两套口径必然打架，而打架的后果是"横幅说暂停着、计划照生成"。
+  redFlags: (cid, status) =>
+    req(`/api/redflags?child_id=${encodeURIComponent(cid)}` +
+        (status ? `&status=${encodeURIComponent(status)}` : '')),
+  // 只发**目标状态**，能不能转由后端判（closed → acknowledged 会 409）。
+  redFlagSetStatus: (cid, id, status) =>
+    req(`/api/redflags/${id}/status?child_id=${encodeURIComponent(cid)}`,
+        { method: 'PATCH', body: JSON.stringify({ status }) }),
 }
 
 // ★ 慢路径统一走 SSE。两条慢路径（建档 18-47s、出卡片 30-45s）共用这一份。
