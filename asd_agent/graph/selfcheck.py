@@ -51,7 +51,12 @@ CID = "graph-check"
 def _counts(conn, cid: str) -> dict:
     q = lambda t: conn.execute(          # noqa: E731
         f"SELECT count(*) AS n FROM {t} WHERE child_id=%s", (cid,)).fetchone()["n"]
+    # ★ `red_flags` 也在里面（Phase 2 起），所以 [1][2][6][13] 那几条
+    #   「业务表零写入 / 行数不变」的守卫自动覆盖到红旗 ——
+    #   这正是把它放进这个字典而不是另写一条查询的理由：
+    #   守卫漏掉一张新表时，没有任何东西会提醒你。
     return {"observations": q("observations"),
+            "red_flags": q("red_flags"),
             "sessions": q("sessions"),
             "skill_state": q("skill_state")}
 
@@ -106,7 +111,8 @@ def main() -> int:
     check("★ 降级时一条 observation 都不编造",
           out.get("observation_ids") == [], out.get("observation_ids"))
     c1 = _counts(conn, CID)
-    check("业务表零写入", c1 == {"observations": 0, "sessions": 0, "skill_state": 0}, c1)
+    check("业务表零写入",
+          c1 == {"observations": 0, "red_flags": 0, "sessions": 0, "skill_state": 0}, c1)
 
     # =============================================== 2. interrupt 能停
     print("\n[2] ⚡ 澄清 interrupt 能停住")
@@ -226,11 +232,25 @@ def main() -> int:
                                     "然后会去咬自己的袖子。"}, cfg8)
     v8 = out8.get("verdict") or {}
     check("C11 命中 urgent", v8.get("highest") == "urgent", v8.get("highest"))
-    check("走 escalate 而非 publish",
-          (out8.get("trace") or [])[-1] == "escalate", (out8.get("trace") or [])[-1:])
+    # ★ Phase 2 改了这条边：escalate 之后**仍然走 publish**。
+    #   原断言是 `trace[-1] == "escalate"`，它把一个 bug 写成了规范 ——
+    #   escalate → END 意味着"孩子今天咬自己"那天家长的原话从不进 observations，
+    #   红旗也无处可落（全图没有任何一个写库的地方）。没有报错，只是数据不见。
+    #   判定一点没变（仍是 redflag.scan 的 highest=="urgent"），
+    #   变的只是"判完之后这一天还写不写"。
+    check("★ 走 escalate，且 escalate 之后仍然走 publish（父语料不丢）",
+          (out8.get("trace") or [])[-1] == "publish"
+          and "escalate" in (out8.get("trace") or []),
+          (out8.get("trace") or [])[-3:])
     check("★ escalate 暂停计划生成", (out8.get("escalation") or {}).get("paused") is True)
     check("escalate 给了转诊指引",
           bool((out8.get("escalation") or {}).get("guidance")))
+    check("★ 红旗落库了（不再是响应里飘一次）",
+          bool(out8.get("red_flag_ids")), out8.get("red_flag_ids"))
+    items = (out8.get("escalation") or {}).get("guidance_items") or []
+    check("★ 转诊指引按 code 逐条给（不是一句通用文案）",
+          len(items) == 1 and items[0].get("who") and items[0].get("avoid"),
+          [i["code"] for i in items])
 
     # =============================================== 9. 四层字段向后兼容
     print("\n[9] 四层字段：新字段不能把旧数据打死")
@@ -252,9 +272,126 @@ def main() -> int:
     print("\n[13] 草稿：存 checkpoint，且一个业务表都不碰")
     check_draft(conn, check)
 
+    # =============================================== 14. 红旗落库（Phase 2）
+    print("\n[14] 红旗：落库、幂等、状态流转、暂停判据")
+    check_redflags(g, conn, check)
+
     close_all()
-    print("\n" + ("✓ Phase 0/1 图级验收全绿" if ok else "✗ 有失败项，见上"))
+    print("\n" + ("✓ Phase 0/1/2 图级验收全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+# ================================================================== [14] 红旗
+RF_CID = "graph-check-rf"
+URGENT = "他最近不太喜欢那个旋转的玩具，看到就走开，然后会去咬自己的袖子。"
+HIGH_ONLY = "他原来会自己吃饭，最近突然不会了，叫他也不理。"
+
+
+def check_redflags(g, conn, check) -> None:
+    """★ Phase 2 的一整组。**另起一个孩子**，这样红旗的计数与
+    `plan_paused` 的判据都不受前面各组的语料影响 ——
+    守卫自己不带上前置状态，才敢断言"就是它干的"。
+    """
+    store.ensure_child(conn, RF_CID)
+
+    # --- 1. 只有 high：不暂停 ---
+    d1 = "2026-11-02"
+    o1 = g.invoke({"child_id": RF_CID, "date": d1, "no_llm": True,
+                   "parent_text": HIGH_ONLY}, thread_config(RF_CID, d1))
+    rows1 = _rf_rows(conn, RF_CID)
+    check("★ high 级也落库（不只 urgent —— 否则答不出「这几个月出现过几次」）",
+          len(rows1) == 1 and rows1[0]["severity"] == "high", rows1)
+    check("★ 只有 urgent 才暂停：现在 high 不暂停",
+          not store.plan_paused(conn, RF_CID))
+    check("high 不触发 escalate", o1.get("escalation") is None)
+    check("★ 红旗行带着该追问的问题（家长要答的那句）",
+          bool(rows1[0]["ask"]), rows1[0]["ask"])
+
+    # --- 2. urgent：降级下 observations 零行而红旗照落 ---
+    d2 = "2026-11-03"
+    o2 = g.invoke({"child_id": RF_CID, "date": d2, "no_llm": True,
+                   "parent_text": URGENT}, thread_config(RF_CID, d2))
+    c = _counts(conn, RF_CID)
+    rows2 = _rf_rows(conn, RF_CID)
+    check("★ 降级下 observations 零行（一条都不编）",
+          c["observations"] == 0, c)
+    check("★★ 但 urgent 红旗照样落库（红旗与模型无关，是 redflag.py 存在的理由）",
+          len(rows2) == 2 and rows2[-1]["severity"] == "urgent", rows2)
+    check("★ urgent 触发暂停", store.plan_paused(conn, RF_CID))
+    check("★ state 里带出本次新增的 id",
+          len(o2.get("red_flag_ids") or []) == 1, o2.get("red_flag_ids"))
+    check("红旗行带着转诊指引（找谁/做什么/不要做什么都在）",
+          bool(rows2[-1]["referral_who"]) and bool(rows2[-1]["referral_avoid"]),
+          rows2[-1]["referral_avoid"][:24])
+
+    # --- 3. 幂等：同一段语料换 thread 再跑一次 ---
+    g.invoke({"child_id": RF_CID, "date": d2, "no_llm": True,
+              "parent_text": URGENT}, thread_config(RF_CID, d2 + "#again"))
+    check("★ 同段语料换 thread 再跑，红旗行数不变（唯一索引 + ON CONFLICT）",
+          len(_rf_rows(conn, RF_CID)) == 2, len(_rf_rows(conn, RF_CID)))
+
+    # --- 4. urgent 那天的父语料真的进了 observations（escalate → END 的数据丢失回归） ---
+    d3 = "2026-11-04"
+    obs3 = _seed_observation(needs_clarification=False, question="", source=URGENT)
+    o3 = g.invoke({"child_id": RF_CID, "date": d3, "no_llm": True,
+                   "parent_text": URGENT, "observation": obs3,
+                   "observed_text": URGENT}, thread_config(RF_CID, d3))
+    check("★ urgent 那天 escalate 之后仍然走 publish",
+          (o3.get("trace") or [])[-1] == "publish"
+          and "escalate" in (o3.get("trace") or []), (o3.get("trace") or [])[-3:])
+    check("★★ urgent 那天的父语料真的进了 observations（Phase 0/1 这里是 0 行）",
+          bool(o3.get("observation_ids")), o3.get("observation_ids"))
+    check("observation 行被打上 redflag_triggered（本周红旗天数开始真的会数）",
+          conn.execute("SELECT count(*) AS n FROM observations "
+                       "WHERE child_id=%s AND redflag_triggered", (RF_CID,)
+                       ).fetchone()["n"] >= 1)
+
+    # --- 5. 状态流转 ---
+    # ★ 这个孩子有**两条** urgent（d2 降级那次与 d3 非降级那次）。
+    #   判据是「存在任意一条未关闭的 urgent」，所以要把它们全关掉才谈得上解除 ——
+    #   这不是测试写复杂了，正是"按孩子判而不是按天判"那句话的后果：
+    #   一次只关掉一条，暂停不会解除。
+    urgent_rows = store.open_urgent_red_flags(conn, RF_CID)
+    check("★ 这个孩子有两条未关闭的 urgent（关一条不够）",
+          len(urgent_rows) == 2, [r["code"] for r in urgent_rows])
+    rid = o2["red_flag_ids"][0]
+    check("初始状态是 open",
+          store.get_red_flag(conn, rid, RF_CID)["status"] == "open")
+    store.set_red_flag_status(conn, rid, "acknowledged")
+    check("★ 已看到不解除暂停（「已看到」≠「已处理」）",
+          store.plan_paused(conn, RF_CID))
+    for r in urgent_rows:
+        store.set_red_flag_status(conn, r["id"], "closed")
+    check("★ 全部已处理之后暂停解除 —— Phase 3 消费的就是这条查询",
+          not store.plan_paused(conn, RF_CID))
+    check("★ 关掉的那条仍留在列表里（不消失：复诊要拿得出来）",
+          len(store.list_red_flags(conn, RF_CID)) == 3,
+          len(store.list_red_flags(conn, RF_CID)))
+    check("?status=closed 过滤生效（两条 urgent 已处理，high 仍未处理）",
+          len(store.list_red_flags(conn, RF_CID, status="closed")) == 2
+          and len(store.list_red_flags(conn, RF_CID, status="open")) == 1)
+    check("状态改回 open 能重新暂停（家长说「其实没处理完」）",
+          (redflag.can_transition("closed", "open")
+           and not (store.set_red_flag_status(conn, rid, "open") or
+                    not store.plan_paused(conn, RF_CID))))
+
+    # --- 6. 转诊指引的聚合 ---
+    multi = redflag.scan("他会咬自己的手，最近老是发呆几秒叫不应。")
+    gm = redflag.guidance_for(multi)
+    check("★ 多个 urgent 逐条给，不揉成一段",
+          len(gm["items"]) == 2, [i["code"] for i in gm["items"]])
+    check("guidance 仍是一句 str（老 checkpoint / 老前端读的就是这个键）",
+          isinstance(gm["summary"], str))
+    check("do_not 跨 code 去重（同一句禁止不该读两遍）",
+          len(gm["do_not"]) == len(set(gm["do_not"])))
+    check("只有 urgent 进指引；high/watch 各带自己的 ask",
+          all(i["ask"] for h in multi.hits for i in gm["items"]
+              if i["code"] == h.code))
+
+
+def _rf_rows(conn, cid: str) -> list[dict]:
+    return list(conn.execute(
+        "SELECT * FROM red_flags WHERE child_id=%s ORDER BY id", (cid,)).fetchall())
 
 
 # ================================================================== [13] 草稿

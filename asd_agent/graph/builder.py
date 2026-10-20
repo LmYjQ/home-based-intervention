@@ -10,9 +10,8 @@ Phase 0 只画**底座已经存在且是纯函数**的那一段：
                                     needs_clarification? ├─ 是 → ⚡ clarify → 回抽取
                                                       └─ 否 ↓
                                               safety_gate → highest=="urgent"?
-                                                                ├─ 是 → escalate → END
-                                                                └─ 否 ↓
-                                                             publish → END
+                                                                ├─ 是 → escalate ↓
+                                                                └─ 否 ──────┴─→ publish → END
 
 **为什么计划链（select_goal / retrieve / generate / validate / approve / freeze）
 和反馈链（record_execution / analyze_outcome / next_action）现在不画：**
@@ -27,6 +26,13 @@ Phase 0 只画**底座已经存在且是纯函数**的那一段：
 理由是实测出来的 —— `interrupt()` 恢复时会重跑整个节点，
 所以凡是在 interrupt 之前写过库的东西，resume 一次就写两遍。
 这条不能靠"我记得判重"，只能靠节点的位置。
+
+★ `escalate → publish`（不是 `escalate → END`）
+-------------------------------------------------
+Phase 0/1 是 escalate → END，于是"孩子今天咬自己"那天，家长的原话从不落库、
+红旗也无处可落（见 `nodes.py` 里那段改边说明）。判定没变，改的只是
+"判完之后这一天还写不写"。而且它让红旗落库对将来 Phase 3 的
+`⚡ approve_plan` interrupt **结构上免疫** —— 那是这条边真正的长期理由。
 
 `PlanReview` / `PlanRequest` 的形状已经在 `state.py` 里定好了，
 Phase 3 接的时候不需要再改 state 的定义 —— 那是为了让分阶段不互相欠债。
@@ -103,7 +109,9 @@ def build_graph(saver=None, *, name: str = "ganyu_intervention"):
     g.add_conditional_edges(
         "safety_gate", _route_safety,
         {"escalate": "escalate", "publish": "publish"})
-    g.add_edge("escalate", END)
+    # ★ escalate 之后仍然走 publish —— 见模块 docstring。
+    #   escalate 自己一个字节都不写（纯计算），落库全在 publish。
+    g.add_edge("escalate", "publish")
     g.add_edge("publish", END)
 
     return g.compile(checkpointer=saver, name=name)

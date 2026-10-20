@@ -103,9 +103,10 @@ def main() -> int:
     conn = store.connect(DB)
     n_biz = conn.execute(
         "SELECT (SELECT count(*) FROM observations WHERE child_id=%s) + "
-        "(SELECT count(*) FROM sessions WHERE child_id=%s) AS n",
-        (CID, CID)).fetchone()["n"]
-    check("★ 存草稿一个业务表都没碰", n_biz == 0, n_biz)
+        "(SELECT count(*) FROM sessions WHERE child_id=%s) + "
+        "(SELECT count(*) FROM red_flags WHERE child_id=%s) AS n",
+        (CID, CID, CID)).fetchone()["n"]
+    check("★ 存草稿一个业务表都没碰（含 Phase 2 的 red_flags）", n_biz == 0, n_biz)
 
     # =============================================== 3. 草稿的上界
     print("\n[3] 草稿不是垃圾桶（宽松 ≠ 没有上界）")
@@ -193,8 +194,127 @@ def main() -> int:
     print("\n[8] ★ 澄清 interrupt 的 HTTP 往返")
     check_clarify_roundtrip(c, check)
 
+    # =============================================== 9. 红旗（Phase 2）
+    print("\n[9] 红旗：刷新后还在 + 状态流转")
+    check_redflags(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_redflags(c, check) -> None:
+    """★ 红旗的 HTTP 面。守的是四件事：
+      刷新后还在（读的是业务表不是响应）、状态流转有守卫、
+      **模型不可用时红旗照样落**、以及 `/api/profile` 是第二个写入口。
+
+    用另一个孩子，与前面各组隔开 —— `plan_paused` 是**按孩子**判的
+    （见 store.plan_paused 的 docstring），混用会让断言互相污染。
+    """
+    import store as store_mod
+
+    cid = "http-check-rf"
+    d = "2026-11-05"
+    urgent = "他最近不太喜欢那个旋转的玩具，看到就走开，然后会去咬自己的袖子。"
+    conn = store_mod.connect(DB)
+    store_mod.ensure_child(conn, cid, name="红旗自检娃", age_months=34)
+
+    r = c.get("/api/redflags", params={"child_id": cid})
+    check("★ 空的时候返回空列表 + paused=false（不是 404）",
+          r.status_code == 200 and r.json()["flags"] == [] and r.json()["paused"] is False,
+          r.status_code)
+
+    # 先建档 —— /api/observe/run 会 `_profile_or_400`，没有画像的孩子走不到观察链。
+    # 报告里就带一句自伤，顺带把"第二个写入口"这条一起验了。
+    r = c.post("/api/profile", json={"child_id": cid, "age_months": 34,
+                                     "report_text": "他会咬自己的手，最近整夜哭闹。",
+                                     "daily_minutes": 30, "materials": ["杯子"],
+                                     "avoid_load_sensory": False, "no_llm": True})
+    res = _await(c, r.json()["job_id"])
+    out = (res or {}).get("result") or {}
+    check("★ /api/profile 也落红旗（第二个写入口走同一条路）",
+          len(out.get("red_flag_ids") or []) == 2, out.get("red_flag_ids"))
+
+    r = c.post("/api/observe/run", json={"child_id": cid, "date": d,
+                                         "text": urgent, "no_llm": True})
+    job = r.json()["job_id"]
+    res = _await(c, job)
+    result = (res or {}).get("result") or {}
+    check("observe job 跑完", res is not None and res.get("status") == "done",
+          res.get("error") if res else "超时")
+    check("★ 响应带出本次新增的红旗 id", len(result.get("red_flag_ids") or []) == 1,
+          result.get("red_flag_ids"))
+    check("★ 响应带结构化转诊指引（老键 guidance 仍是一句 str）",
+          isinstance((result.get("escalation") or {}).get("guidance"), str)
+          and len((result.get("escalation") or {}).get("guidance_items") or []) == 1,
+          (result.get("escalation") or {}).get("guidance"))
+
+    body = c.get("/api/redflags", params={"child_id": cid}).json()
+    check("★ 刷新后还读得到（读的是业务表，不是一次性响应）",
+          len(body["flags"]) == 3, len(body["flags"]))
+    f0 = body["flags"][0]
+    check("行里带着 severity / code / 引文 / 追问 / 转诊指引",
+          f0["severity"] == "urgent" and f0["code"] == "self_injury"
+          and bool(f0["quote"]) and bool(f0["ask"])
+          and bool(f0["referral_who"]) and bool(f0["referral_avoid"]),
+          f0["code"])
+    check("★ paused=true（urgent 存在）", body["paused"] is True)
+
+    # 降级（no-llm）下 observations 一行都没写，红旗却落了 —— 这是
+    # 「红旗与模型无关」的 HTTP 侧证据。
+    n_obs = conn.execute("SELECT count(*) AS n FROM observations WHERE child_id=%s",
+                         (cid,)).fetchone()["n"]
+    check("★ 降级下 observations 仍是 0 行，而红旗照落",
+          n_obs == 0 and len(body["flags"]) == 3, f"obs={n_obs}, flags={len(body['flags'])}")
+
+    rid = next(f["id"] for f in body["flags"] if f["severity"] == "urgent")
+    r = c.patch(f"/api/redflags/{rid}/status", params={"child_id": cid},
+                json={"status": "acknowledged"})
+    check("PATCH acknowledged → 200", r.status_code == 200, r.status_code)
+    check("★ 已看到不解除暂停（「已看到」≠「已处理」）",
+          r.json()["paused"] is True and r.json()["flag"]["status"] == "acknowledged")
+
+    r = c.patch(f"/api/redflags/{rid}/status", params={"child_id": cid},
+                json={"status": "acknowledged"})
+    check("★ 重复设同一状态是幂等的 200（前端双击不炸）", r.status_code == 200, r.status_code)
+
+    r = c.patch(f"/api/redflags/{rid}/status", params={"child_id": cid},
+                json={"status": "done"})
+    check("★ 非法状态值 → 422（Pydantic 层就拒了）", r.status_code == 422, r.status_code)
+
+    r = c.patch("/api/redflags/99999999/status", params={"child_id": cid},
+                json={"status": "closed"})
+    check("★ 未知 id → 404", r.status_code == 404, r.status_code)
+
+    r = c.patch(f"/api/redflags/{rid}/status", params={"child_id": cid},
+                json={"status": "closed"})
+    check("acknowledged → closed 200", r.status_code == 200, r.status_code)
+    r = c.patch(f"/api/redflags/{rid}/status", params={"child_id": cid},
+                json={"status": "acknowledged"})
+    check("★ closed → acknowledged → 409（没处理过就不算「已看到」）",
+          r.status_code == 409, r.status_code)
+    # ★ 这个孩子有**两条** urgent：观察那条 + 建档报告那条。
+    #   判据是「存在任意一条未关闭的 urgent」，所以全关掉才谈得上解除 ——
+    #   这不是测试写复杂了，正是「按孩子判而不是按天判」那句话的后果。
+    for f in c.get("/api/redflags", params={"child_id": cid}).json()["flags"]:
+        if f["severity"] == "urgent" and f["status"] != "closed":
+            c.patch(f"/api/redflags/{f['id']}/status", params={"child_id": cid},
+                    json={"status": "closed"})
+    check("★ 全部已处理之后 paused 变 false",
+          c.get("/api/redflags", params={"child_id": cid}).json()["paused"] is False)
+    check("★ ?status=closed 过滤生效",
+          len(c.get("/api/redflags",
+                    params={"child_id": cid, "status": "closed"}).json()["flags"]) == 2)
+
+    kinds = {f["source_kind"] for f in
+             c.get("/api/redflags", params={"child_id": cid}).json()["flags"]}
+    check("★ 两种来源在库里是同一种东西（source_kind 区分来源，不分表）",
+          kinds == {"observation", "report"}, kinds)
+
+    # 同一天重跑一次 observe：幂等，不该多出一行
+    c.post("/api/observe/run", json={"child_id": cid, "date": d,
+                                     "text": urgent, "no_llm": True})
+    n = len(c.get("/api/redflags", params={"child_id": cid}).json()["flags"])
+    check("★ 重跑 observe 不多落红旗（唯一索引）", n == 3, n)
 
 
 def check_clarify_roundtrip(c, check) -> None:

@@ -51,7 +51,7 @@ import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "asd_agent"))
 
@@ -64,6 +64,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import llm
 import observe
 import vocab
+import redflag
 import store
 import summary as summary_mod
 from activities import PlanRequest, ScoredActivity, candidates as retrieve_candidates
@@ -328,6 +329,21 @@ class DraftIn(BaseModel):
     other_notes: str = Field(default="", max_length=20000)
 
 
+class RedFlagStatusIn(BaseModel):
+    """改一条红旗的状态。
+
+    ★ `Literal` 而不是 str，与 `graph/state.py` 的 `PlanReview` 同一条理由：
+      前端提交的操作必须经过**服务端** schema 校验，多打一个词就该在
+      进来那一刻被拒，而不是顺着流程流到落库那一步。
+    `extra="forbid"`：不接受前端顺手多塞的字段，那通常意味着它以为自己
+    改了别的东西（比如 severity），而服务端没照做。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["open", "acknowledged", "closed"]
+
+
 # ================================================================== 慢路径（job + SSE）
 @app.post("/api/profile")
 def api_profile(inp: ProfileIn):
@@ -360,9 +376,22 @@ def api_profile(inp: ProfileIn):
         # 由 PostgreSQL 自己保证顺序。
         store.ensure_child(conn, inp.child_id, age_months=inp.age_months)
         store.save_profile(conn, ex.profile)
+        # ★ 红旗落库（Phase 2）。**放在 ensure_child 之后** ——
+        #   red_flags.child_id 有外键指向前者，而 scan() 是更早就跑完的。
+        #   走的是与图那条路**完全相同的一对函数**
+        #   （redflag.rows_for 纯 + store.append_red_flags 落），
+        #   所以「建档时扫到的自伤」和「今天观察时扫到的自伤」
+        #   在库里是同一种东西，前端不需要为它们写两套渲染。
+        #   source_kind 区分来源，不进幂等键 —— 同一份报告重跑一次不会多出一行。
+        rf_ids = store.append_red_flags(
+            conn, inp.child_id,
+            getattr(ex.profile, "report_date", None) or date.today().isoformat(),
+            redflag.rows_for(ex.redflags), source=inp.report_text,
+            source_kind="report")
         return {
             "profile": _jsonable(ex.profile),
             "redflags": _jsonable(ex.redflags),
+            "red_flag_ids": rf_ids,
             "report_summary": ex.report_summary,
             "unverified": ex.unverified,
             "degraded": ex.degraded,
@@ -669,6 +698,10 @@ def _observe_result(g, cfg: dict) -> dict:
         # 就是 nodes.py 里 interrupt() 传进去的那个 payload（含 question）
         "interrupt": _jsonable(ints[0].value) if ints else None,
         "observation_ids": list(vals.get("observation_ids") or []),
+        # ★ 本次**新增**的红旗行（重跑一次是 []）。前端要显示
+        #   「今天记下了 N 条红旗」时必须是新增而不是库里总数 ——
+        #   否则家长会看到同一个数字被重复宣布。
+        "red_flag_ids": list(vals.get("red_flag_ids") or []),
         "clarify_asked": bool(vals.get("clarify_asked")),
         # 澄清往返的产物：家长的回答 + 合并后的语料。
         # 回指校验比的是**整段**原话，所以回答是追加进去的而不是替换 ——
@@ -763,6 +796,51 @@ def api_observe_status(child_id: str, date: str):
     """
     g = get_graph()
     return _observe_result(g, thread_config(child_id, date))
+
+
+# ================================================================== 红旗（Phase 2）
+# ★ 为什么不复用 `_observe_result` 里那个 `escalation`：那个是**事件**
+#   （"这段话我读到了什么"），会随刷新/换日期消失；这里是**当前状态**
+#   （"还有哪些没处理"），要能跨天跨页面读。两者回答的不是同一个问题。
+@app.get("/api/redflags")
+def api_redflags(child_id: str, status: str | None = None):
+    """红旗列表。**纯读 checkpoint 之外的业务表，毫秒级，不起 job。**
+
+    ★ `paused` 与列表**同一次查询算出来**（`store.plan_paused`），
+      前端不许自己从列表推 —— 两套口径必然打架，
+      而打架的那个后果是"横幅说暂停着、计划却照生成"。
+      Phase 3 的 `generate_plan` 读的是同一条查询。
+    """
+    conn = _conn()
+    return {
+        "flags": _jsonable(store.list_red_flags(conn, child_id, status=status)),
+        "paused": store.plan_paused(conn, child_id),
+    }
+
+
+@app.patch("/api/redflags/{flag_id}/status")
+def api_redflag_status(flag_id: int, inp: RedFlagStatusIn, child_id: str):
+    """改一条红旗的状态。**判据在 `redflag.can_transition`，不在这里。**
+
+    ★ 必须**先读当前值再判**：状态是会被另一条请求改的，
+      拿客户端传来的旧状态判等于没判。
+
+    ★ 409 而不是 422：请求本身合法（"closed" 是合法状态），
+      冲突的是当前状态 —— 与 `/api/observe/resume` 那个 409 同一类。
+      422 留给"你发的东西根本不是合法状态"，那种在 Pydantic 层就拒了。
+    """
+    conn = _conn()
+    row = store.get_red_flag(conn, flag_id, child_id)
+    if not row:
+        # 404 而不是 403：这里没有多用户身份体系（Phase 6 才做），
+        # 「这条不属于你」与「这条不存在」对调用方是同一件事。
+        raise HTTPException(404, f"红旗 {flag_id} 不存在")
+    if not redflag.can_transition(row["status"], inp.status):
+        raise HTTPException(
+            409, f"不能从「{row['status']}」直接变成「{inp.status}」")
+    store.set_red_flag_status(conn, flag_id, inp.status)
+    return {"flag": _jsonable(store.get_red_flag(conn, flag_id, child_id)),
+            "paused": store.plan_paused(conn, child_id)}
 
 
 # ================================================================== 草稿
