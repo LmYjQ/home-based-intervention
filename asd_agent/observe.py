@@ -400,7 +400,8 @@ def persist(conn, child_id: str, outcome: ObservationOutcome) -> list[int]:
     rf = outcome.redflags.triggered
     ids: list[int] = []
     for e in outcome.events:
-        ids.append(store.log_observation(conn, child_id, outcome.date, e, rf))
+        ids.append(store.log_observation(conn, child_id, outcome.date, e, rf,
+                                         source=outcome.source_text))
     return ids
 
 
@@ -676,12 +677,7 @@ def _cli() -> None:
     import statemachine as sm
 
     db = "/tmp/observe_check.db"
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + suffix)
-        except FileNotFoundError:
-            pass
-    conn = store.connect(db)
+    conn = store.reset(db)   # ★ 一行代替删 db/-wal/-shm 三个文件
     cid = "obs-check"
     store.ensure_child(conn, cid, age_months=34)
 

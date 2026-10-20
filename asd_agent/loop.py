@@ -599,12 +599,7 @@ def run_loop(child_id: str, *, days: int = 5, no_llm: bool = False,
              seed_history: bool = False, db_path: str | None = None) -> int:
     t0 = time.time()
     db = db_path or f"/tmp/loop_{child_id}.db"
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + suffix)
-        except FileNotFoundError:
-            pass
-    conn = store.connect(db)
+    conn = store.reset(db)   # ★ 一行代替删 db/-wal/-shm 三个文件
 
     constraints = ParentConstraints(
         daily_minutes_available=minutes,
@@ -631,6 +626,10 @@ def run_loop(child_id: str, *, days: int = 5, no_llm: bool = False,
     else:
         from profile import SAMPLE_REPORT
         ex = extract_profile(SAMPLE_REPORT, child_id, 34, parent_constraints=constraints)
+        # ★ 下面统一用 `prof`，这一支原先只算出了 `ex` 没绑定 prof ——
+        #   于是不带 --no-llm 跑 loop.py 直接 UnboundLocalError 崩掉。
+        #   降级那一支（if 分支）绑了 prof，live 这一支漏了。
+        prof = ex.profile
         print(f"  可信度 {ex.profile.overall_confidence:.2f}  降级 {ex.degraded}")
         if ex.redflags.triggered:
             print("  ★ 报告中的红旗：")

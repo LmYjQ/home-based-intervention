@@ -5,20 +5,76 @@
 
 ---
 
-## 🔖 换 session 先看这一屏（2026-10-19 更新）
+## 🔖 换 session 先看这一屏（2026-10-19 晚更新）
 
-**已提交到 `d513dac`，工作区干净。** 阶段 1-4b 全部完成并验证通过。
+> ## ⚡ 2026-10-20 新增：LangGraph 接入（**新 session 优先看这份**）
+>
+> **`asd_agent/LANGGRAPH.md`** ← 换 session 动手前先读那份，里面有：
+> - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
+> - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
+>   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
+> - Phase 0 的三个待建文件与两条必须写死的边界
+>
+> **`store.py` 已改：连接加 `autocommit=True`（`store.py:100`）** —— 这不是风格调整。
+> 原长连接非 autocommit + 全项目零 `rollback()` ⇒ 每次读都留下永不结束的事务 ⇒ 连接长期停在
+> `idle in transaction` ⇒ 把 `PostgresSaver.setup()` 的 `CREATE INDEX CONCURRENTLY` 卡死
+> （CONCURRENTLY 等的是**整个 database** 的 virtualxid，与 schema 无关）。
+> 语义零变化：11 个 `commit()` 全在单个写函数结尾，无一处多语句事务。
+> 那些 `commit()` **保留**，别去「清理」。
+> 验证：12/12 离线回归 + 180 并发 0 失败 + HTTP 全链路 + 跑完无 idle-in-transaction。
+>
+> 图本身**还没写**（`asd_agent/graph/` 不存在）。
 
-**下一步：阶段 5 —— Vue 3 + Vite 前端 + FastAPI 后端，手动点测试。**
-详细方案见本文末尾「下一步：阶段 5」一节（含目录结构、8 条路由、
-9 条手动测试清单）。**动手前先读那一节和「阶段 4b」一节。**
-
-**当前唯一入口**：
-```bash
-cd asd_agent
-../.venv/bin/python loop.py --no-llm --script hardcoded   # 0.0s，五日闭环
-../.venv/bin/python loop.py --no-llm --script hardcoded --seed-history   # + 闸门对照
+**⚠️ 工作区未提交。** 阶段 5 的 `server.py` + `frontend/` 已写完并通过浏览器实测，
+**PostgreSQL 迁移也已完成**，但都**还没 commit**。`git status`：
 ```
+ M asd_agent/observe.py     + source 列（observations 存整段原话）
+ M asd_agent/store.py       ★ sqlite → PostgreSQL 全量迁移
+ M asd_agent/summary.py     + domain_updates 形状校验与兜底 / PG 语法
+ M asd_agent/feedback.py    PG 语法
+ M asd_agent/loop.py        PG 语法
+ M asd_agent/coach.py       PG 语法
+ M asd_agent/planner.py     PG 语法
+ M server.py                新 + PG 语法 + 删 _IO_LOCK
+?? frontend/                新
+?? .playwright-mcp/         ← 测试产物，建议加进 .gitignore
+```
+
+**✅ 存储层已换成 PostgreSQL，并发 500 随之消失**（180 请求 0 失败，迁移前失败 8 个）。
+详见「✅ 迁移到 PostgreSQL 已完成」一节 —— 那里有改动清单、
+sqlite→postgres 对照表、三个设计决定、以及踩到的坑。
+
+**⚠️ 跑任何东西之前先起 PG 容器**（**端口绑 127.0.0.1**，不要绑 0.0.0.0）：
+```bash
+docker run -d --rm --name ganyu_pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=ganyu -p 127.0.0.1:55432:5432 \
+  -v ganyu_pgdata:/var/lib/postgresql/data 81bd698b4594
+```
+
+**⚠️ 本机 8000 端口被别的程序占着**（实测：另一个 python 进程，HTTP 404）。
+起后端请用 **8123**，并把 `frontend/vite.config.js` 的代理 target 同步改成 8123 ——
+不改的话前端会打到别人的服务上，满屏 404。
+
+**前端手测**：`frontend/MANUAL_TEST.md` —— 逐步写了输入什么、预期看到什么，
+核心那条断言是 `refusal_counts = {"gro-007": 1}`（只有家长亲手填「不配合」的那条）。
+
+**动手前必读的两节**：
+1. 「✅ 迁移到 PostgreSQL 已完成」—— 尤其坑 1（**批量替换漏了 server.py，
+   12 个离线回归全绿但 `/api/card` 500**；跨进程接线必须单独打接口）
+2. 「🔜 待定：daily 的 direction 要改成 weekly」—— 有两个问题待用户确认
+
+**当前入口**：
+```bash
+# CLI（12/12 全绿，0.4s）
+cd asd_agent && ../.venv/bin/python loop.py --no-llm --script hardcoded
+# 前后端（ASD_DB_PATH 只决定 schema 名，连接串是 ASD_PG_DSN）
+ASD_DB_PATH=/tmp/ganyu_dev.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
+  ./.venv/bin/python -c "import uvicorn,server; uvicorn.run(server.app,host='127.0.0.1',port=8123,log_level='warning')"
+cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
+```
+
+**⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用
+`uv pip install --python .venv/bin/python <pkg>`。
 
 **三条最容易被回退的正确设计**（下面每条都有专门章节，别顺手改回去）：
 
@@ -825,106 +881,285 @@ for f in activities observe store statemachine coach evaluator feedback summary 
   `POST /api/observations` 应该变成"逐条反馈"+"其他观察"两个入口。
 
 ---
-### 下一步：阶段 5（Vue 前端 + FastAPI，手动测试）
+### 阶段 5 进行中（2026-10-19 晚）：Vue 前端 + FastAPI 已落地，**未提交**
 
-**2026-10-19 定：前端用 Vue 3 + Vite，后端 FastAPI，验证方式是手动点。**
-不再是 `static/index.html` 原生 JS —— Vue 组件化更适合"逐条反馈卡片"
-这种一个活动一个组件的结构。
-
-当前仓库**没有任何前端文件**（无 package.json / .vue / vite.config），
-后端也没有 server.py。阶段 1-4b 的成果全部是 Python，`loop.py` 是唯一入口。
-
-#### 目录结构建议
+**状态：代码写完并通过浏览器实测，但工作区未提交。** `git status`：
 ```
-ganyu/
-├── asd_agent/            后端，纯 Python，不动
-├── server.py             FastAPI，~300
-└── frontend/             Vue 3 + Vite（新建）
-    ├── package.json
-    ├── vite.config.js    ← proxy /api → localhost:8000
-    └── src/
-        ├── App.vue
-        ├── api.js        唯一的接口出口，fetch 全在这里
-        └── components/
-            ├── ProfileForm.vue      建档（慢，走 job）
-            ├── PlanView.vue         一周计划 + 候选理由
-            ├── CoachCard.vue        ★ 家长卡片，逐条反馈的主界面
-            ├── FeedbackItem.vue     ★ 一条活动的反馈（结果按钮+提示层级+补充）
-            ├── OtherNotes.vue       ★ 当天的「其他观察」框
-            ├── ProgressView.vue     状态机 + 日结
-            └── AgentTrace.vue       llm.LLMTrace 的展示面板
+ M asd_agent/observe.py     + source 列
+ M asd_agent/store.py       + source 列 / + connect_thread_local
+ M asd_agent/summary.py     + domain_updates 兜底与形状校验
+?? server.py                新
+?? frontend/                新（Vue 3 + Vite，8 个组件）
+?? .playwright-mcp/         ← 浏览器测试产物，建议加进 .gitignore
 ```
 
-#### 路由（对应阶段 4b 的新形态）
+#### 已落地的东西
+
+| 文件 | 说明 |
+|---|---|
+| `server.py` ~650 | 10 条路由，**零业务判断**，全部转调 `asd_agent/` |
+| `frontend/src/api.js` | 唯一 fetch 出口 + `streamJob()`（两条慢路径共用 SSE） |
+| `frontend/src/App.vue` | 一天的流程：建档 → 卡片 → 逐条反馈 →（自动）收尾 |
+| 8 个组件 | ProfileForm / PlanView / CoachCard / FeedbackItem / OtherNotes / ProgressView / AgentTrace / RedFlagList + JobProgress |
+
+**实测通过**（curl + 真浏览器）：
 ```
-POST /api/profile              → {job_id}       建档 18-47s，必须 job
-GET  /api/jobs/{id}/stream                    SSE 进度（llm.py 的 on_step 已经够用）
-POST /api/plan/{cid}           → 候选 + 每条"为什么推/为什么不推"
-POST /api/card/{cid}           → CoachCard     今天做哪条 + 怎么退路
-
-POST /api/feedbacks            → ★ 逐条反馈，body = {date, feedbacks:[
-                                    {activity_id, outcome, prompt_level,
-                                     steps_done, note}], other_notes}
-                              → DayFeedbackResult（sessions + observations 落库）
-POST /api/summary/{cid}        → ★ 日结，落 daily_summary
-GET  /api/sessions/{cid}/transitions → 状态转移（纯 Python，秒回）
-GET  /api/progress/{cid}       → what_progressed（纯 SQL，秒回）
-GET  /api/summaries/{cid}      → ★ recent_summary，教练 Agent 读的那批
+✓ /api/profile + SSE   进度逐条吐出；C11 红旗命中 urgent/self_injury
+✓ /api/plan           排序与 CLI 基线一致；36 条带原因剔除
+✓ /api/card            record_prompt 43 字（<60 上限）
+✓ /api/feedbacks       2ms 秒回，refusal_counts={'gro-007':1} 核心断言通过
+✓ npx vite build       通过；浏览器加载无 JS 错误
 ```
 
-**★ `POST /api/feedbacks` 是唯一有业务语义的新路由**，它直接对应
-`feedback.apply_feedbacks(conn, child_id, date, feedbacks, other_notes=...)`。
-注意它**不调 LLM**（outcome/quality 全是纯 Python 映射），
-只有 `note` 非空的那些条目会各触发一次 `extract_observations`。
-所以这个接口是"秒回 + 可选慢路径"，前端要能显示"正在抽取 3 条描述…"。
+#### ★ 本轮修掉的两个真 bug（都是"纸面代码"暴露的）
 
-#### ★ 三条不能破的接线约定（写给下一个 session）
+**① `observations` 表没有整段原话 —— 跨进程喂不动教练。**
+长期记忆要"把攒下的观察喂给明天的教练"，而表里只有单条事件的 `raw_quote`，
+`to_coach_inputs` 的契约却是 `raw` 必须是**整段原话** —— 用碎片拼 corpus 会让
+教练的引文回指校验把正常信号全判成编造（阶段 4 警告过）。
+→ 加 `source` 列，`observe.persist` 一并写入。**这是阶段 5 之前就存在的缺口。**
 
-1. **`build_request(before=...)` 的 `before` 参数。**
-   同一天里"发卡片"和"算明天候选"读的是**两份不同的记忆**：
-   `build_request(conn, cid, prof, before=day.date)` 会把当天刚写的日结
-   排除在外。不传 `before` 会让今天的反馈回过头来解释今天要做什么，方向反了。
+**② `DailySummary.domain_updates` 的默认值是 `(FieldInfo,)` 元组而不是 `[]`。**
+模型省略这个选填字段时，`_repair` 里 `d.domain` 直接 AttributeError → 日结 500。
+**只在 live 路径触发**，所以 `--no-llm` 的 12 个离线回归一个都没报。
+→ `_repair` 里 `isinstance(d, DomainEvidence)` 挡形状，
+   且"今天有记录却一条方向都没给"时用 `_fallback_summary` 顶上（纯 Python、零 token）。
+★ **根因仍未定位**（见下方待办）。修的是后果，不是因。
 
-2. **`latest_summary(before=)` 的 `before` 同理。**
-   `store.latest_summary(conn, cid, days=7, before=<明天>)` 才是教练该读的那批。
+#### 本轮做过的两个设计决定
 
-3. **前端不要自己算 quality。**
-   家长只传 `outcome` + `prompt_level`，`feedback.quality_for()` 是唯一的
-   quality 来源。前端算一遍就出现了第二套口径，而状态机的升级闸门
-   拿平均 quality 比 0.5/0.75 —— 两套口径必然打架。
+**日结改成自动触发。** `/api/feedbacks` 提交后直接收尾，前端不再点第二个按钮。
+理由不是省一次点击，是**那条顺序不变量（记录先落库 → 再转移 → 再日结）
+本就该由后端保证**，拆成两个端点等于让前端记着。
+加幂等保护：`apply_transitions` **不幂等**（`append_state` 只追加，重跑会状态抖动），
+所以当天已收尾就直接返回落库的那份，`force=true` 才重算。
 
-#### 手动测试清单（阶段 5 开工时按这个点）
+**LLM 与 Python 的分工（用户定）**：日结的 `direction` 由 Python 按计数判，
+LLM 只写 `flags` 和 `parent_note` —— 那些才是真需要归纳的。
 
-不写 pytest，**手动点**。每一条对应一个曾经真实踩过的坑：
+---
 
-- [ ] 建档：贴报告原文 → 等 18-47s → 看 SSE 进度条 → 出画像
-      （空库会降级成 level=0/可信度 0.1，**这是对的**，闸门该关就关）
-- [ ] 建档红旗：贴含 C11"会去咬自己的袖子"的原文 → 必须出现 urgent/self_injury
-- [ ] 卡片：`record_prompt` **不能出现两次判据**（超 60 字会 Pydantic 报错，
-      已对 50 条活动全量验证过最长 45 字）
-- [ ] 逐条反馈：Day1 只填 gro-007，fin-001/gro-006 点「跳过」
-      → **Network 面板看 `POST /api/feedbacks` 的响应里 `refusal_counts`
-      应该是 `{'gro-007': 1}`**，另两条必须是 0。这是本次改动的核心断言。
-- [ ] 「其他观察」框：填超市捂耳朵那段 → 事件进 observations，
-      但 `refusal_counts` **一条都不加**
-- [ ] 逐条 + note：note 非空的那条才会调 LLM，**观察 Network 里这条慢**，
-      其余是秒回。前端要能区分这两种等待
-- [ ] 日结：跑完一天看 `GET /api/summaries/{cid}` 有返回，
-      再看 `daily_summary` 表行数 +1
-- [ ] 冷却：连续两天拒同一条活动 → 第三天那条从候选里消失，
-      理由是"已连续抗拒 2 次，进入冷却期"
-- [ ] 进度：`GET /api/progress/{cid}` 显示"卡在未开始，本可到入门 ——
-      画像可信度不足，升级闸门拦下了"（降级画像下**这是正确输出**）
+## ✅ 迁移到 PostgreSQL 已完成（2026-10-19 晚）
 
-#### 降级方案
+**动机**：sqlite 的并发 500（见下）试过两种修法都没成功，
+而需求上本来就要换成 PG —— 于是直接换，不再在 sqlite 上修第三个版本。
+
+**环境**：`psycopg 3.3.6`（`uv pip install --python .venv/bin/python -i https://pypi.tuna.tsinghua.edu.cn/simple "psycopg[binary]"`），
+容器 `postgres:16-alpine`，端口绑 **127.0.0.1:55432**（不要绑 0.0.0.0，会把开发库暴露到局域网）：
+
+```bash
+docker run -d --rm --name ganyu_pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=ganyu -p 127.0.0.1:55432:5432 81bd698b4594
+```
+
+### ★ 并发 500 已随迁移消失（这才是换 PG 的唯一理由）
+
+| 测试 | sqlite（迁移前） | psycopg（迁移后） |
+|---|---|---|
+| HTTP 15 轮 × 12 并发 = 180 请求 | **失败 8** | **0 失败** |
+| 进程内 12 线程 × 15 轮 × 4 个只读查询 = 720 | 偶发 `InterfaceError` | **0 失败** |
+| 12 线程 × 8 轮 × 3 种写 = 288 条 | 需全局锁 | **0 失败、0 丢失** |
+
+**根因回顾**：`sqlite3` 的**游标**不是线程安全的。`check_same_thread=False`
+只是「不检查线程归属」，**不等于线程安全** —— 两个线程同时 `execute()`
+同一个连接即抛 `InterfaceError: bad parameter or other API misuse`。
+
+⚠️ **这个 bug 串行测不出来。** 当年连打 15 次串行全绿、5 轮小并发也只炸 2 轮，
+差点据此否定它。迁移后又特意用**同样的形状**压测，就是为了确认它真的没了。
+
+### 改了什么（34 条 SQL，5 个文件）
+
+| 位置 | sqlite | postgres |
+|---|---|---|
+| 7 张表主键 | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGINT GENERATED ALWAYS AS IDENTITY` |
+| 占位符 | `?` | `%s` |
+| 布尔列 | `INTEGER NOT NULL DEFAULT 0` | `BOOLEAN NOT NULL DEFAULT FALSE` |
+| 建表 | `executescript()` | 多语句单次 `execute()`（psycopg3 支持，已实测） |
+| 取自增 id | `cursor.lastrowid` | `INSERT ... RETURNING id` |
+| 临时库 | 删 `/tmp/x.db` + `-wal` + `-shm` | `store.reset()` → `DROP SCHEMA ... CASCADE` |
+| 列清单 | `sqlite_master` | `information_schema.tables` + `current_schema()` |
+
+**可以保留的**：`row["col"]`（`conn.row_factory = dict_row` 保住）、
+`COUNT(DISTINCT …)`、`BETWEEN`、`ORDER BY …, id`、`ON CONFLICT … DO UPDATE`。
+**改动集中在 DDL 与占位符，查询逻辑基本没动。**
+
+### ★ 三个值得单独说的决定
+
+**① 「路径」翻译成 schema，不是 database。**
+调用点传 `/tmp/xxx.db` 的目的是「拿一个干净互不干扰的环境」。
+`CREATE DATABASE` 不能在事务里跑、不能被连接池复用、删库还得先断连接 ——
+三处都比 schema 麻烦，而 `DROP SCHEMA ... CASCADE` 一条语句正好等于「删掉这个 db 文件」。
+→ 34 个调用点的形状原样保留，`ASD_DB_PATH` 沿用旧名（只决定 schema 名），
+新的连接串是 `ASD_PG_DSN`。
+
+**② `connect_thread_local()` 与 `connect()` 合流成一个入口。**
+迁移前它们是两个入口、两套缓存，于是「某个调用点忘了用 thread_local 版」
+成了一种可能 —— 而当年手写 `with _IO_LOCK:` 漏了 6 处端点正是同一类错误。
+现在只有一个入口，这种错误在结构上不再可能。
+
+**③ `_IO_LOCK` 连同它保护的顺序不变量一起处理。**
+删锁之前逐处看过：它锁的三处都是「先写记录 → 再转移 → 再日结」这类**顺序不变量**。
+这些不变量是真的（`apply_transitions` 读的是 append 之前的 `current_states`，
+边算边写会让后一条看到前一条的结果），所以**保留不变量、只删锁**，
+并在原地写下它到底在保证什么。留一把不再需要的锁不只是冗余 ——
+它会让下一个人以为「这里还有个必须加锁的坑」。
+
+### 本轮踩到的坑（已修，勿回退）
+
+1. **★ 批量替换漏了 `server.py`，而它不在回归集里。**
+   `asd_agent/` 六个文件的 `?`→`%s` 一次替换全中，
+   12 个离线入口全绿 —— 但 `server.py` 里那处 `WHERE child_id=?` 没被处理，
+   `/api/card` 直接 500（`ProgrammingError: the query has 0 placeholders but 2 parameters were passed`）。
+   **它只在真发 HTTP 时才暴露，而 12 个回归入口一个都不碰 server.py。**
+   → 「改完离线回归全绿」不等于改完了，凡是跨进程的接线都要单独打一次接口。
+
+2. **`SUM(outcome='success')` 在 PG 里直接报错**，不是静默算错：
+   `function sum(boolean) does not exist`（sqlite 把比较结果当 0/1 累加，PG 不会）。
+   → `COUNT(*) FILTER (WHERE outcome='success')`。**这类差异好在它是硬报错。**
+
+3. **`cursor.lastrowid` 不存在**，7 个写入函数全部要改 `RETURNING id`。
+   psycopg3 也没有 `Connection.row_factory` 的**类属性**，
+   但**实例属性可设** —— 设了之后 `row["col"]` 与 `dict(row)` 都能照旧用。
+
+### 验证（全部实测通过）
+
+```bash
+docker run -d --rm --name ganyu_pg -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=ganyu -p 127.0.0.1:55432:5432 81bd698b4594
+cd asd_agent
+for f in vocab activities capabilities statemachine store redflag coach evaluator observe feedback summary planner; do
+  ../.venv/bin/python $f.py; done          # 12/12 全绿
+../.venv/bin/python activities.py --validate
+../.venv/bin/python loop.py --no-llm --script hardcoded   # 五日闭环 + 冷却 + 日结落库 5 行
+```
+
+HTTP 全链路（`ASD_NO_LLM=1`，13 条路由）：
+```
+✓ /api/profile + SSE    进度逐条吐出
+✓ /api/plan             排序与 CLI 基线一致；36 条带原因剔除
+✓ /api/card             record_prompt 43 字（<60 上限），3 步 / 3 级提示阶梯
+✓ /api/feedbacks        refusal_counts={'gro-007':1}  ★核心断言通过；其他观察框贡献 0 条
+✓ /api/close            日结自动落库（进 close 子对象）
+✓ 并发 180 请求         0 失败（迁移前 8 失败）
+```
+
+**注意**：`/api/summaries` 不带 `before=` 时返回空，是**既有设计**不是回归 ——
+`latest_summary` 用 `on_date<?`（严格小于 today），教练读的是「之前」。
+与 sqlite 口径完全一致，已核对。
+
+### 数据在哪
+
+PG 里每个「临时库」对应一个 schema，可直接查：
+```bash
+docker exec ganyu_pg psql -U postgres -d ganyu -c "\dt loop_loop_child.*"
+```
+
+---
+
+## 🔜 待定：daily 的 direction 要改成 weekly（用户已提出，未实现）
+
+**用户原话**：「一天的数据和上一次比统计说服力不足，每天先只记一个分数，
+到一周了再汇总更新一次」—— **这个判断是对的，已采纳。**
+
+**问题**：现在 `up/flat/down` 有**两套判定，且互相矛盾**：
+| 层 | 谁判 | 依据 |
+|---|---|---|
+| 日结 `DailySummary.domain_updates[].direction` | **LLM** | prompt 里喂计数，让模型开口说 |
+| 状态机 `propose_transition` | **Python** | 7/14 天窗口计数 |
+
+同一件事，一套问模型、一套数计数。而日结那个方向判断**只被 `coach.py:280`
+读进 prompt**，不参与任何判定 —— 危害有限，但它把一个**可判定**的问题
+交给了不可复现的字符串，违反「模型给证据，Python 做判定」。
+
+**打算怎么改**：
+- **每天只记一个分数** —— `sessions` 表已经存了每天的 `quality`（`quality_for()` 算的），
+  **数据已经在记了，不需要新表**
+- 新增 `weekly_direction(conn, cid, week)`：按能区对比本周 vs 上周的
+  `avg(quality)` 与成功率，出 `up/flat/down`
+- **阈值要承认噪声**：差异小于某幅度就判 `flat`；
+  **样本不足（本周 <3 次）就说不足，不猜**
+- `DailySummary.domain_updates` 降级为"当天事实"；**方向只在周报里出现**
+
+**已定**：LLM 那次调用**保留**，只写 `flags` + `parent_note`（这两个确实需要归纳）。
+LLM 调用数不变，仍是每天 1 次。
+
+**两个待确认（动手前问）**：
+1. daily 的 direction **直接删掉**，还是保留但标注"仅供参考"？
+   （若删，要改 `coach.py:280` 喂什么给它）
+2. 周对比按**能区**（5 个）还是**技能细项**（几十个）？
+   细项更具体但样本更少、更容易"样本不足"。
+
+**明确不做**：在反馈表单上加"比上次轻松/差不多/费劲"三个按钮。
+—— 那等于把系统该做的判断推给家长，且**单日对比统计上没有意义**。
+
+---
+
+### ★ 前端手测发现的 bug：反馈表印了别的活动的判据（已修）
+
+**症状**：生成卡片（`gro-007`）后，从候选点「用它」加进 `cog-001`、`soc-002`，
+**三行反馈表全都显示 gro-007 的内容** ——
+`活动：gro-007 一二三木头人` / `判断标准：能连续 5 轮听到口令后停下不动`。
+
+**根因**：`App.vue` 传给 `FeedbackItem` 的三个 prop 是**无条件取卡片那条活动**：
+```vue
+:title="card?.activity?.activity_id === f.activity_id ? ... : f.activity_id"  ← 只有 title 加了判断
+:difficulty="card?.activity?.difficulty ?? '—'"     ← 无判断
+:n-steps="card?.n_steps || 3"                       ← 无判断
+:form-text="card?.feedback_form || ''"              ← 无判断
+```
+**危害比「显示错」更严重**：家长会**照着 gro-007 的成功判据去判断 cog-001 做没做到**，
+然后把结论填进去 —— 错判据比没有判据更有害。
+
+**修法**（用户选定）：`/api/plan` 每条候选补上自己的 `n_steps` / `feedback_form`
+（用与 `/api/card` **同一个** `render_feedback_form`，两处不会漂移）；
+`PlanView` 暴露 `infoOf(activity_id)`；`App.vue` 按行取，取不到就留空。
+
+**★ 教训**：
+1. **`vite build` 通过 ≠ 渲染正确。** 这个 bug 编译期毫无征兆 ——
+   它不是语法错，是**数据用错了源**，构建器看不出来，只有真点按钮才暴露。
+   阶段 5 交付时写的「浏览器实测通过」验的是 curl 能通，不是渲染对。
+2. **错判据比空判据有害。** 取不到信息时让 `form-text` 留空、`n_steps` 退回 3 ——
+   空白家长看得出是「没信息」，印着别人的判据则会被当成真的照着填。
+3. **`title` 加了判断而 `form-text` 没加**，这种「改了一处忘了另一处」
+   很难靠读代码发现，只能靠真跑一遍。
+
+---
+
+## ⚠️ 已知遗留（本轮发现）
+
+- **`DailySummary.domain_updates` 默认值为何是 `(FieldInfo,)` 尚未定位。**
+  已用形状校验挡住后果，但**为什么**没查清。下一个 session 若有余力，
+  值得单独二分一次（⚠️ 别再手写"看起来一样"的最小复现 —— 我试了 3 次全部
+  复现不出来，每次都得出 `[]` 然后推翻自己重来。正确做法是**直接二分真文件**）。
+- **`refusal_counts >= 2` 没有冷却期结束条件**（阶段 4b 遗留，语义变了但问题还在）
+- **抽取质量仍未验证**：outcome 由家长点之后绕开了它，
+  但"从家长补充描述里抽事件"的准确率依然只有 live/capture 才测得到
+- **`--no-llm` 下状态机仍被闸门冻结**（降级画像 0.1）—— 这是对的，闸门该关就关
+
+---
+
+## 阶段 5 的手动测试清单（原方案，已按实现调整）
+
+**启动**：
+```bash
+ASD_DB_PATH=/tmp/ganyu_dev.db ./.venv/bin/python server.py
+cd frontend && npm run dev     # ⚠️ 5173 被占时会自动退到 5174，看启动日志
+```
+**测之前**：打开左上角「离线模式」开关（live 模式每次出卡片要 30-45s）。
+
+- [ ] 建档：贴报告 → SSE 进度 → 出画像。空库会降级成可信度 0.1，**这是对的**
+- [ ] 建档红旗：贴含 C11「会去咬自己的袖子」的原文 → 必须出现 urgent/self_injury
+- [ ] 逐条反馈：Day1 只填 gro-007 填「不配合」，fin-001/gro-006 点「跳过」
+      → 响应里 `refusal_counts` 必须是 `{'gro-007': 1}`
+- [ ] 「其他观察」框：填超市捂耳朵 → 事件进 observations，`refusal_counts` **一条都不加**
+- [ ] 逐条 + note：note 非空的那条才调 LLM，**Network 里这条慢**，其余秒回
+- [ ] 日结：提交后**自动**出现在响应里，`daily_summary` 表行数 +1
+- [ ] 冷却：连续两天拒同一条 → 第三天它从候选消失，理由「已连续抗拒 2 次」
+- [ ] 进度：可信度 0.1 时显示「卡在未开始，本可到入门 —— 升级闸门拦下了」（**正确输出**）
+- [ ] **并发**：`Promise.all` 打 progress+summaries 不再 500（换 PG 后应彻底消失）
+
+## 降级方案
 
 时间紧就**直接交 CLI demo**，前端可以整个砍掉 ——
 `loop.py --no-llm --script hardcoded`（0.0s，五日闭环 + 冷却 + 日结落库）
-加 `--seed-history`（状态机与闸门对照）已经覆盖全部技术叙事：
-多 Agent、结构化检索、长期记忆、状态机、闭环。
-
-#### 开工前必做
-
-实测阶段 3/4/4b 新增路径的真实模型行为（见各处「未实测」）：
-`ObservationBatch` 在 `SYSTEM_SINGLE` 下的合规率、
-多事件会不会截断（max_tokens=4000）、真实耗时。
+加 `--seed-history` 已覆盖全部技术叙事：多 Agent、结构化检索、长期记忆、状态机、闭环。

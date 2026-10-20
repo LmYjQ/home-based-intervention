@@ -41,7 +41,7 @@ target_states）。
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 from datetime import date, timedelta
 from typing import Literal
 
@@ -210,7 +210,7 @@ def _fallback_summary(inp: SummaryInput) -> DailySummary:
 
 
 # ================================================================== 主入口
-def summarize_day(conn: sqlite3.Connection, child_id: str, date: str, *,
+def summarize_day(conn: psycopg.Connection, child_id: str, date: str, *,
                    sessions: list | None = None, observations: list | None = None,
                    no_llm: bool = False, save: bool = True,
                    on_step=None) -> DailySummary:
@@ -247,6 +247,20 @@ def summarize_day(conn: sqlite3.Connection, child_id: str, date: str, *,
                 max_tokens=1500, temperature=0.0,
                 timeout_s=llm.TIMEOUT_S * 2, on_step=on_step)
             out = _repair(inp, draft)
+            # ★ 今天**有**记录却一条方向都没给 —— 这不是"今天没练"，是丢了数据。
+            #   两者的区别下游看不出来：明天的教练读 recent_summary 拿到的
+            #   都是"没有方向信息"，于是安静跳过。
+            #   "没练过"是有意义的空（上面 not sessions 分支），这里不是。
+            #   → 用 _fallback_summary 顶上：它只按计数报事实，纯 Python、零 token，
+            #     正好是模型该做而没做的那部分。
+            if not out.domain_updates and not _all_skipped(inp):
+                fb = _fallback_summary(inp)
+                out = out.model_copy(update={
+                    "domain_updates": fb.domain_updates,
+                    "flags": out.flags or fb.flags,
+                    "parent_note": (out.parent_note or fb.parent_note),
+                    "degraded": True,
+                })
         except llm.LLMError:
             out = _fallback_summary(inp)
 
@@ -272,7 +286,14 @@ def _repair(inp: SummaryInput, draft: DailySummary) -> DailySummary:
     # 留着等于埋一个"看起来有矛盾"的雷。
     seen: set[str] = set()
     doms: list[DomainEvidence] = []
+    # ★ `draft.domain_updates` 只信任**真的是 DomainEvidence 的项**。
+    #   模型省略这个选填字段时，某些环境下 Pydantic 取到的默认值是个
+    #   `(FieldInfo,)` 元组而不是 `[]` —— 紧接着 `d.domain` 就 AttributeError，
+    #   整个日结 500。根因还没定位到，但这里必须挡住：
+    #   下游只该看到 DomainEvidence，别的形状一律当"没给"。
     for d in draft.domain_updates:
+        if not isinstance(d, DomainEvidence):
+            continue
         if d.domain in seen:
             continue
         seen.add(d.domain)
@@ -294,6 +315,16 @@ def _repair(inp: SummaryInput, draft: DailySummary) -> DailySummary:
                                     "flags": flags})
 
 
+def _all_skipped(inp: SummaryInput) -> bool:
+    """今天是不是全部 skipped（一条都没真做）。
+
+    ★ 与 `_fallback_summary` 里 `outcome != "skipped"` 同一口径。
+      skipped 不参与方向判断 —— "发了卡片没来得及做"不是"做了但没效果"，
+      全是 skipped 的那天不该被补一条方向出来。
+    """
+    return all(r.get("outcome") == "skipped" for r in inp.today)
+
+
 # ================================================================== 从 store 读
 def _row(s) -> dict:
     """SessionRecord → 日结用的一行。带上 domain（从活动库反查）。"""
@@ -308,11 +339,11 @@ def _row(s) -> dict:
     }
 
 
-def _sessions_on(conn: sqlite3.Connection, child_id: str, on_date: str) -> list:
+def _sessions_on(conn: psycopg.Connection, child_id: str, on_date: str) -> list:
     from statemachine import SessionRecord
     rows = conn.execute(
         "SELECT session_date,activity_id,outcome,quality,out_of_routine "
-        "FROM sessions WHERE child_id=? AND session_date=? ORDER BY id",
+        "FROM sessions WHERE child_id=%s AND session_date=%s ORDER BY id",
         (child_id, on_date)).fetchall()
     return [SessionRecord(date=r["session_date"], activity_id=r["activity_id"],
                           outcome=r["outcome"], quality=r["quality"],
@@ -320,11 +351,11 @@ def _sessions_on(conn: sqlite3.Connection, child_id: str, on_date: str) -> list:
             for r in rows]
 
 
-def _observations_on(conn: sqlite3.Connection, child_id: str,
+def _observations_on(conn: psycopg.Connection, child_id: str,
                      on_date: str) -> list[str]:
     import json
     rows = conn.execute(
-        "SELECT payload FROM observations WHERE child_id=? AND observed_at=? "
+        "SELECT payload FROM observations WHERE child_id=%s AND observed_at=%s "
         "ORDER BY id", (child_id, on_date)).fetchall()
     out: list[str] = []
     for r in rows:
@@ -337,14 +368,19 @@ def _observations_on(conn: sqlite3.Connection, child_id: str,
     return out
 
 
-def _history(conn: sqlite3.Connection, child_id: str, end_date: str,
+def _history(conn: psycopg.Connection, child_id: str, end_date: str,
              days: int = 7) -> list[dict]:
     """近 N 天的每日计数。**纯 SQL。**"""
     start = (date.fromisoformat(end_date) - timedelta(days=days)).isoformat()
     rows = conn.execute(
         "SELECT session_date, COUNT(*) AS n, "
-        "  SUM(outcome='success') AS s, SUM(outcome='refused') AS r "
-        "FROM sessions WHERE child_id=? AND session_date>=? AND session_date<=? "
+        # ★ COUNT(*) FILTER 而不是 SUM(outcome='success')：
+        #   后者是 sqlite 的写法（它把比较结果当 0/1 累加），
+        #   PostgreSQL 里直接报 `function sum(boolean) does not exist` —— 实测过。
+        #   FILTER 是 PG 的标准聚合过滤写法，语义一致且不依赖隐式类型转换。
+        "  COUNT(*) FILTER (WHERE outcome='success') AS s, "
+        "  COUNT(*) FILTER (WHERE outcome='refused') AS r "
+        "FROM sessions WHERE child_id=%s AND session_date>=%s AND session_date<=%s "
         "GROUP BY session_date ORDER BY session_date",
         (child_id, start, end_date)).fetchall()
     return [{"date": r["session_date"], "n": r["n"],
@@ -357,12 +393,7 @@ def _cli() -> None:
     import feedback
 
     db = "/tmp/summary_check.db"
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + suffix)
-        except FileNotFoundError:
-            pass
-    conn = store.connect(db)
+    conn = store.reset(db)   # ★ 一行代替删 db/-wal/-shm 三个文件
     cid = "sum-check"
     store.ensure_child(conn, cid, age_months=34)
 
@@ -376,7 +407,7 @@ def _cli() -> None:
     s1 = summarize_day(conn, cid, "2026-10-17", no_llm=True)
     print("  " + s1.render().replace("\n", "\n  "))
 
-    n = conn.execute("SELECT COUNT(*) AS c FROM daily_summary WHERE child_id=?",
+    n = conn.execute("SELECT COUNT(*) AS c FROM daily_summary WHERE child_id=%s",
                      (cid,)).fetchone()["c"]
     print(f"\n  daily_summary 表行数 = {n}")
     assert n == 1, "日结必须落库"

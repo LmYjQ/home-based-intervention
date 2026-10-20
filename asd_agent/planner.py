@@ -44,6 +44,7 @@ from capabilities import LEVEL_CN, AbilityProfile
 from vocab import ABILITY_DOMAIN, SCENE, STATE_TARGET_DIFFICULTY
 
 MAX_DAYS = 7
+MAX_PER_DAY = 5          # 一天最多几条。贪心装箱靠时间预算约束，这个只是兜底
 Slot = str  # morning / afternoon / evening / anytime
 
 
@@ -391,11 +392,70 @@ def todays_plan(req: PlanRequest, *, top_k: int = 12) -> list[ScoredActivity]:
     return retrieve_candidates(req, top_k=top_k)
 
 
+# ================================================================== 一天的装箱
+def pack_day(cands: list[ScoredActivity], budget_minutes: int, *,
+             first: ScoredActivity | None = None,
+             max_n: int = MAX_PER_DAY) -> list[ScoredActivity]:
+    """按分数贪心装箱，**把家长给的分钟数尽量占满**。纯 Python、零 LLM、可复现。
+
+    ★ 为什么"今天做哪几条"不需要模型：
+      排不排得下（时长）、会不会重复（活动 id）、会不会一天练同一个技能细项 ——
+      全是**可判定**的。让 7B 去"判断"这些只会引入不可复现的抖动，
+      而家长明天打开页面看到的推荐顺序和今天不一样，是这个 demo 最不能出的错。
+      模型留给两件真正需要理解的事：今天孩子是什么状态（诊断）、
+      以及怎么跟他做才做得成（卡片文案与退路）。
+
+    ★ 同一天不重复练同一个技能细项 —— 这条原本只写在 SYSTEM 提示词里
+      （"一天不要安排同一个技能细项下的多条活动，孩子会腻"），
+      而**提示词是建议，模型可以不听**。一天三条大运动，
+      "腻了"是这类工具被弃用的头号原因，所以它必须是硬保证而不是措辞。
+      实测 50 条活动里 `轮流等待` 覆盖 10 条，不设这条约束的话
+      贪心装箱很容易把同一个细项排满一整天。
+
+    ★ 装箱用的是 `total_min + prep_min`：备料时间也是家长的时间。
+      只算活动时长会让一天的总量真实地超出家长给的预算。
+
+    `first` 是教练诊断之后选定的焦点活动（可能已经换过一条），
+    它先入箱，剩下的分钟数才分给其余候选。
+    """
+    budget = int(budget_minutes)
+    picked: list[ScoredActivity] = []
+    used_ids: set[str] = set()
+    used_skills: set[str] = set()
+    spent = 0
+
+    def try_add(s: ScoredActivity) -> bool:
+        nonlocal spent
+        a = s.activity
+        if a.activity_id in used_ids:
+            return False
+        if used_skills & set(a.target_skill_items):
+            return False          # 今天已经练过这个细项了
+        cost = a.total_min + a.prep_min
+        if spent + cost > budget:
+            return False
+        picked.append(s)
+        used_ids.add(a.activity_id)
+        # 用 update 而不是 `|=`：闭包里 `|=` 会把名字重新绑定成本地变量，
+        # 于是函数自己都读不到它（UnboundLocalError）。
+        used_skills.update(a.target_skill_items)
+        spent += cost
+        return True
+
+    if first is not None:
+        try_add(first)
+    for s in cands:
+        if len(picked) >= max_n or spent >= budget:
+            break
+        try_add(s)
+    return picked
+
+
 def _cli() -> None:
     import store
     from capabilities import ParentConstraints
 
-    conn = store.connect("/tmp/planner_demo.db")
+    conn = store.reset("/tmp/planner_demo.db")
     store._seed_demo(conn, "demo-001", confidence=0.85)
     prof = store.latest_profile(conn, "demo-001")
     states = store.current_states(conn, "demo-001")
@@ -429,6 +489,32 @@ def _cli() -> None:
     print(f"\n  总 {sum(d.total_minutes for d in fb.days)} 分钟，"
           f"每日上限 {req.daily_minutes} → "
           f"{'✓ 全天不超预算' if all(d.total_minutes <= req.daily_minutes for d in fb.days) else '✗ 超预算'}")
+
+    print("\n=== 单日装箱（今天页用的就是它，纯 Python 零 LLM）===")
+    picks = pack_day(cands, req.daily_minutes)
+    spent = sum(s.activity.total_min + s.activity.prep_min for s in picks)
+    for s in picks:
+        a = s.activity
+        print(f"    {a.activity_id} {a.total_min}+{a.prep_min}min  {a.title}"
+              f"  {'/'.join(a.target_skill_items)}")
+    print(f"  {len(picks)} 条，共 {spent} 分钟（预算 {req.daily_minutes}）")
+
+    # 三条硬约束。少一条都是"能跑但错"，而界面上看不出来。
+    assert spent <= req.daily_minutes, f"超预算：{spent} > {req.daily_minutes}"
+    skills = [x for s in picks for x in s.activity.target_skill_items]
+    assert len(skills) == len(set(skills)), f"同一天重复练同一个技能细项：{skills}"
+    ids = [s.activity.activity_id for s in picks]
+    assert len(ids) == len(set(ids)), f"同一天重复排了同一条活动：{ids}"
+    print("  ✓ 不超预算（含备料时间）/ 技能细项不重复 / 活动不重复")
+
+    # 焦点优先：诊断换过的那条要先入箱，且不能把它挤掉
+    focus = cands[2] if len(cands) > 2 else None
+    if focus:
+        p2 = pack_day(cands, req.daily_minutes, first=focus)
+        assert p2[0].activity.activity_id == focus.activity.activity_id, "焦点没排在第一条"
+        assert focus.activity.activity_id in [x.activity.activity_id for x in p2], "焦点被挤掉了"
+        print(f"  ✓ 指定焦点 {focus.activity.activity_id} → 排在第 1 条，共 "
+              f"{sum(x.activity.total_min + x.activity.prep_min for x in p2)} 分钟")
 
     print("\n=== LLM 编排 + 三道后置校验 ===")
     plan = plan_week(prof, req, plan_id="plan-demo", days=7, today="2026-10-17")

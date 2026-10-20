@@ -18,5 +18,12 @@ asd_agent/*.db-shm
 # —— 但它们体积大且需要现场重录，默认不进版本库
 asd_agent/fixtures/responses/
 
+# ---------------------------------------------------------------- 前端
+node_modules/
+frontend/dist/
+
+# Playwright MCP 的浏览器测试产物（snapshot / console log），不是源码
+.playwright-mcp/
+
 # ---------------------------------------------------------------- 系统
 .DS_Store

@@ -699,7 +699,7 @@ def _cli() -> None:
     import store
     from activities import PlanRequest, candidates as retrieve_candidates
 
-    conn = store.connect("/tmp/coach_demo.db")
+    conn = store.reset("/tmp/coach_demo.db")
     store._seed_demo(conn, "demo-001", confidence=0.85)
     prof = store.latest_profile(conn, "demo-001")
     pc = prof.parent_constraints
@@ -791,7 +791,6 @@ def _cli() -> None:
     print("  ★ 只收紧不放松：模型判 drop 的分支在函数规则之前就 return 了")
 
     conn.close()
-    os.remove("/tmp/coach_demo.db")
 
 
 if __name__ == "__main__":

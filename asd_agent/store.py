@@ -2,7 +2,7 @@
 """
 长期记忆存储
 ============
-标准库 sqlite3，零依赖，不上 ORM。这是整个系统里唯一一个"跨天"的东西，
+PostgreSQL（psycopg3）+ 纯 SQL，不上 ORM。这是整个系统里唯一一个"跨天"的东西，
 所以它的两条设计决定值得说明。
 
 一、**skill_state 只追加，永不 UPDATE**
@@ -24,8 +24,9 @@ Pydantic 对象直接进 prompt，**不在这里拼任何给 LLM 看的字符串
 而提示词和 SQL 各改一处是这类系统最常见的线上事故。
 渲染留给 `activities.render_*` 这类已经存在的地方。
 
-并发：`threading.Lock` 包住所有 DB 操作 + `PRAGMA journal_mode=WAL`。
-**不要用 async sqlite** —— FastAPI 那边已经是同步路由（见 PROGRESS），
+并发：**每线程一个连接，不加锁**。这一段是本文件迁移到 PostgreSQL 时
+改动最大、也最有价值的地方，理由见 `connect()` 的 docstring。
+**不要用 async psycopg** —— FastAPI 那边是同步路由（见 PROGRESS），
 收益为零而复杂度翻倍。
 """
 
@@ -33,36 +34,129 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import re
 import threading
 from datetime import date, timedelta
 from typing import Any
 
+import psycopg
+from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
 
+Connection = psycopg.Connection
+
+DEFAULT_DSN = os.getenv(
+    "ASD_PG_DSN", "postgresql://postgres:postgres@127.0.0.1:55432/ganyu")
 DEFAULT_DB = os.getenv("ASD_DB_PATH", str(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "asd_agent.db")))
 
-_LOCK = threading.Lock()          # sqlite3 的连接不可跨线程共享；这里用一把全局锁串行化
-_CONNS: dict[str, sqlite3.Connection] = {}
+_TLS = threading.local()      # 每线程一份连接，见 connect()
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
+def _schema_of(path: str) -> str:
+    """/tmp/feedback_check.db → "feedback_check"。
+
+    **为什么要把「路径」翻译成「schema」而不是直接换成数据库名：**
+    调用点传路径的目的是「拿一个干净、互不干扰的环境」——
+    自检脚本删掉 /tmp/xxx.db 再连，就是为了让这张表从零开始。
+    换成独立的 database 也能做到，但 `CREATE DATABASE` 不能在事务里跑、
+    不能被连接池复用、删库还得先断连接，三处都比 schema 麻烦。
+    schema 是同一个 database 里的命名空间，`DROP SCHEMA ... CASCADE`
+    一条语句就等于「删掉这个 db 文件」，语义一一对应。
+    """
+    name = os.path.basename(path)
+    if name.endswith(".db"):
+        name = name[:-3]
+    name = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_").lower()
+    return name or "ganyu"
+
+
+def connect(path: str | None = None) -> psycopg.Connection:
+    """**每线程一个连接。CLI 和服务都用这一个入口。**
+
+    ★ 为什么每线程一个，而不是像迁移前那样按路径缓存一个共享连接：
+      sqlite3 的**游标**不是线程安全的，`check_same_thread=False` 只是
+      「不检查线程归属」而**不等于线程安全** —— 两个线程同时 `execute()`
+      同一个连接会抛 `InterfaceError: bad parameter or other API misuse`。
+      这不是理论：前端 `Promise.all` 并发打 `/api/progress` + `/api/summaries`，
+      实测 180 个请求失败 8 个，而串行连打 15 次全绿。
+
+      psycopg3 没有这个问题（服务端协议不依赖客户端游标状态，
+      同一连接并发 execute 实测 12 线程 × 40 次查询 0 失败），
+      但**仍然每线程一个连接** —— 共享连接会让所有请求排成一条队，
+      psycopg 文档也建议每线程一个。这里把 `connect_thread_local()`
+      合流进 `connect()`：迁移前它们是两个入口、各自一套缓存，
+      合并后只有一个，**不会再出现「某个调用点忘了用 thread_local 版」**。
+
+    ★ 为什么是 autocommit（2026-10-20 实测后改）
+    --------------------------------------------------
+    连接是**长连接**且按线程缓存的，所以在非 autocommit 下，任何一次
+    普通 SELECT 都会开一个事务，而它**永远不会被提交或回滚** ——
+    读操作全项目一次 `rollback()` 都没有。于是连接会在 `pg_stat_activity`
+    里长期停在 `idle in transaction`。
+
+    这不是洁癖问题，它有两个真实后果：
+      1. `CREATE INDEX CONCURRENTLY` 等的是**整个 database** 的 virtualxid，
+         与 schema 无关 → 任何一条 idle-in-transaction 都能把 checkpointer 的
+         `setup()` 卡死（实测卡了 3 分钟不出）
+      2. 长期空转事务会挡住 VACUUM
+
+    改成 autocommit **语义零变化**：本项目所有写函数
+    （ensure_child / save_profile / append_state / save_plan /
+      log_session / log_observation / save_summary …）都是**各自结尾
+    单独 `commit()`**，没有一处多语句事务，事务模型本来就是「一条语句
+    一个事务」。那些 `commit()` 调用保留着——autocommit 下它们是无害的
+    no-op（psycopg3 允许），万一哪天关掉 autocommit 仍然是正确的。
+
+    实测：autocommit=False 时 SELECT 后 `transaction_status=2`（ACTIVE，事务开着），
+    autocommit=True 时 `=0`（无事务）。
+    """
     p = path or DEFAULT_DB
-    with _LOCK:
-        if p not in _CONNS:
-            c = sqlite3.connect(p, check_same_thread=False)
-            c.row_factory = sqlite3.Row
-            c.execute("PRAGMA journal_mode=WAL")     # 读写不互相阻塞
-            c.execute("PRAGMA foreign_keys=ON")
-            _init(c)
-            c.commit()
-            _CONNS[p] = c
-        return _CONNS[p]
+    sch = _schema_of(p)
+    conns = getattr(_TLS, "conns", None)
+    if conns is None:
+        conns = _TLS.conns = {}
+    if sch not in conns:
+        c = psycopg.connect(DEFAULT_DSN, autocommit=True)
+        c.row_factory = dict_row                  # 保住 row["col"] 与 dict(row)
+        with c.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{sch}"')
+            cur.execute(f'SET search_path TO "{sch}"')
+        c.commit()
+        _init(c)
+        conns[sch] = c
+    return conns[sch]
 
 
-def _init(c: sqlite3.Connection) -> None:
-    c.executescript("""
+def connect_thread_local(path: str | None = None) -> psycopg.Connection:
+    """**已废弃，只是 `connect()` 的别名。**
+
+    保留它是因为 `server.py` 曾经用它绕开 sqlite 的并发 bug，
+    而调用点不必为此改动。语义已经完全相同。
+    """
+    return connect(path)
+
+
+def reset(path: str | None = None) -> psycopg.Connection:
+    """★ 替代迁移前那些 `os.remove("/tmp/xxx.db" + 后缀)` 的自检开头。**
+
+    「删掉临时库、重新连一个干净的」= `DROP SCHEMA ... CASCADE` + 建表。
+    没有这一步，自检脚本第二次跑会因为上一轮的残留行而误报。
+    """
+    p = path or DEFAULT_DB
+    sch = _schema_of(p)
+    c = connect(p)
+    c.execute(f'DROP SCHEMA IF EXISTS "{sch}" CASCADE')
+    c.commit()
+    conns = getattr(_TLS, "conns", None)
+    if conns and sch in conns:
+        del conns[sch]        # 让下一次 connect() 重建 schema 与表
+    return connect(p)
+
+
+def _init(c: psycopg.Connection) -> None:
+    # psycopg3 没有 executescript，但多语句单次 execute 是支持的（已实测）
+    c.execute("""
     CREATE TABLE IF NOT EXISTS children (
         child_id      TEXT PRIMARY KEY,
         name          TEXT,
@@ -72,7 +166,7 @@ def _init(c: sqlite3.Connection) -> None:
 
     -- 能力画像会被新报告整体替换，所以这张表按 version 存多份，取最新一份
     CREATE TABLE IF NOT EXISTS ability_profile (
-        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        id                  BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id            TEXT NOT NULL REFERENCES children(child_id),
         created_at          TEXT NOT NULL,
         report_date         TEXT,
@@ -84,7 +178,7 @@ def _init(c: sqlite3.Connection) -> None:
 
     -- ★ 只追加，永不 UPDATE。状态历史即审计日志。
     CREATE TABLE IF NOT EXISTS skill_state (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         skill_item  TEXT NOT NULL,
         domain      TEXT NOT NULL,
@@ -97,7 +191,7 @@ def _init(c: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_state_child ON skill_state(child_id, skill_item, id);
 
     CREATE TABLE IF NOT EXISTS plans (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         plan_date   TEXT NOT NULL,
         created_at  TEXT NOT NULL,
@@ -106,29 +200,38 @@ def _init(c: sqlite3.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_plan_child ON plans(child_id, plan_date DESC);
 
     CREATE TABLE IF NOT EXISTS sessions (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id      TEXT NOT NULL REFERENCES children(child_id),
         session_date  TEXT NOT NULL,
         activity_id   TEXT NOT NULL,
         outcome       TEXT NOT NULL,      -- success / partial / refused / skipped
         quality       REAL NOT NULL DEFAULT 0,
-        out_of_routine INTEGER NOT NULL DEFAULT 0,
+        -- ★ BOOLEAN 而不是 INTEGER 0/1：迁移前存的是 int(rec.out_of_routine)，
+        --   读的时候又 bool(...) 包一层，两处都在假装这是个布尔。
+        --   换成真 BOOLEAN 后 psycopg 直接给 Python bool，两处转换都可以删。
+        out_of_routine BOOLEAN NOT NULL DEFAULT FALSE,
         note          TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_session_child ON sessions(child_id, session_date);
     CREATE INDEX IF NOT EXISTS idx_session_act   ON sessions(child_id, activity_id);
 
     CREATE TABLE IF NOT EXISTS observations (
-        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id      TEXT NOT NULL REFERENCES children(child_id),
         observed_at   TEXT NOT NULL,
-        redflag_triggered INTEGER NOT NULL DEFAULT 0,
-        payload       TEXT NOT NULL      -- Observation 的 JSON
+        redflag_triggered BOOLEAN NOT NULL DEFAULT FALSE,
+        payload       TEXT NOT NULL,     -- Observation 的 JSON
+        -- ★ 家长**整段原话**，同一段抽出的多条事件共享它。
+        --   为什么必须单独存一列：payload 里只有单条事件的 raw_quote，
+        --   而 coach.to_coach_inputs 的契约是 raw 填整段原话 —— 用碎片拼 corpus
+        --   会让教练的引文回指校验把正常信号全判成编造（见 observe.py 的说明）。
+        --   没有它，"把攒下的观察喂给明天的教练"这条路在跨进程后就没有原料了。
+        source        TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_obs_child ON observations(child_id, observed_at DESC);
 
     CREATE TABLE IF NOT EXISTS materials_log (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         logged_at   TEXT NOT NULL,
         items       TEXT NOT NULL       -- JSON list
@@ -141,67 +244,88 @@ def _init(c: sqlite3.Connection) -> None:
     --   现在它落库，明天的 build_request 会读（loop.build_request 的 recent_summary），
     --   教练 Agent 第一次能拿到方向而不只是三个数字。
     CREATE TABLE IF NOT EXISTS daily_summary (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         on_date     TEXT NOT NULL,
         payload     TEXT NOT NULL      -- DailySummary 的 JSON
     );
     CREATE INDEX IF NOT EXISTS idx_dsum_child ON daily_summary(child_id, on_date DESC);
     """)
+    c.commit()
 
 
 # ================================================================== 写入
-def ensure_child(conn: sqlite3.Connection, child_id: str, *, name: str = "",
+# ★ 迁移后这里不再有 _LOCK。sqlite 需要全局锁是因为「一个连接 + 非线程安全的游标」，
+#   PostgreSQL 里每线程一个连接，写冲突由数据库的行锁解决
+#   （我们全是单行 INSERT，不涉及行锁升级为表锁的经典死锁形状）。
+#   留着那把锁只会让并发写重新排队，把刚解决的问题请回来。
+def ensure_child(conn: psycopg.Connection, child_id: str, *, name: str = "",
                  age_months: int = 0) -> None:
-    with _LOCK:
-        conn.execute(
-            "INSERT INTO children(child_id,name,age_months,created_at) VALUES(?,?,?,?) "
-            "ON CONFLICT(child_id) DO UPDATE SET age_months=excluded.age_months",
-            (child_id, name, age_months, date.today().isoformat()))
-        conn.commit()
+    conn.execute(
+        "INSERT INTO children(child_id,name,age_months,created_at) VALUES(%s,%s,%s,%s) "
+        "ON CONFLICT(child_id) DO UPDATE SET age_months=excluded.age_months",
+        (child_id, name, age_months, date.today().isoformat()))
+    conn.commit()
 
 
-def save_profile(conn: sqlite3.Connection, profile) -> int:
+def save_profile(conn: psycopg.Connection, profile) -> int:
     """存一份能力画像。**不替换旧的** —— 同一孩子可能先有旧报告再换新报告，
     保留历史才能回答"他是最近退步了还是一直这样"。取用时按 id 最大的一条。"""
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO ability_profile(child_id,created_at,report_date,"
-            "overall_confidence,payload) VALUES(?,?,?,?,?)",
-            (profile.child_id, date.today().isoformat(), profile.report_date,
-             profile.overall_confidence,
-             profile.model_dump_json() if hasattr(profile, "model_dump_json")
-             else json.dumps(profile, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+    # RETURNING id：迁移前靠 sqlite 的 cursor.lastrowid，psycopg3 没有这个属性。
+    # 这是本文件里唯一一处「驱动差异逼着改写法」的地方，其余 INSERT 只换占位符。
+    row = conn.execute(
+        "INSERT INTO ability_profile(child_id,created_at,report_date,"
+        "overall_confidence,payload) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+        (profile.child_id, date.today().isoformat(), profile.report_date,
+         profile.overall_confidence,
+         profile.model_dump_json() if hasattr(profile, "model_dump_json")
+         else json.dumps(profile, ensure_ascii=False))).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def append_state(conn: sqlite3.Connection, child_id: str, transition) -> int:
+def append_state(conn: psycopg.Connection, child_id: str, transition) -> int:
     """追加一条状态转移。**没有对应的 update/delete 接口，这是故意的。**"""
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO skill_state(child_id,skill_item,domain,from_state,to_state,"
-            "at_date,reason,evidence) VALUES(?,?,?,?,?,?,?,?)",
-            (child_id, transition.skill_item, transition.domain,
-             transition.from_state, transition.to_state,
-             transition.at_date, transition.reason,
-             json.dumps(transition.evidence, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+    row = conn.execute(
+        "INSERT INTO skill_state(child_id,skill_item,domain,from_state,to_state,"
+        "at_date,reason,evidence) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (child_id, transition.skill_item, transition.domain,
+         transition.from_state, transition.to_state,
+         transition.at_date, transition.reason,
+         json.dumps(transition.evidence, ensure_ascii=False))).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def save_plan(conn: sqlite3.Connection, child_id: str, plan_date: str, payload) -> int:
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO plans(child_id,plan_date,created_at,payload) VALUES(?,?,?,?)",
-            (child_id, plan_date, date.today().isoformat(),
-             payload.model_dump_json() if hasattr(payload, "model_dump_json")
-             else json.dumps(payload, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+def save_plan(conn: psycopg.Connection, child_id: str, plan_date: str, payload) -> int:
+    row = conn.execute(
+        "INSERT INTO plans(child_id,plan_date,created_at,payload) "
+        "VALUES(%s,%s,%s,%s) RETURNING id",
+        (child_id, plan_date, date.today().isoformat(),
+         payload.model_dump_json() if hasattr(payload, "model_dump_json")
+         else json.dumps(payload, ensure_ascii=False))).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def log_session(conn: sqlite3.Connection, child_id: str, rec, note: str = "") -> int:
+def latest_plan(conn: psycopg.Connection, child_id: str, plan_date: str) -> dict | None:
+    """取某一天已生成的计划。**没有就是 None** —— 调用方据此决定要不要重新生成。
+
+    ★ 这条读取是"今天这张卡片只生成一次"的落点。
+      之前每次进「今天」页都重跑一遍检索 + 两次 LLM（30-45s），
+      而家长点开页面看到的其实是**同一份结果**（输入没变），
+      变的只有等待时间。生成一次、之后直接读，落库比前端缓存强：
+      前端缓存换个标签页就丢，而"今天的卡片"本就该跨会话不变。
+
+      只追加不替换（同 ability_profile），取 id 最大的一条。
+    """
+    row = conn.execute(
+        "SELECT payload FROM plans WHERE child_id=%s AND plan_date=%s "
+        "ORDER BY id DESC LIMIT 1", (child_id, plan_date)).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "") -> int:
     """记一次练习。rec 是 statemachine.SessionRecord。
 
     note 之前没被写进 INSERT（表里有列，语句里没有）。接上闭环之后这成了一个
@@ -209,49 +333,69 @@ def log_session(conn: sqlite3.Connection, child_id: str, rec, note: str = "") ->
     而第一条是家长明确报告的那次 —— 两者 outcome/quality 完全一样，
     没有 note 就没法在 DB 里回答"为什么今天有两条"。
     """
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO sessions(child_id,session_date,activity_id,outcome,quality,"
-            "out_of_routine,note) VALUES(?,?,?,?,?,?,?)",
-            (child_id, rec.date, rec.activity_id, rec.outcome, rec.quality,
-             int(rec.out_of_routine), note))
-        conn.commit()
-        return int(cur.lastrowid)
+    # out_of_routine 直接传 bool：列已经是 BOOLEAN，迁移前的 int(...) 是
+    # 在假装它是整数。
+    row = conn.execute(
+        "INSERT INTO sessions(child_id,session_date,activity_id,outcome,quality,"
+        "out_of_routine,note) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (child_id, rec.date, rec.activity_id, rec.outcome, rec.quality,
+         bool(rec.out_of_routine), note)).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def log_observation(conn: sqlite3.Connection, child_id: str, observed_at: str,
-                    obs, redflag_triggered: bool = False) -> int:
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO observations(child_id,observed_at,redflag_triggered,payload) "
-            "VALUES(?,?,?,?)",
-            (child_id, observed_at, int(redflag_triggered),
-             obs.model_dump_json() if hasattr(obs, "model_dump_json")
-             else json.dumps(obs, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+def log_observation(conn: psycopg.Connection, child_id: str, observed_at: str,
+                    obs, redflag_triggered: bool = False,
+                    source: str = "") -> int:
+    """source 是家长**整段原话**（同一段抽出的多条事件共享）。
+
+    见 observations 表 source 列的注释：不存它，跨进程把观察喂给教练时就
+    只能拼碎片，引文回指校验会把正常信号判成编造。
+    """
+    row = conn.execute(
+        "INSERT INTO observations(child_id,observed_at,redflag_triggered,"
+        "payload,source) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+        (child_id, observed_at, bool(redflag_triggered),
+         obs.model_dump_json() if hasattr(obs, "model_dump_json")
+         else json.dumps(obs, ensure_ascii=False), source)).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def log_materials(conn: sqlite3.Connection, child_id: str, items: list[str]) -> int:
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO materials_log(child_id,logged_at,items) VALUES(?,?,?)",
-            (child_id, date.today().isoformat(), json.dumps(items, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+def log_materials(conn: psycopg.Connection, child_id: str, items: list[str]) -> int:
+    row = conn.execute(
+        "INSERT INTO materials_log(child_id,logged_at,items) VALUES(%s,%s,%s) "
+        "RETURNING id",
+        (child_id, date.today().isoformat(), json.dumps(items, ensure_ascii=False))
+    ).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
 # ================================================================== 读取
-def latest_profile(conn: sqlite3.Connection, child_id: str):
+def latest_profile(conn: psycopg.Connection, child_id: str):
     """取最新一份能力画像（失败时返回 None，不抛 —— 调用方决定要不要降级）。"""
     from capabilities import AbilityProfile
     row = conn.execute(
-        "SELECT payload FROM ability_profile WHERE child_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT payload FROM ability_profile WHERE child_id=%s ORDER BY id DESC LIMIT 1",
         (child_id,)).fetchone()
     return AbilityProfile.model_validate_json(row["payload"]) if row else None
 
 
-def current_states(conn: sqlite3.Connection, child_id: str) -> dict[str, dict]:
+def latest_profile_id(conn: psycopg.Connection, child_id: str) -> int | None:
+    """最新画像那行的 id。**用来判断已缓存的当天计划是不是过期了。**
+
+    重新建档之后，画像变了（家长可能把每天时间从 30 改成 45），
+    之前按旧画像装箱的那一天就该重算 —— 否则家长改了条件却看不到任何变化，
+    而界面上也没有任何地方告诉他"这份计划是按旧条件排的"。
+    """
+    row = conn.execute(
+        "SELECT id FROM ability_profile WHERE child_id=%s ORDER BY id DESC LIMIT 1",
+        (child_id,)).fetchone()
+    return int(row["id"]) if row else None
+
+
+def current_states(conn: psycopg.Connection, child_id: str) -> dict[str, dict]:
     """每个技能细项的当前状态。取 skill_state 里该细项的最后一行。
 
     从没转移过的细项**不在结果里**（而不是给个 not_started）——
@@ -260,7 +404,7 @@ def current_states(conn: sqlite3.Connection, child_id: str) -> dict[str, dict]:
     rows = conn.execute(
         "SELECT s.* FROM skill_state s "
         "JOIN (SELECT skill_item, MAX(id) AS mid FROM skill_state "
-        "      WHERE child_id=? GROUP BY skill_item) m ON s.id = m.mid",
+        "      WHERE child_id=%s GROUP BY skill_item) m ON s.id = m.mid",
         (child_id,)).fetchall()
     return {
         r["skill_item"]: {
@@ -272,16 +416,16 @@ def current_states(conn: sqlite3.Connection, child_id: str) -> dict[str, dict]:
     }
 
 
-def state_history(conn: sqlite3.Connection, child_id: str, skill_item: str) -> list[dict]:
+def state_history(conn: psycopg.Connection, child_id: str, skill_item: str) -> list[dict]:
     """某个细项的完整转移史。升级和回退都在。"""
     rows = conn.execute(
         "SELECT from_state,to_state,at_date,reason,evidence FROM skill_state "
-        "WHERE child_id=? AND skill_item=? ORDER BY id",
+        "WHERE child_id=%s AND skill_item=%s ORDER BY id",
         (child_id, skill_item)).fetchall()
     return [{**dict(r), "evidence": json.loads(r["evidence"])} for r in rows]
 
 
-def sessions_for_skill(conn: sqlite3.Connection, child_id: str, skill_item: str,
+def sessions_for_skill(conn: psycopg.Connection, child_id: str, skill_item: str,
                        *, until: str | None = None):
     """某个技能细项的全部练习记录，转成 SessionRecord 直接喂给状态机。
 
@@ -292,10 +436,10 @@ def sessions_for_skill(conn: sqlite3.Connection, child_id: str, skill_item: str,
     from statemachine import SessionRecord
 
     sql = ("SELECT session_date,activity_id,outcome,quality,out_of_routine "
-           "FROM sessions WHERE child_id=?")
+           "FROM sessions WHERE child_id=%s")
     args: list[Any] = [child_id]
     if until:
-        sql += " AND session_date<=?"
+        sql += " AND session_date<=%s"
         args.append(until)
     sql += " ORDER BY session_date"
 
@@ -313,56 +457,56 @@ def sessions_for_skill(conn: sqlite3.Connection, child_id: str, skill_item: str,
             continue
         out.append(SessionRecord(date=r["session_date"], activity_id=r["activity_id"],
                                  outcome=r["outcome"], quality=r["quality"],
-                                 out_of_routine=bool(r["out_of_routine"])))
+                                 out_of_routine=r["out_of_routine"]))
     return out
 
 
-def recent_activity_ids(conn: sqlite3.Connection, child_id: str, days: int = 3,
+def recent_activity_ids(conn: psycopg.Connection, child_id: str, days: int = 3,
                         end_date: str | None = None) -> list[str]:
     """最近 N 天排过的活动（用于新鲜度 / 避免重复）。"""
     end = end_date or date.today().isoformat()
     start = (date.fromisoformat(end) - timedelta(days=days - 1)).isoformat()
     rows = conn.execute(
-        "SELECT DISTINCT activity_id FROM sessions WHERE child_id=? "
-        "AND session_date BETWEEN ? AND ?",
+        "SELECT DISTINCT activity_id FROM sessions WHERE child_id=%s "
+        "AND session_date BETWEEN %s AND %s",
         (child_id, start, end)).fetchall()
     return [r["activity_id"] for r in rows]
 
 
-def refusal_counts(conn: sqlite3.Connection, child_id: str,
+def refusal_counts(conn: psycopg.Connection, child_id: str,
                    lookback_days: int = 30) -> dict[str, int]:
     """activity_id -> 抗拒次数。检索器的冷却期判定要用。"""
     start = (date.today() - timedelta(days=lookback_days)).isoformat()
     rows = conn.execute(
         "SELECT activity_id, COUNT(*) AS n FROM sessions "
-        "WHERE child_id=? AND outcome='refused' AND session_date>=? GROUP BY activity_id",
+        "WHERE child_id=%s AND outcome='refused' AND session_date>=%s GROUP BY activity_id",
         (child_id, start)).fetchall()
     return {r["activity_id"]: r["n"] for r in rows}
 
 
-def success_history_ids(conn: sqlite3.Connection, child_id: str) -> set[str]:
+def success_history_ids(conn: psycopg.Connection, child_id: str) -> set[str]:
     """成功过的活动（前置判定用）。一次成功即可 —— 前置是"这项能不能做"，
     不是"这项做得多好"，把标准卡太高会让依赖图在 demo 里完全走不动。"""
     rows = conn.execute(
         "SELECT DISTINCT activity_id FROM sessions "
-        "WHERE child_id=? AND outcome IN ('success','partial')",
+        "WHERE child_id=%s AND outcome IN ('success','partial')",
         (child_id,)).fetchall()
     return {r["activity_id"] for r in rows}
 
 
-def success_counts(conn: sqlite3.Connection, child_id: str) -> dict[str, int]:
+def success_counts(conn: psycopg.Connection, child_id: str) -> dict[str, int]:
     rows = conn.execute(
         "SELECT activity_id, COUNT(*) AS n FROM sessions "
-        "WHERE child_id=? AND outcome='success' GROUP BY activity_id",
+        "WHERE child_id=%s AND outcome='success' GROUP BY activity_id",
         (child_id,)).fetchall()
     return {r["activity_id"]: r["n"] for r in rows}
 
 
-def recent_scenes(conn: sqlite3.Connection, child_id: str, days: int = 14) -> list[str]:
+def recent_scenes(conn: psycopg.Connection, child_id: str, days: int = 14) -> list[str]:
     """近期高频场景，来自行为观察表。"""
     start = (date.today() - timedelta(days=days)).isoformat()
     rows = conn.execute(
-        "SELECT payload FROM observations WHERE child_id=? AND observed_at>=? "
+        "SELECT payload FROM observations WHERE child_id=%s AND observed_at>=%s "
         "ORDER BY observed_at DESC LIMIT 40", (child_id, start)).fetchall()
     counts: dict[str, int] = {}
     for r in rows:
@@ -375,32 +519,32 @@ def recent_scenes(conn: sqlite3.Connection, child_id: str, days: int = 14) -> li
     return [s for s, _ in sorted(counts.items(), key=lambda kv: -kv[1])[:5]]
 
 
-def successes_outside_routine(conn: sqlite3.Connection, child_id: str) -> dict[str, int]:
+def successes_outside_routine(conn: psycopg.Connection, child_id: str) -> dict[str, int]:
     rows = conn.execute(
         "SELECT activity_id, COUNT(*) AS n FROM sessions "
-        "WHERE child_id=? AND outcome='success' AND out_of_routine=1 GROUP BY activity_id",
+        "WHERE child_id=%s AND outcome='success' AND out_of_routine GROUP BY activity_id",
         (child_id,)).fetchall()
     return {r["activity_id"]: r["n"] for r in rows}
 
 
 # ================================================================== 日结
-def save_summary(conn: sqlite3.Connection, child_id: str, summary) -> int:
+def save_summary(conn: psycopg.Connection, child_id: str, summary) -> int:
     """存一天的日结。summary 是 summary.DailySummary。
 
     同一天可以有多条（重跑），取用时按 on_date 取 id 最大的一条 ——
     与 ability_profile 同样的口径，不做 UPDATE。
     """
-    with _LOCK:
-        cur = conn.execute(
-            "INSERT INTO daily_summary(child_id,on_date,payload) VALUES(?,?,?)",
-            (child_id, summary.date,
-             summary.model_dump_json() if hasattr(summary, "model_dump_json")
-             else json.dumps(summary, ensure_ascii=False)))
-        conn.commit()
-        return int(cur.lastrowid)
+    row = conn.execute(
+        "INSERT INTO daily_summary(child_id,on_date,payload) VALUES(%s,%s,%s) "
+        "RETURNING id",
+        (child_id, summary.date,
+         summary.model_dump_json() if hasattr(summary, "model_dump_json")
+         else json.dumps(summary, ensure_ascii=False))).fetchone()
+    conn.commit()
+    return int(row["id"])
 
 
-def latest_summary(conn: sqlite3.Connection, child_id: str, *,
+def latest_summary(conn: psycopg.Connection, child_id: str, *,
                    days: int = 7, before: str | None = None) -> list[dict]:
     """最近 N 天的日结，按日期升序。**纯 SQL，不调 LLM。**
 
@@ -410,8 +554,8 @@ def latest_summary(conn: sqlite3.Connection, child_id: str, *,
     end = before or date.today().isoformat()
     start = (date.fromisoformat(end) - timedelta(days=days)).isoformat()
     rows = conn.execute(
-        "SELECT on_date,payload FROM daily_summary WHERE child_id=? "
-        "AND on_date>=? AND on_date<? ORDER BY on_date, id",
+        "SELECT on_date,payload FROM daily_summary WHERE child_id=%s "
+        "AND on_date>=%s AND on_date<%s ORDER BY on_date, id",
         (child_id, start, end)).fetchall()
     out: list[dict] = []
     for r in rows:
@@ -495,13 +639,13 @@ class ProgressReport(BaseModel):
         return "\n".join(lines)
 
 
-def what_last_week(conn: sqlite3.Connection, child_id: str, end_date: str,
+def what_last_week(conn: psycopg.Connection, child_id: str, end_date: str,
                    days: int = 7) -> WeeklyRecap:
     """上周回顾。一条 GROUP BY + 两条 EXISTS 式查询，无 LLM。"""
     start = (date.fromisoformat(end_date) - timedelta(days=days - 1)).isoformat()
     rows = conn.execute(
         "SELECT activity_id, outcome, COUNT(*) AS n FROM sessions "
-        "WHERE child_id=? AND session_date BETWEEN ? AND ? GROUP BY activity_id, outcome",
+        "WHERE child_id=%s AND session_date BETWEEN %s AND %s GROUP BY activity_id, outcome",
         (child_id, start, end_date)).fetchall()
 
     from activity_data import get as get_activity
@@ -526,18 +670,18 @@ def what_last_week(conn: sqlite3.Connection, child_id: str, end_date: str,
     r.top_scenes = recent_scenes(conn, child_id, days=days)
     r.redflags = conn.execute(
         "SELECT COUNT(DISTINCT observed_at) AS days FROM observations "
-        "WHERE child_id=? AND observed_at BETWEEN ? AND ? "
+        "WHERE child_id=%s AND observed_at BETWEEN %s AND %s "
         # ★ COUNT(DISTINCT observed_at) 而不是 COUNT(*) ——
         # 一次家长输入会落成 N 条 observation，它们共享同一个 observed_at。
         # 用 COUNT(*) 时"今天说了一句含自伤的话"会被数成"今天有 3 条红旗"，
         # 而 WeeklyRecap.render() 写的是"本周有 N 条记录触发了红旗信号" ——
         # 家长关心的是**有几天遇到红旗**，不是记了几条。
         # 闭环接线之前 observations 恒为空，这个 bug 一直藏着没人看见。
-        "AND redflag_triggered=1", (child_id, start, end_date)).fetchone()["days"]
+        "AND redflag_triggered", (child_id, start, end_date)).fetchone()["days"]
     return r
 
 
-def what_child_refuses(conn: sqlite3.Connection, child_id: str,
+def what_child_refuses(conn: psycopg.Connection, child_id: str,
                        lookback_days: int = 30) -> RefusalReport:
     """抗拒归因。**按活动聚合是主体，按材料聚合是补充** ——
     因为抗拒常常不是"不喜欢这个活动"而是"看到那个球就炸"，
@@ -545,7 +689,7 @@ def what_child_refuses(conn: sqlite3.Connection, child_id: str,
     start = (date.today() - timedelta(days=lookback_days)).isoformat()
     rows = conn.execute(
         "SELECT activity_id, COUNT(*) AS n FROM sessions "
-        "WHERE child_id=? AND outcome='refused' AND session_date>=? "
+        "WHERE child_id=%s AND outcome='refused' AND session_date>=%s "
         "GROUP BY activity_id ORDER BY n DESC", (child_id, start)).fetchall()
 
     from activity_data import get as get_activity
@@ -556,8 +700,8 @@ def what_child_refuses(conn: sqlite3.Connection, child_id: str,
                                 a.title if a else "（活动已下线）", row["n"]))
 
     total = conn.execute(
-        "SELECT COUNT(*) AS n FROM sessions WHERE child_id=? "
-        "AND outcome IN ('success','partial','refused') AND session_date>=?",
+        "SELECT COUNT(*) AS n FROM sessions WHERE child_id=%s "
+        "AND outcome IN ('success','partial','refused') AND session_date>=%s",
         (child_id, start)).fetchone()["n"]
     ref = sum(n for _, _, n in rep.by_activity)
     rep.total_sessions = total
@@ -565,7 +709,7 @@ def what_child_refuses(conn: sqlite3.Connection, child_id: str,
     return rep
 
 
-def what_progressed(conn: sqlite3.Connection, child_id: str,
+def what_progressed(conn: psycopg.Connection, child_id: str,
                     lookback_days: int = 30,
                     profile_confidence: float | None = None) -> ProgressReport:
     """谁进步了。纯 SQL 聚合状态历史表，**不调 LLM**。
@@ -588,7 +732,7 @@ def what_progressed(conn: sqlite3.Connection, child_id: str,
 
     rows = conn.execute(
         "SELECT skill_item, domain, from_state, to_state, at_date FROM skill_state "
-        "WHERE child_id=? ORDER BY skill_item, id", (child_id,)).fetchall()
+        "WHERE child_id=%s ORDER BY skill_item, id", (child_id,)).fetchall()
 
     first: dict[str, dict] = {}
     last: dict[str, dict] = {}
@@ -621,7 +765,7 @@ def what_progressed(conn: sqlite3.Connection, child_id: str,
         try:
             by_id = {a.activity_id: a for a in load_activities()}
             for r in conn.execute(
-                    "SELECT DISTINCT activity_id FROM sessions WHERE child_id=?",
+                    "SELECT DISTINCT activity_id FROM sessions WHERE child_id=%s",
                     (child_id,)).fetchall():
                 a = by_id.get(r["activity_id"])
                 if a is None:
@@ -647,7 +791,7 @@ def what_progressed(conn: sqlite3.Connection, child_id: str,
 
 
 # ================================================================== 自检
-def _seed_demo(conn: sqlite3.Connection, child_id: str = "demo-001",
+def _seed_demo(conn: psycopg.Connection, child_id: str = "demo-001",
                confidence: float = 0.85) -> str:
     """灌一份两周的 demo 数据。**刻意用真实的 skill_state 转移行，
     而不是直接 UPDATE 当前值** —— 这样 what_progressed 才有东西可查。"""
@@ -691,26 +835,21 @@ def _seed_demo(conn: sqlite3.Connection, child_id: str = "demo-001",
 
 
 def _cli() -> None:
-    import shutil
     tmp = "/tmp/asd_agent_demo.db"
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(tmp + suffix)
-        except FileNotFoundError:
-            pass
-
-    conn = connect(tmp)
+    conn = reset(tmp)          # ★ 一行代替原来删 db/wal/shm 三个文件
     cid = _seed_demo(conn, "demo-001", confidence=0.85)
     # 同一个孩子、同一份练习记录，只把画像可信度从 0.85 降到 0.30 再跑一遍。
     # 两份 skill_state 一对比，就是升级闸门在存储层的证据。
     _seed_demo(conn, "demo-002", confidence=0.30)
 
     print("=== 表 ===")
+    # information_schema.tables 而不是 sqlite_master —— 后者是 sqlite 独有的系统表，
+    # 且它列的是**整个库**；PG 下要用 current_schema() 过滤，否则会把 public 也列进来。
     for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
-            "ORDER BY name"):
-        n = conn.execute(f"SELECT COUNT(*) AS n FROM {r['name']}").fetchone()["n"]
-        print(f"  {r['name']:18s} {n:4d} 行")
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema=current_schema() ORDER BY table_name"):
+        n = conn.execute(f"SELECT COUNT(*) AS n FROM {r['table_name']}").fetchone()["n"]
+        print(f"  {r['table_name']:18s} {n:4d} 行")
 
     print("\n=== what_last_week（最近 7 天，截至今天）===")
     print(what_last_week(conn, cid, date.today().isoformat()).render())
@@ -755,7 +894,7 @@ def _cli() -> None:
     print(f"  recent_scenes         {recent_scenes(conn, cid)}")
 
     conn.close()
-    shutil.rmtree(tmp, ignore_errors=True)
+    # 迁移前这里是 shutil.rmtree(tmp) 删文件；现在是 schema，下次 reset() 会重建
 
 
 if __name__ == "__main__":

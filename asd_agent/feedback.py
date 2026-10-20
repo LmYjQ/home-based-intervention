@@ -42,7 +42,7 @@ observations 那条告诉检索器"这条活动要进冷却期"。
 
 from __future__ import annotations
 
-import sqlite3
+import psycopg
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -126,7 +126,7 @@ def quality_for(fb: ActivityFeedback) -> float:
 
 
 # ================================================================== 主入口
-def apply_feedbacks(conn: sqlite3.Connection, child_id: str, date: str,
+def apply_feedbacks(conn: psycopg.Connection, child_id: str, date: str,
                     feedbacks: list[ActivityFeedback], *,
                     other_notes: str = "", no_llm: bool = False,
                     on_step=None) -> DayFeedbackResult:
@@ -242,12 +242,7 @@ def _cli() -> None:
     print("② ★ 归属只认家长填过的那条")
     print("=" * 68)
     db = "/tmp/feedback_check.db"
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.remove(db + suffix)
-        except FileNotFoundError:
-            pass
-    conn = store.connect(db)
+    conn = store.reset(db)   # ★ 一行代替删 db/-wal/-shm 三个文件
     cid = "fb-check"
     store.ensure_child(conn, cid, age_months=34)
 
@@ -297,7 +292,7 @@ def _cli() -> None:
     print("⑤ session note 回答「这一行为什么这样」")
     print("=" * 68)
     rows = conn.execute(
-        "SELECT activity_id,outcome,quality,note FROM sessions WHERE child_id=? "
+        "SELECT activity_id,outcome,quality,note FROM sessions WHERE child_id=%s "
         "ORDER BY id", (cid,)).fetchall()
     for r in rows:
         print(f"  {r['activity_id']}  {r['outcome']:8s} {r['quality']:.2f}  {r['note']}")
