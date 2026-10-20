@@ -232,9 +232,170 @@ def main() -> int:
     check("escalate 给了转诊指引",
           bool((out8.get("escalation") or {}).get("guidance")))
 
+    # =============================================== 9. 四层字段向后兼容
+    print("\n[9] 四层字段：新字段不能把旧数据打死")
+    check_layers_backcompat(check)
+
+    # =============================================== 10. 降级时四层全空
+    print("\n[10] 降级时四层全空（一条都不编）")
+    check_layers_degraded(g, check)
+
+    # =============================================== 11. publish 的幂等键是语料
+    print("\n[11] ★ publish 幂等键是「本次语料」而不是「这一天」")
+    check_publish_idempotency(g, conn, check)
+
+    # =============================================== 12. 规则对齐
+    print("\n[12] ★ 规则 1-6 仍与 verify_schema 逐字对齐")
+    check_rules_alignment(check)
+
     close_all()
-    print("\n" + ("✓ Phase 0 图级验收全绿" if ok else "✗ 有失败项，见上"))
+    print("\n" + ("✓ Phase 0/1 图级验收全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+# ================================================================== [9] 向后兼容
+#: 一条**Phase 1 之前**落库的 payload 字面量（没有 fact_fields）。
+#: 留着它不是为了好看 —— 它是 server.py 教练诊断那条读路径的替身：
+#: 那里是 `Observation.model_validate(json.loads(r["payload"]))`
+#: 且外面包着裸 `except: continue`。字段一旦改成 required，
+#: 每一条历史 observation 都会校验失败并被**静默跳过** —— 没有报错，
+#: 只是家长和教练突然看不到几个月前的观察了。这条断言守的就是那个静默。
+OLD_PAYLOAD = {
+    "scene": "indoor_play", "behavior": "refusal", "antecedent": "unclear",
+    "consequence": "none", "intensity": 2, "duration_sec": None,
+    "people_present": ["mother"], "raw_quote": "他今天不太配合",
+    "spans": [], "confidence": 0.5, "needs_clarification": False,
+    "clarifying_question": None, "note": None,
+}
+
+
+def check_layers_backcompat(check) -> None:
+    """★ 四个新字段全部可选 —— 逐个证明它们不会打死已有数据。"""
+    ev = schema.Observation.model_validate(OLD_PAYLOAD)
+    check("旧 payload（无 fact_fields）仍能校验", ev.behavior == "refusal")
+    check("fact_fields 缺省为空而不是报错", ev.fact_fields == [], ev.fact_fields)
+
+    b = observe.ObservationBatch.model_validate({"events": [OLD_PAYLOAD]})
+    check("旧 batch（无后三层）仍能校验", len(b.events) == 1)
+    check("后三层缺省为空",
+          (b.parent_interpretation, b.hypotheses, b.missing_information)
+          == (None, [], []),
+          (b.parent_interpretation, b.hypotheses, b.missing_information))
+
+    # graph/nodes.py 的 publish 那条重校验路径：dump → validate
+    dumped = observe.ObservationOutcome(
+        source_text="x", date="2026-10-20", events=[ev]).model_dump(mode="json")
+    back = observe.ObservationOutcome.model_validate(dumped)
+    check("旧 checkpoint 的 state 形状仍能重校验（publish 那条路径）",
+          back.source_text == "x")
+
+
+# ================================================================== [10] 降级
+def check_layers_degraded(g, check) -> None:
+    """降级时四层必须全空。**空不是「坏了」，是没得说。**
+
+    这与 observe._fallback_batch「一条事件都不编」是同一条原则：
+    编造的解读/假设会被家长当成对孩子行为的判断，而那正是这个系统
+    最不该给的东西 —— 它给的是证据与追问，不是结论。
+    """
+    fb = observe._fallback_batch("他今天不太配合", "2026-10-20", redflag.CLEAN)
+    check("降级时零事件", fb.events == [] and fb.degraded)
+    check("★ 降级时后三层全空（不编解读、不编假设、不编缺失）",
+          (fb.parent_interpretation, fb.hypotheses, fb.missing_information)
+          == (None, [], []),
+          (fb.parent_interpretation, fb.hypotheses, fb.missing_information))
+
+    d = "2026-10-26"
+    out = g.invoke({"child_id": CID, "date": d, "no_llm": True,
+                    "parent_text": "今天没什么事"}, thread_config(CID, d))
+    obs = out.get("observation") or {}
+    check("图级降级跑完后四层仍全空",
+          (obs.get("parent_interpretation"), obs.get("hypotheses"),
+           obs.get("missing_information")) == (None, [], []),
+          (obs.get("parent_interpretation"), obs.get("hypotheses"),
+           obs.get("missing_information")))
+
+
+# ================================================================== [11] 幂等键
+def check_publish_idempotency(g, conn, check) -> None:
+    """★ 这一组是 Phase 1 改 publish 的**全部理由**。
+
+    原判据是 `_today_has_observations(child, date)` ——「这一天有没有任何一行」。
+    Phase 0 成立是因为当时只有图一个写入口。图一接进 HTTP，
+    `/api/feedbacks` → `apply_feedbacks` 同一天也会从**逐条活动的 note**
+    写 observations 行，于是那个粗判据会把「其他观察」误判成
+    「今天已落库」而静默跳过 —— 没有报错，家长那段话就是不落库。
+
+    同一天出现两批来源不同的语料，是 Phase 1 之后**正常**的形态，
+    所以幂等判据必须细到「这一段语料」。
+    """
+    d = "2026-10-27"
+    date_s = d
+    # 先手写一条「逐条活动 note」风格的行：同日期、不同 source。
+    note_source = "玩木头人他不肯听，我说你停他就站在那儿不动"
+    ev = schema.Observation.model_validate({**OLD_PAYLOAD, "raw_quote": "他不肯听"})
+    note_out = observe.ObservationOutcome(source_text=note_source, date=date_s,
+                                          events=[ev])
+    note_ids = observe.persist(conn, CID, note_out)
+    n_after_note = conn.execute(
+        "SELECT count(*) AS n FROM observations WHERE child_id=%s AND observed_at=%s",
+        (CID, date_s)).fetchone()["n"]
+    check("前置：同日期已有逐条 note 写的行", n_after_note == len(note_ids), n_after_note)
+
+    other = "超市里他蹲下来捂住耳朵了，我没理他，过了一会儿自己好了。"
+    obs_other = _seed_observation(needs_clarification=False, question="",
+                                  source=other)
+    cfg = thread_config(CID, d)
+    out = g.invoke({"child_id": CID, "date": d, "no_llm": True,
+                    "parent_text": other, "observation": obs_other,
+                    "observed_text": other}, cfg)
+
+    check("★ 没被同日期的 note 行误判成「已落库」（旧的日期级判据这里返回 []）",
+          bool(out.get("observation_ids")), out.get("observation_ids"))
+
+    srcs = [r["source"] for r in conn.execute(
+        "SELECT DISTINCT source FROM observations WHERE child_id=%s AND observed_at=%s",
+        (CID, date_s)).fetchall()]
+    check("★ 两种来源的语料都在，互不吞",
+          set(srcs) == {note_source, other}, srcs)
+
+    n_before = conn.execute(
+        "SELECT count(*) AS n FROM observations WHERE child_id=%s AND observed_at=%s",
+        (CID, date_s)).fetchone()["n"]
+
+    # 同一段语料再跑一次 → 幂等，不重复写
+    out2 = g.invoke({"child_id": CID, "date": d, "no_llm": True,
+                     "parent_text": other, "observation": obs_other,
+                     "observed_text": other}, thread_config(CID, d + "#again"))
+    n_after = conn.execute(
+        "SELECT count(*) AS n FROM observations WHERE child_id=%s AND observed_at=%s",
+        (CID, date_s)).fetchone()["n"]
+    check("同一段语料再跑一次不重复落库",
+          n_after == n_before, f"{n_before} → {n_after}")
+    check("★ 逐条 note 那行没被波及",
+          conn.execute(
+              "SELECT count(*) AS n FROM observations "
+              "WHERE child_id=%s AND observed_at=%s AND source=%s",
+              (CID, date_s, note_source)).fetchone()["n"] == len(note_ids))
+
+
+# ================================================================== [12] 规则对齐
+def check_rules_alignment(check) -> None:
+    """★ `_RULES_1_6` 与 verify_schema 的提示词必须逐字一致。
+
+    observe.py 的模块注释声明了这件事，但注释不是断言 ——
+    一次「顺手整理提示词」就能把它悄悄作废，而后果是
+    verify_schema 那份 12/12 的 A/B 结论**不再代表生产链路**。
+    """
+    import verify_schema
+    prompt = verify_schema.build_prompt()
+    check("★ observe._RULES_1_6 逐字出现在 verify_schema 的提示词里",
+          observe._RULES_1_6 in prompt)
+    check("★ 新规则没有混进 1-6（在 _RULES_LAYERS 里）",
+          "fact_fields" not in observe._RULES_1_6
+          and "fact_fields" in observe._RULES_LAYERS)
+    check("两套 SYSTEM 都接上了新规则",
+          "fact_fields" in observe.SYSTEM and "fact_fields" in observe.SYSTEM_SINGLE)
 
 
 def _probe_rerun() -> bool:

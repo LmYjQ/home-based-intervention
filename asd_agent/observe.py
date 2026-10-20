@@ -87,6 +87,29 @@ class ObservationBatch(BaseModel):
         default=None, max_length=200,
         description="证据不足以判断时，向家长追问的那**一个**最关键的问题；没有就填 null")
 
+    # ---- 四层之「家长解读 / 模型假设 / 缺失信息」三层 ----
+    # ★ 为什么这三层在 batch 上而 `fact_fields` 在 event 上：见 schema.py 里的说明。
+    #   简单说：解读、假设、缺失都是**跨事件**的（一次话抽三条事件，
+    #   「他今天整体缺觉」这个解读对三条都成立），挂三条上就是同一句话存三份。
+    #
+    # 「模型给证据，Python 做判定」在这三层的落点：
+    #   missing_information 记的是**缺什么**，不是**要问什么**。
+    #   措辞由 Python 决定（graph/nodes.py 的 validate_observation），
+    #   模型只负责说清「我不知道的是哪一块」。
+    parent_interpretation: str | None = Field(
+        default=None, max_length=200,
+        description="家长自己说出的解读或担心（**不是你的判断**）。"
+                    "他没表达就填 null，不要替他总结想法")
+    hypotheses: list[str] = Field(
+        default_factory=list, max_length=3,
+        description="1-3 条对这段话的**可能**解释，每条一句话，按可能性从高到低。"
+                    "它们是待验证的假设，不是结论；想不出就留空数组")
+    missing_information: list[str] = Field(
+        default_factory=list, max_length=3,
+        description="这段话里还缺、且会影响下一步判断的信息，每条一个短语"
+                    "（如「不知道他当时在做什么」）。**这里记「缺什么」而不是「问什么」**。"
+                    "信息够就填 []，不要为了凑数把有的东西说成缺的")
+
 
 class ObservationOutcome(BaseModel):
     """抽取的完整产物。"""
@@ -102,6 +125,16 @@ class ObservationOutcome(BaseModel):
     degraded: bool = False
     trace: llm.LLMTrace | None = None
     note: str = ""
+
+    # ---- 四层的后三层：从 batch 带过来 ----
+    # ★ 为什么这里也要有一份而不能只留在 batch 上：
+    #   checkpoint 存的是 `ObservationOutcome.model_dump()`（graph/state.py 的注释
+    #   说明了为什么存 dict 不存对象），HTTP 也直接返回它。字段只在 batch 上的话，
+    #   出了 batch 这三层就没了 —— 而它们恰恰是给人看的。
+    #   三者与 ObservationBatch 上的同名字段同形状、同样默认空。
+    parent_interpretation: str | None = None
+    hypotheses: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
 
     def render(self) -> str:
         L = [f"【从家长的一段话里抽出 {len(self.events)} 条事件】"]
@@ -119,6 +152,14 @@ class ObservationOutcome(BaseModel):
                 L.append(f"     ★ 追问：{e.clarifying_question}")
         if self.redflags.triggered:
             L += ["", self.redflags.render()]
+        # ---- 四层的后三层（只渲染有内容的；空着不是「坏了」，是没得说）----
+        if self.parent_interpretation:
+            L.append(f"  家长自己的解读：{self.parent_interpretation}")
+        if self.hypotheses:
+            L.append("  待验证的假设（不是结论）：")
+            L += [f"     · {h}" for h in self.hypotheses]
+        if self.missing_information:
+            L.append("  还缺的信息：" + "；".join(self.missing_information))
         if self.unverified:
             L.append(f"引文未通过原文核对（已压低置信度）："
                      + "；".join(f"第{k+1}条「{v[:20]}」" for k, v in self.unverified.items()))
@@ -171,6 +212,28 @@ _RULES_SINGLE = """
    就把前因/后果都填 `unclear`，而不是根据常见情况补一个合理的。
    这条活动做得怎么样家长已经在结果里选过了，你不需要再判断一次。"""
 
+# ★ 规则 9-10 单独成常量，**绝不能塞进上面的 _RULES_1_6** ——
+#   那个块与 verify_schema.build_prompt() 的规则 1-6 是逐字对齐的
+#   （graph/selfcheck.py 有一条断言守着这件事，见 _check_rules_alignment）。
+#   改动它 = 让 verify_schema 那份 12/12 的 A/B 结论不再代表生产链路。
+#   技术方案 §4 场景 A 要求的四层写在这里，追加在既有规则之后。
+_RULES_LAYERS = """
+9. **事实、解读、假设、缺失，分开写，不要混。**
+   - `events` 是事实，每个字段尽量来自原话；
+     `fact_fields` 标出这条事件里**哪些字段是原话直接写着的**，
+     推断出来的字段不要列进去 —— 家长要能对照着核。
+   - `parent_interpretation` 是**家长自己说的**解读或担心，不是你的判断。
+     他没表达就填 null，不要替他总结想法。
+   - `hypotheses` 是你对这段话的**可能**解释，每条一句话，按可能性排序。
+     它们是待验证的假设，**不是结论** —— 想不出就留空数组。
+   - `missing_information` 记的是**你缺什么信息**，不是「该问家长什么」。
+     信息够就填 []，不要为了凑数把已经有的东西说成缺的。
+
+10. **宁可空着，不要凑满。** 上面四个字段全都允许为空。
+    编造的事实会进 `refusal_counts` 与红旗的按天计数，
+    而那两条都会改变第二天的干预计划 —— 一次编造污染一个可判定的通道。
+    拿不准就留空，并在 confidence 里说实话。"""
+
 _SYSTEM_HEAD_OTHER = """你是一个自闭症儿童干预记录助手，负责把家长口述的一段话，
 转成结构化的行为观察记录。**一次输入里可能包含多次事件，请全部抽出来。**"""
 
@@ -198,12 +261,12 @@ _VOCAB = f"""
 """
 
 SYSTEM = f"""{_SYSTEM_HEAD_OTHER}
-{_VOCAB}{_RULES_1_6}{_RULES_7_8}
+{_VOCAB}{_RULES_1_6}{_RULES_7_8}{_RULES_LAYERS}
 
 只输出 JSON，不要输出任何其他文字。"""
 
 SYSTEM_SINGLE = f"""{_SYSTEM_HEAD_SINGLE}
-{_VOCAB}{_RULES_1_6}{_RULES_SINGLE}
+{_VOCAB}{_RULES_1_6}{_RULES_SINGLE}{_RULES_LAYERS}
 
 只输出 JSON，不要输出任何其他文字。"""
 
@@ -387,7 +450,13 @@ def extract_observations(parent_text: str, *, date: str,
 
     return ObservationOutcome(
         source_text=parent_text, date=date, events=real, redflags=rf,
-        noise_events=noise, unverified=unverified, trace=trace, note=note)
+        noise_events=noise, unverified=unverified, trace=trace, note=note,
+        # ★ 四层的后三层原样带过来，**Python 不改写**：
+        #   家长解读与缺失信息是模型给的**证据**，「要不要因此打断家长」
+        #   由 graph/nodes.py 的 validate_observation 判（见那里的注释）。
+        parent_interpretation=draft.parent_interpretation,
+        hypotheses=list(draft.hypotheses),
+        missing_information=list(draft.missing_information))
 
 
 # ================================================================== 落库

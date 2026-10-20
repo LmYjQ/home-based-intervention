@@ -74,6 +74,27 @@ class Observation(BaseModel):
     )
     confidence: float = Field(ge=0.0, le=1.0, description="你对自己这组判断的把握程度")
 
+    # ---- 四层之「事实层」：哪些字段是原话里直接写着的 ----
+    # ★ 为什么逐事件而另外三层不逐事件（技术方案 §4 场景 A 要的是四层）：
+    #   「这条事件的哪些字段有原话依据」是一个**逐事件**的问题 ——
+    #   同一次输入里的两条事件，一条的 behavior 是家长亲口说的、
+    #   另一条的前因是模型补的，这两件事只能挂在各自的事件上。
+    #   而「家长的解读」「待验证假设」「缺失信息」是**跨事件**的
+    #   （方案 §6 的 hypotheses 表有 related_observation_ids 复数），
+    #   挂在每条事件上会重复三份，所以那三层在 observe.ObservationBatch 上。
+    #
+    # **可选 + 默认空，且绝不能改成 required** —— 两个真实消费者：
+    #   · server.py 的教练诊断用裸 `except: continue` 重校验历史 payload
+    #   · graph/nodes.py 的 publish 同样重校验旧 checkpoint
+    #   required 字段会让**每一条旧行静默消失**、旧 checkpoint 直接 raise。
+    #   同理，降级路径（observe._fallback_batch）产出空列表，
+    #   遵守「降级时一条都不编」。
+    fact_fields: list[SpannedField] = Field(
+        default_factory=list, max_length=6,
+        description="这条事件里哪些字段是**原话里直接写着的**（能指给家长核对），"
+                    "哪些是你推断出来的。只列有原话依据的字段，推断出来的不要列。",
+    )
+
     # ---- 主动声明不确定 ----
     needs_clarification: bool = Field(
         default=False, description="证据不足以做出可靠判断时置 true"

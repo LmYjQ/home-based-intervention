@@ -109,6 +109,11 @@ class InterventionState(TypedDict, total=False):
     #: 而不是「observation 字段在不在」—— 澄清之后 observation 还在，
     #: 但语料确实变了，那一次必须重抽。
     observed_text: str
+    #: 澄清重抽**之前**那段语料（= 上一轮已落库的 source）。
+    #: `publish` 澄清后要删旧行，删的是「上一轮那一份」而不是「这一天全部」——
+    #: 同一天 `feedback.apply_feedbacks` 还会从逐条活动的 note 写别的行，
+    #: 按日期删会把那些一起删掉（Phase 1 修掉的两个潜伏 bug 之一）。
+    previous_source: str
     #: 事件条数（方便路由与展示，不必每次解 dict）
     n_events: int
     #: 模型给出的追问文案（**文案是证据**；该不该问由 Python 判）

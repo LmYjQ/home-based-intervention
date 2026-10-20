@@ -216,9 +216,15 @@ def _reextract(state, text: str) -> dict:
     out = observe.extract_observations(
         text, date=state["date"], activity=None,
         no_llm=bool(state.get("no_llm", False)))
+    # ★ 先记下**旧**语料再覆盖 —— publish 澄清后要按它删掉上一轮落的那几行。
+    #   取的是旧 observation 的 source_text，不是 state.observed_text：
+    #   后者存的是家长原话，而落库的 source 列是 extract 时传进去的那段
+    #   （两者今天相等，但语义不同，别混用）。
+    prev = (state.get("observation") or {}).get("source_text") or ""
     return {
         "observation": out.model_dump(mode="json"),
         "observed_text": text,
+        "previous_source": prev,
         "redflags": _rf_dump(out.redflags),
         "n_events": len(out.events),
         "parent_text": text,
@@ -279,9 +285,11 @@ def escalate(state) -> dict:
 def publish(state) -> dict:
     """★ **全图唯一写业务表的地方**，且排在所有 interrupt 之后。
 
-    幂等兜底（第二道保险）：同一天已有 observation 落库时，
+    幂等兜底（第二道保险）：**这段语料**今天已经落过库时，
     只在家长**又答了一次澄清**的情况下重写 —— 因为那次的语料真的变了。
     没重抽过就不重写。
+
+    幂等键是「本次语料」而不是「这一天」（Phase 1 改的，原因见下面 `already` 那行）。
 
     为什么不干脆做成"永远重写"：重复写入会让 `refusal_counts`
     与红旗按天计数（`COUNT(DISTINCT observed_at)`）的语义变模糊，
@@ -293,7 +301,16 @@ def publish(state) -> dict:
     # 澄清过 → 语料变了，重抽的产物才是今天该落的那一份
     obs = state.get("observation") or {}
     degraded = bool(obs.get("degraded"))
-    already = _today_has_observations(conn, child_id, state["date"])
+    # ★ 幂等键是**本次语料**，不是「这一天」。
+    #   原判据是 `_today_has_observations(child, date)`（这天有没有任何一行），
+    #   它在 Phase 0 成立是因为当时只有图一个写入口。图一接进 HTTP，
+    #   同一天 `feedback.apply_feedbacks` 也会从逐条活动的 note 写 observations 行
+    #   —— 那个粗判据会把「其他观察」误判成「今天已落库」而**静默跳过**，
+    #   家长写的那段话永远不落库（没有报错，只有数据不见）。
+    #   改成按 source 判之后，「今天还写过别的东西」不再吞掉「今天这段话」。
+    #   这也让写侧与读侧一致：server.py 早就按 (observed_at, source) 分组了。
+    source = obs.get("source_text") or ""
+    already = _source_published(conn, child_id, state["date"], source)
     # ★ 用 clarify_asked 判，不能用 `clarified_text != parent_text` ——
     #   _reextract 会把 parent_text 直接改成 merged，两者恒相等，
     #   那个比较永远为假，于是澄清后的重抽结果永远不落库（静默丢数据）。
@@ -308,8 +325,19 @@ def publish(state) -> dict:
         ids = []
     else:
         out = observe.ObservationOutcome.model_validate(obs)
+        # ★ 把 date 钉成 state["date"]，不要用 observation 自带的那个。
+        #   `observe.persist` 写的是 `observed_at=outcome.date`，而上面的幂等判据
+        #   查的是 `state["date"]` —— 两个键必须一致，否则「查的那天」和
+        #   「写的那天」不是同一天，幂等判据永远匹配不上，于是每次跑都重写一遍。
+        #   正常路径上两者相等（extract 收的就是 state["date"]），但这三条路上不等：
+        #   带 observation 进来的重跑、分叉带过来的历史 state、澄清后的重抽。
+        out = out.model_copy(update={"date": state["date"]})
         if reextracted:
-            _delete_today(conn, child_id, state["date"])   # 覆盖，不是清历史
+            # 只删**上一轮那一份**语料的行。原 `_delete_today` 按 child+date 删全部，
+            # 会把同一天逐条 note 写的行一起删掉 —— 那是数据丢失，不是覆盖。
+            prev = state.get("previous_source") or ""
+            if prev and prev != source:
+                _delete_source(conn, child_id, state["date"], prev)
         ids = observe.persist(conn, child_id, out)
 
     return {
@@ -318,13 +346,29 @@ def publish(state) -> dict:
     }
 
 
-def _today_has_observations(conn, child_id: str, date: str) -> bool:
+def _source_published(conn, child_id: str, date: str, source: str) -> bool:
+    """这段语料今天是否已经落过库。`source` 就是 `observations.source` 那一列。
+
+    刻意不做 `sha(source)`：PG 上 `text` 比较走的是等值索引路径，
+    而这张表按 child_id 过滤后一天也就几行，实测不构成瓶颈。
+    """
+    if not source:
+        # 没有语料可比 —— 空 source 的行是老数据（它们只到 observed_at 为止）。
+        # 按「已落库」处理，与旧行为一致：宁可不多写，不凭空造。
+        return bool(conn.execute(
+            "SELECT 1 FROM observations "
+            "WHERE child_id=%s AND observed_at=%s AND (source IS NULL OR source='') LIMIT 1",
+            (child_id, date)).fetchone())
     return bool(conn.execute(
-        "SELECT 1 FROM observations WHERE child_id=%s AND observed_at=%s LIMIT 1",
-        (child_id, date)).fetchone())
+        "SELECT 1 FROM observations "
+        "WHERE child_id=%s AND observed_at=%s AND source=%s LIMIT 1",
+        (child_id, date, source)).fetchone())
 
 
-def _delete_today(conn, child_id: str, date: str) -> None:
-    """只有「澄清后重抽」这一条路才会走到这里。**是覆盖，不是清历史。**"""
-    conn.execute("DELETE FROM observations WHERE child_id=%s AND observed_at=%s",
-                 (child_id, date))
+def _delete_source(conn, child_id: str, date: str, source: str) -> None:
+    """只有「澄清后重抽」这一条路才会走到这里。**是覆盖那一段，不是清这一天。**"""
+    if not source:
+        return
+    conn.execute("DELETE FROM observations "
+                 "WHERE child_id=%s AND observed_at=%s AND source=%s",
+                 (child_id, date, source))
