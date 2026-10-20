@@ -21,6 +21,7 @@ import AgentTrace from '../components/AgentTrace.vue'
 import FeedbackItem from '../components/FeedbackItem.vue'
 import OtherNotes from '../components/OtherNotes.vue'
 import RedFlagBanner from '../components/RedFlagBanner.vue'
+import PlanReview from '../components/PlanReview.vue'
 import { useDraft } from '../composables/useDraft.js'
 
 const props = defineProps({ CHILD: String, date: String, hasProfile: Boolean,
@@ -143,8 +144,38 @@ async function loadObserveStatus() {
   }
 }
 
-onMounted(() => { draft.restore(); loadObserveStatus(); loadRedFlags() })
-watch(() => props.date, () => { draft.restore(); loadObserveStatus() })  // 换日期 = 换那天的草稿与追问
+
+// ================================================================ 计划审批（Phase 3）
+// ★ 为什么单独一块、而不是塞进"今天的安排"里：
+//   "今天的安排"是**已经生效的东西**（卡片发出去就收不回来了），
+//   而审批是**还没生效的东西**（等你点头）。混在一起的话，
+//   家长会分不清"这些已经排好了"和"这些还在等你确认"。
+//
+// ★ 刷新后靠 /api/plan/status 找回待批的计划 —— 前端不持有 interrupt 状态
+//   （刷新就没了，服务端不会）。
+const planState = ref(null)
+const planBusy = ref(false)
+
+async function loadPlanStatus() {
+  try {
+    planState.value = await api.planStatus(props.CHILD, props.date)
+  } catch (e) {
+    console.warn('[plan] 读状态失败', e.message)
+  }
+}
+
+// 批完之后：计划变了 → 当天的卡片要跟着重出
+async function onPlanReviewed(r) {
+  if (r) planState.value = r
+  else await loadPlanStatus()
+  await load()          // 重新读当天安排（后端会按已生效的计划给）
+  await loadPlanStatus()
+}
+
+onMounted(() => { draft.restore(); loadObserveStatus(); loadRedFlags(); loadPlanStatus() })
+watch(() => props.date, () => {
+  draft.restore(); loadObserveStatus(); loadPlanStatus()
+})  // 换日期 = 换那天的草稿与追问
 
 // ================================================================ 红旗（Phase 2）
 // ★ 与观察链的追问不同：红旗**不是那一天的**，是"目前还没处理的事"。
@@ -241,6 +272,11 @@ defineExpose({ load })
          家长会先读完"今天练这三条"再看到"今天要停"。 -->
     <RedFlagBanner :flags="redFlags" :paused="paused" :busy="rfBusy"
                    @set-status="setRedFlagStatus" />
+
+    <!-- ⚡ 计划审批（Phase 3）：排在横幅之后、"今天的安排"之前 ——
+         暂停比审批更要紧（今天要不要停），审批比安排更要紧（还没生效）。 -->
+    <PlanReview :CHILD="props.CHILD" :date="props.date" :plan="planState"
+                @reviewed="onPlanReviewed" />
 
     <section class="card">
       <div class="head">

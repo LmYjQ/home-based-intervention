@@ -67,6 +67,20 @@ export const api = {
   redFlagSetStatus: (cid, id, status) =>
     req(`/api/redflags/${id}/status?child_id=${encodeURIComponent(cid)}`,
         { method: 'PATCH', body: JSON.stringify({ status }) }),
+
+  // ---- 计划链（Phase 3）----
+  // ★ 计划链**不是慢路径**（全程纯 Python 检索 + 装箱，零 LLM），
+  //   所以直接 req，不用 job + SSE。
+  //   run 可能返回 phase:"review"（图停在 ⚡ 审批 interrupt 上等家长），
+  //   那不是错误是正常结果 —— 与观察链的 clarify 同款的两阶段协议。
+  planRun: (body) => req('/api/plan/run', { method: 'POST', body: JSON.stringify(body) }),
+  planReview: (body) =>
+    req('/api/plan/review', { method: 'POST', body: JSON.stringify(body) }),
+  // 刷新页面后靠它知道「还有个计划等你批」—— 纯读 checkpoint，毫秒级
+  planStatus: (cid, date) =>
+    req(`/api/plan/status?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+  planVersions: (cid, date) =>
+    req(`/api/plan/versions?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
 }
 
 // ★ 慢路径统一走 SSE。两条慢路径（建档 18-47s、出卡片 30-45s）共用这一份。
