@@ -50,7 +50,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "asd_agent"))
@@ -58,7 +58,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "asd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from langgraph.types import Command
+from pydantic import BaseModel, ConfigDict, Field
 
 import llm
 import observe
@@ -76,6 +77,14 @@ from planner import pack_day
 from summary import summarize_day
 import loop as loop_mod
 from schema import Observation
+
+# ---- 编排层（Phase 1 接入）----
+# ★ 图的编译与 saver 都在 graph.runtime 里按进程缓存 ——
+#   `saver_for()` 每次调用都开一条新连接并（首次）跑一次 setup()
+#   （里面含 CREATE INDEX CONCURRENTLY），绝不能每请求调一次。
+from graph import draft as graph_draft
+from graph.runtime import get_graph, get_draft_graph
+from graph.state import ClarifyAnswer, thread_config
 
 app = FastAPI(title="家长干预教练 Agent", version="0.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
@@ -261,8 +270,62 @@ class FeedbackIn(BaseModel):
     child_id: str
     date: str
     feedbacks: list[ActivityFeedback] = Field(default_factory=list)
-    other_notes: str = ""
+    other_notes: str = Field(
+        default="",
+        deprecated=("「其他观察」改走 POST /api/observe/run（图接管，Phase 1）。"
+                    "这个字段留着只为不让旧前端静默丢掉家长写的话 —— "
+                    "本端点不再拿它去抽事件。"))
     no_llm: bool | None = None
+
+
+# ================================================================== 图的载荷
+class ObserveIn(BaseModel):
+    """家长的一段自然语言 → 观察链。技术方案 §1.1 的第一步。"""
+
+    child_id: str
+    date: str
+    text: str = Field(min_length=1)
+    no_llm: bool | None = None
+
+
+class ObserveResumeIn(BaseModel):
+    """对澄清 interrupt 的回答。
+
+    ★ 这里**不重复**声明 answer 的长度上界：`graph/nodes.py` 的 clarify 节点
+      已经用 `interrupt(..., response_schema=ClarifyAnswer)` 挂好了 Pydantic，
+      校验发生在**恢复那一刻**（技术方案 §5.4「前端提交必须经服务端 Schema
+      校验」）。在这里再抄一份 max_length 就是两处口径 —— 抄的那份迟早会落后。
+      FastAPI 这层只保证形状是 dict，语义交给图。
+    """
+
+    child_id: str
+    date: str
+    answer: str = Field(default="", max_length=2000)   # 只防超长请求体，不参与语义校验
+    skip: bool = False
+    no_llm: bool | None = None
+
+
+class DraftRowIn(BaseModel):
+    """草稿里的一行。**刻意比 `ActivityFeedback` 宽松** —— 草稿就是「填了一半」。
+
+    ★ 不能复用 `ActivityFeedback`：它的 `outcome` 必填且取值受限，
+      而家长刚点开页面时所有行都是空的 —— 存不进去。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    activity_id: str
+    outcome: str = Field(default="", max_length=16)
+    prompt_level: int = Field(default=0, ge=0, le=3)   # 与 ActivityFeedback 同口径：int 0-3
+    steps_done: int = Field(default=0, ge=0, le=20)
+    note: str = Field(default="", max_length=2000)
+
+
+class DraftIn(BaseModel):
+    child_id: str
+    date: str
+    rows: list[DraftRowIn] = Field(default_factory=list)
+    other_notes: str = Field(default="", max_length=20000)
 
 
 # ================================================================== 慢路径（job + SSE）
@@ -561,6 +624,182 @@ def api_plan(child_id: str, on: str | None = None):
     }
 
 
+# ================================================================== 观察链（Phase 1）
+# ★ 为什么「其他观察」改走图，而逐条活动的 note 抽取留在 apply_feedbacks
+# ------------------------------------------------------------------
+# 一天里有**两段**自由文本，它们语义不同、抽取模式也不同：
+#   · 逐条活动的 note  → `SYSTEM_SINGLE`，只抽这一条活动里发生的事，
+#                        而且家长已经点过 outcome 了，抽取只补细节
+#   · 「其他观察」整段  → `SYSTEM`，一次话里多次事件要抽全
+# Phase 0 只有图一个写入口，所以 `publish` 的幂等判据按「这一天」写就成立。
+# 图一接进 HTTP，`/api/feedbacks` 也在同一天写 observations 行，那个粗判据
+# 就会把「其他观察」误判成「今天已落库」而**静默跳过**（graph/nodes.py 里有
+# 完整说明）。所以「其他观察」这一段整体交给图的 publish，逐条 note 那条路
+# **原样保留** —— sessions→outcomes 的语义拆分是 Phase 4 的活，
+# 而 `loop.py` 的 CLI 也走 apply_feedbacks 的 other_notes 路径。
+
+
+def _observe_result(g, cfg: dict) -> dict:
+    """把 checkpoint 上的状态读成前端要的形状。
+
+    ★ 中断判定用 `snap.next` / `snap.interrupts`，**不用** state 里的
+      `needs_clarification`：resume 跑完之后那个字段是**上一次**的值，
+      拿它判会把「已经答过了」误报成「还在等」。
+
+    三种 phase：
+      idle    —— 这个 thread 从没跑过（前端据此显示「还没有记录」）
+      clarify —— 停在 ⚡ interrupt 上，等家长回答
+      done    —— 跑完了（可能走了 escalate 那条路）
+    """
+    snap = g.get_state(cfg)
+    vals = snap.values or {}
+    nxt = tuple(snap.next or ())
+    ints = list(getattr(snap, "interrupts", None) or [])
+
+    if not vals and not nxt:
+        return {"phase": "idle", "thread_id": cfg["configurable"]["thread_id"],
+                "interrupt": None, "observation_ids": [],
+                "clarify_asked": False, "degraded": False, "trace": []}
+
+    obs = vals.get("observation") or {}
+    interrupted = bool(nxt) and bool(ints)
+    return {
+        "phase": "clarify" if interrupted else "done",
+        "thread_id": cfg["configurable"]["thread_id"],
+        # 就是 nodes.py 里 interrupt() 传进去的那个 payload（含 question）
+        "interrupt": _jsonable(ints[0].value) if ints else None,
+        "observation_ids": list(vals.get("observation_ids") or []),
+        "clarify_asked": bool(vals.get("clarify_asked")),
+        # 澄清往返的产物：家长的回答 + 合并后的语料。
+        # 回指校验比的是**整段**原话，所以回答是追加进去的而不是替换 ——
+        # 展示出来是为了让家长看到「系统把你说的两段话合起来重新理解了一遍」。
+        "clarification_answer": vals.get("clarification_answer") or "",
+        "clarified_text": vals.get("clarified_text") or "",
+        "degraded": bool(obs.get("degraded")),
+        # 四层：给人看的部分。空是合法的（降级时就是全空）
+        "parent_interpretation": obs.get("parent_interpretation"),
+        "hypotheses": list(obs.get("hypotheses") or []),
+        "missing_information": list(obs.get("missing_information") or []),
+        "n_events": int(vals.get("n_events") or 0),
+        "verdict": _jsonable(vals.get("verdict") or {}),
+        "escalation": _jsonable(vals.get("escalation")),
+        "trace": list(vals.get("trace") or []),
+    }
+
+
+@app.post("/api/observe/run")
+def api_observe_run(inp: ObserveIn):
+    """跑观察链。慢路径（抽取可到 60s）→ job + SSE。
+
+    ★ **两阶段协议**。这���端点可能返回 `phase="clarify"` —— 也就是图停在
+      ⚡ interrupt 上等家长回答。那不是错误，是一个**正常结果**。
+      第二阶段是 `POST /api/observe/resume`。
+
+    ★ 为什么 resume 的身份是 `(child_id, date)` 而不是 job_id：
+      `_Job` 是进程内的一次性容器（重启即失、没有 resume 概念），
+      而 thread_id 是 `{child_id}:{date}`，天然对应「这一天的那次观察」。
+      连续性在 checkpoint 里 —— 这正是引入 checkpointer 的理由。
+    """
+    no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    _profile_or_400(_conn(), inp.child_id)      # 没有画像的孩子不该走到这一步
+
+    def work(step):
+        t0 = time.time()
+        g = get_graph()
+        step("跑观察链…")
+        out = g.invoke({"child_id": inp.child_id, "date": inp.date,
+                        "parent_text": inp.text, "no_llm": no_llm},
+                       thread_config(inp.child_id, inp.date))
+        step("观察链结束")
+        r = _observe_result(g, thread_config(inp.child_id, inp.date))
+        r["llm_calls"] = 0 if no_llm else 1
+        r["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return r
+
+    return {"job_id": _start_job("observe", work)}
+
+
+@app.post("/api/observe/resume")
+def api_observe_resume(inp: ObserveResumeIn):
+    """回答澄清，让图接着跑。
+
+    ★★ 没有待回答的澄清时**必须 409** ——
+      `Command(resume=...)` 打在一个没有 pending interrupt 的 thread 上，
+      LangGraph 会把它当成**新输入**从头跑一遍整条图：重新抽取、重新落库。
+      **不报错、不抛异常，就是数据写了两遍。**
+      所以这个判断必须在 `graph.invoke` 之前挡掉。
+    """
+    no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    g = get_graph()
+    cfg = thread_config(inp.child_id, inp.date)
+
+    snap = g.get_state(cfg)
+    pending = bool(getattr(snap, "interrupts", None) or [])
+    if not pending:
+        raise HTTPException(
+            409, "这一天没有待回答的澄清（可能已经答过了，或者压根没跑过观察）")
+
+    def work(step):
+        t0 = time.time()
+        step("接着跑观察链…")
+        # 传 dict 而不是 ClarifyAnswer 实例：让 nodes.py 里已经挂好的
+        # response_schema 在**恢复那一刻**做校验（技术方案 §5.4）。
+        g.invoke(Command(resume={"answer": inp.answer, "skip": inp.skip}), cfg)
+        step("观察链结束")
+        r = _observe_result(g, cfg)
+        r["llm_calls"] = 0 if no_llm else 1
+        r["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return r
+
+    return {"job_id": _start_job("observe-resume", work)}
+
+
+@app.get("/api/observe/status")
+def api_observe_status(child_id: str, date: str):
+    """这一天观察链现在停在哪。**纯读 checkpoint，毫秒级，不起 job。**
+
+    ★ 刷新页面后靠它知道「还有个问题没答」—— 前端不持有任何 interrupt 状态，
+      那是服务端的事（前端一刷新就没了，服务端不会）。
+    """
+    g = get_graph()
+    return _observe_result(g, thread_config(child_id, date))
+
+
+# ================================================================== 草稿
+@app.get("/api/draft")
+def api_draft_get(child_id: str, date: str):
+    """读草稿。**没有就是 `draft: null`**，不是空壳 —— 调用方据此决定要不要恢复。"""
+    g = get_draft_graph()
+    return {"draft": _jsonable(graph_draft.load_draft(g, child_id=child_id, date=date))}
+
+
+@app.put("/api/draft")
+def api_draft_put(inp: DraftIn):
+    """覆盖式存草稿。家长改的是同一份，不是记历史。
+
+    ★ 走 checkpoint（`draft:{child_id}:{date}` 独立命名空间），不碰业务表 ——
+      草稿图的节点永远不会被执行（只用 update_state 写），所以
+      「interrupt 恢复会重跑节点」那条硬约束在这里结构上不适用。
+    """
+    g = get_draft_graph()
+    saved_at = datetime.now().isoformat(timespec="seconds")
+    graph_draft.save_draft(
+        g, child_id=inp.child_id, date=inp.date,
+        rows=[r.model_dump() for r in inp.rows],
+        other_notes=inp.other_notes, saved_at=saved_at)
+    return {"thread_id": graph_draft.draft_thread_id(inp.child_id, inp.date),
+            "saved_at": saved_at}
+
+
+@app.delete("/api/draft")
+def api_draft_delete(child_id: str, date: str):
+    """草稿提交成功后删掉（语义上的删除，不是写一份空的）。"""
+    g = get_draft_graph()
+    graph_draft.clear_draft(g.checkpointer, child_id=child_id, date=date)
+    return {"cleared": True,
+            "thread_id": graph_draft.draft_thread_id(child_id, date)}
+
+
 @app.post("/api/feedbacks")
 def api_feedbacks(inp: FeedbackIn):
     """★ 逐条反馈 → sessions + observations。**唯一有业务语义的新增路由。**
@@ -569,18 +808,26 @@ def api_feedbacks(inp: FeedbackIn):
     只有 note 非空的条目才各触发一次抽取（可到 60s）。
     响应里的 `llm_calls` 告诉前端"刚才那几秒是在抽事件"，
     否则家长会以为界面卡死了。
+
+    ★ Phase 1：`other_notes` **不再**拿��去抽事件 ——「其他观察」改由
+      `POST /api/observe/run` 的图接管。这里传空字符串，抽取只走逐条 note。
+      `llm_calls` 的计数同步不再把它算进去。
     """
     no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
     conn = _conn()
     _profile_or_400(conn, inp.child_id)
 
+    # ★ Phase 1：`other_notes` **不再**传给 apply_feedbacks。
+    #   它以前会在这里被抽一遍事件、落一遍库；而「其他观察」现在由
+    #   `POST /api/observe/run` 的图 publish 落库。两处都做 = 抽两次、
+    #   写两行、付两次 LLM，而且 refusal/recent_scenes 会被同一段话算两遍。
+    #   `apply_feedbacks` 本身**没有改** —— `loop.py` 的 CLI 还在用它那条路径。
     n_notes = sum(1 for f in inp.feedbacks if f.note.strip())
-    n_notes += 1 if inp.other_notes.strip() else 0
     llm_calls = 0 if no_llm else n_notes
 
     t0 = time.time()
     res = apply_feedbacks(conn, inp.child_id, inp.date, inp.feedbacks,
-                          other_notes=inp.other_notes, no_llm=no_llm)
+                          other_notes="", no_llm=no_llm)
     # ★ 家长提交当天最后一条反馈 → 自动收尾（状态转移 + 日结）。
     #   不做成前端点第二个按钮：那条顺序不变量（记录先落库、再转移再日结）
     #   是后端的性质，不该由前端记着。收尾本身幂等，重复提交不会重复转移。

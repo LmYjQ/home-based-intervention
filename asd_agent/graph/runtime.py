@@ -1,0 +1,83 @@
+# -*- coding: utf-8 -*-
+"""
+图的运行时
+==========
+
+**编译一次，按进程复用。**
+
+为什么必须缓存：`saver_for()` 每次调用都会**开一条新的数据库连接**，
+并在首次时跑一次 `PostgresSaver.setup()`（里面含 `CREATE INDEX CONCURRENTLY`）。
+每个 HTTP 请求调一次，就意味着每个请求开一条连接、跑一次 CONCURRENTLY。
+所以它是**按 schema 名缓存的进程级单例**。
+
+多 worker（uvicorn --workers N）下每个进程各有一份 —— 那是正常的：
+`setup()` 建表用 IF NOT EXISTS，重复跑幂等，而 checkpointer 表在 schema 里，
+所有 worker 看到的是同一批表。**不要试图跨进程共享 saver 实例**：
+连接不是线程安全的也不是进程安全的。
+
+一个进程里 `ASD_DB_PATH` 变了会得到另一张图（key 是 schema 名）。
+自检脚本正是靠这个拿到干净图的。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+
+_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
+import store                                          # noqa: E402
+
+from .builder import build_graph                      # noqa: E402
+from .checkpointer import saver_for                   # noqa: E402
+
+_LOCK = threading.Lock()
+_GRAPHS: dict[str, object] = {}        # schema 名 -> CompiledStateGraph
+_DRAFTS: dict[str, object] = {}        # schema 名 -> 草稿图
+
+
+def _key(path: str | None) -> str:
+    return store._schema_of(path or store.DEFAULT_DB)
+
+
+def _cached(cache: dict, key: str, factory):
+    with _LOCK:
+        g = cache.get(key)
+        if g is None:
+            g = cache[key] = factory()
+        return g
+
+
+def get_graph(path: str | None = None):
+    """干预主图。同一进程、同一 schema 只编译一次。"""
+    return _cached(_GRAPHS, _key(path), lambda: build_graph(saver_for(path)))
+
+
+def get_draft_graph(path: str | None = None):
+    """草稿图（见 draft.py）。与主图分开的缓存，两者不会互相顶掉。"""
+    from . import draft
+    return _cached(_DRAFTS, _key(path), lambda: draft.build_draft_graph(saver_for(path)))
+
+
+def close_all() -> None:
+    """关掉本进程持有的 saver 连接 + 清缓存。**只给测试与关停用。**"""
+    from .checkpointer import close_all as _close
+    with _LOCK:
+        _GRAPHS.clear()
+        _DRAFTS.clear()
+    _close()
+
+
+if __name__ == "__main__":
+    # 自检：图能拿到、且**确实是同一个对象**（即真的缓存了）
+    g1, g2 = get_graph(), get_graph()
+    print(f"schema        = {_key(None)}")
+    print(f"同一实例      = {g1 is g2}")
+    print(f"有 checkpointer= {g1.checkpointer is not None}")
+    d1, d2 = get_draft_graph(), get_draft_graph()
+    print(f"草稿同一实例  = {d1 is d2}")
+    print(f"草稿≠主图     = {d1 is not g1}")
+    close_all()

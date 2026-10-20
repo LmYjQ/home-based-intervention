@@ -248,9 +248,57 @@ def main() -> int:
     print("\n[12] ★ 规则 1-6 仍与 verify_schema 逐字对齐")
     check_rules_alignment(check)
 
+    # =============================================== 13. 草稿
+    print("\n[13] 草稿：存 checkpoint，且一个业务表都不碰")
+    check_draft(conn, check)
+
     close_all()
     print("\n" + ("✓ Phase 0/1 图级验收全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+# ================================================================== [13] 草稿
+def check_draft(conn, check) -> None:
+    """草稿走独立的 thread 命名空间，且**只写 checkpoint 表**。
+
+    「只写 checkpoint」这件事不是靠自觉 —— 它靠的是草稿图从不 invoke：
+    `update_state` 只落 checkpoint，没有任何节点被执行，
+    所以「interrupt 恢复重跑节点」那条硬约束在这里**结构上不适用**。
+    断言守的是「草稿不能因为将来有人改成 invoke 而开始写业务表」。
+    """
+    from . import draft
+    from .runtime import get_draft_graph
+
+    before = _counts(conn, CID)
+    dg = get_draft_graph(DB)
+
+    check("空草稿读出来是 None（不是空壳）",
+          draft.load_draft(dg, child_id=CID, date="2026-10-28") is None)
+
+    draft.save_draft(dg, child_id=CID, date="2026-10-28",
+                     rows=[{"activity_id": "gro-007", "outcome": "",
+                            "prompt_level": 0, "note": "试了两次"}],
+                     other_notes="超市里他捂耳朵", saved_at="12:00:00")
+    d = draft.load_draft(dg, child_id=CID, date="2026-10-28")
+    check("半填的行能存能取（outcome 为空也存得下）",
+          bool(d) and d["rows"][0]["outcome"] == "", d)
+    check("自由文本存取一致", bool(d) and d["other_notes"] == "超市里他捂耳朵")
+    check("★ 草稿 thread 与 run thread 是不同命名空间",
+          draft.draft_thread_id(CID, "2026-10-28")
+          != thread_config(CID, "2026-10-28")["configurable"]["thread_id"],
+          draft.draft_thread_id(CID, "2026-10-28"))
+
+    # 覆盖式：家长改的是同一份草稿，不是记历史
+    draft.save_draft(dg, child_id=CID, date="2026-10-28",
+                     rows=[], other_notes="改了", saved_at="12:01:00")
+    d2 = draft.load_draft(dg, child_id=CID, date="2026-10-28")
+    check("保存是覆盖而不是追加", d2["rows"] == [] and d2["other_notes"] == "改了")
+
+    draft.clear_draft(dg.checkpointer, child_id=CID, date="2026-10-28")
+    check("clear 后读回 None",
+          draft.load_draft(dg, child_id=CID, date="2026-10-28") is None)
+    check("★ 草稿全程一个业务表都没碰",
+          _counts(conn, CID) == before, f"{before} → {_counts(conn, CID)}")
 
 
 # ================================================================== [9] 向后兼容
