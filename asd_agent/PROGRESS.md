@@ -13,8 +13,10 @@
 > - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
-> - **Phase 0 + Phase 1 均已完成**（2026-10-20）。图级验收 9 → **13 组**断言，
->   新增 `http_selfcheck.py` **8 组**。Phase 1 的接线约束见第四节之二。
+> - **Phase 0 / 1 / 2 均已完成**（2026-10-20）。图级验收 9 → **14 组**断言，
+>   `http_selfcheck.py` **9 组**。Phase 1 的接线约束见第四节之二；
+>   **Phase 3 开工必读 = 第四节之三末尾的「给 Phase 3 的合同」+ 整个第四节之四**
+>   （图长什么样、实质性变更判据、要补的迁移、验收断言；带 ⚠️ 的没重新验证过）。
 >
 > **★ 一条会静默咬人的实测结果**：`interrupt()` 恢复会重跑所在节点这件事
 > **只在 `PostgresSaver` 下可观测**，用 `InMemorySaver` 写单测会看到"只跑了一次"，
@@ -52,11 +54,35 @@
 > 小模型跟例子，不跟论述。新规则单独放 `_RULES_LAYERS`，**绝不能动与 verify_schema
 > 逐字对齐的 `_RULES_1_6`**（selfcheck [12] 把这件事变成机器可验的不变量）。
 >
-> **`asd_agent/http_selfcheck.py` 是新增的**（8 组）—— `server.py` **不在任何回归集里**，
+> **`asd_agent/http_selfcheck.py` 是新增的**（**9 组**）—— `server.py` **不在任何回归集里**，
 > 而 Phase 1 往里面接了图。不补这一层就等于把刚做对的东西放在没人守的地方。
 >
-> **下一步 = Phase 2（安全链）**：`escalate` 真的落库（红旗现在只在响应里飘一次，
-> `RedFlagList.vue` 渲染完就永久消失）+ 转诊指引 + `safety_gate` 加 urgent 路由。
+> **Phase 2 ✅（2026-10-20，安全链：红旗落库 + 转诊指引）**。细节见 LANGGRAPH.md 第四节之三：
+> - **`escalate → END` 改成了 `escalate → publish → END`。** 判定一行没动，
+>   改的是"判完之后这一天还写不写" —— 原来 urgent 那天的家长原话**从不进
+>   `observations`**，最该记下来的那天什么都没留下。
+>   放在 `publish` 而不是 `escalate` 的真正理由：Phase 3 要在 `safety_gate` 之后
+>   插 `⚡ approve_plan`，写在 `escalate` 就变成"interrupt 之前写库"。
+> - **新表 `red_flags`**，唯一索引 `(child_id, observed_at, code, source_hash)`
+>   + `ON CONFLICT DO NOTHING`。键里**不含 `thread_id`**（分叉重跑不污染真实历史）。
+>   `status` 是**全项目唯一可变的业务字段**，行的身份仍 append-only。
+> - **转诊指引长在 `redflag.RULES` 每一项上**（`who`/`do`/`avoid`/`emergency`，
+>   `avoid` 是防害字段不允许为空）。多个 urgent 逐条给，不揉成一段；
+>   `escalation.guidance` **仍是一句 str**（老 checkpoint 与老前端读的就是它）。
+> - **★ 给 Phase 3 的合同**：`store.plan_paused(child_id)` 是「暂停计划生成」的
+>   **唯一口径**（存在 urgent 且未关闭；按孩子不按天）。`generate_plan` 必须调它，
+>   不许自己再发明一个。前端也只读后端返回的 `paused`，不自己从列表推。
+> - 前端新建 `RedFlagBanner.vue`（不复用 `RedFlagList.vue`：一个吃扫描结果无按钮，
+>   一个吃已落库的行要按状态给动作），**置顶**在"今天的安排"之上。
+>
+> **下一步 = Phase 3（计划链）**：`plans` 表加 `status`/`version`；
+> 审批 interrupt（`approve`/`edit`/`reject`）；实质性变更判据（纯 Python）；
+> `planner.plan_week` 的死代码问题。
+> **开工顺序**：先读 `LANGGRAPH.md` 的「🎯 Phase 3 开工前必须知道的四件事」
+> 与「四之四、Phase 3 待接」两节 —— 后者是从旧计划文件搬过来的，
+> 带 ⚠️ 的地方**搬过来时没重新验证**，动手前先读真文件。
+> **别只读这一屏就开工**：Phase 3 会碰 `plans` 迁移与第二个 interrupt，
+> 那两处的结构约束（落库只在 `publish`）踩坏了是**静默双写**。
 
 **✅ 工作区已提交**（2026-10-20，分支 `pg-langgraph-baseline`）：
 ```
@@ -64,8 +90,19 @@ aa70b6d Phase 0：LangGraph 编排层地基
 8a2b221 Phase 1 步 1-2：四层字段 + publish 幂等键重挂
 13d74ab Phase 1 步 3-4：图接进 HTTP（两阶段澄清 + 草稿）
 adbf9aa Phase 1 步 5：前端接上观察链 + 草稿持久化
+3f653cc PROGRESS：交接屏更新到 Phase 1
+a25acc5 Phase 2 步 1：红旗落库能力（规则 + 表 + 节点体）
+14e1f38 Phase 2 步 2：改边 + HTTP 面（escalate 之后仍然走 publish）
+b30c28c Phase 2 步 3：置顶红旗横幅（前端）
 ```
-每一步都是可 revert 的独立 commit，改既有行为的那步（步 2）单独成步。
+每一步都是可 revert 的独立 commit，改既有行为的那步单独成步。
+
+> Phase 2 刻意拆成三步而不是一个大 commit：
+> 步 1 只加能力（规则 + 表 + 节点体），**不改图的边**；
+> 步 2 才改边，并**同时**改它牵动的断言 ——
+> 旧断言 `trace[-1] == "escalate"` 把 bug 写成了规范，
+> 改边与改断言必须同一个 commit，否则中间那个 commit 是不绿的。
+> 步 3 是前端（依赖步 2 的 API）。
 
 **✅ 存储层已换成 PostgreSQL，并发 500 随之消失**（180 请求 0 失败，迁移前失败 8 个）。
 详见「✅ 迁移到 PostgreSQL 已完成」一节 —— 那里有改动清单、
@@ -103,9 +140,9 @@ cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
 **三个自检入口**（改图 / 改 server.py 之后必须跑，全绿才算数）：
 ```bash
 cd asd_agent
-ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 13 组
+ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 14 组
 ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
-ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 8 组
+ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 9 组
 ```
 
 **⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用
@@ -1162,6 +1199,18 @@ LLM 调用数不变，仍是每天 1 次。
 
 ## ⚠️ 已知遗留（本轮发现）
 
+**Phase 2（红旗）新增的：**
+
+- **计划暂停没有过期策略。** urgent 没人关就永远停着计划生成。
+  这是有意的 fail-closed，且横幅让它可见可操作；Phase 3 该重新审视一次，
+  到时**只改 `store.plan_paused` 那一条 SQL**。
+- **红旗状态变更没有完整审计。** 现在只有 `status_changed_at` 记时点，
+  没有"谁在什么时候从什么改成了什么"。留给 Phase 5 的 `workflow_audit_events`。
+- **评估报告里的 urgent 也会暂停当前计划**（哪怕是几个月前那份报告）。
+  这是产品判断不是技术判断，当时选了 fail-closed；要反转同样只改那一条 SQL。
+
+**更早就在的：**
+
 - **`DailySummary.domain_updates` 默认值为何是 `(FieldInfo,)` 尚未定位。**
   已用形状校验挡住后果，但**为什么**没查清。下一个 session 若有余力，
   值得单独二分一次（⚠️ 别再手写"看起来一样"的最小复现 —— 我试了 3 次全部
@@ -1183,7 +1232,10 @@ cd frontend && npm run dev     # ⚠️ 5173 被占时会自动退到 5174，看
 **测之前**：打开左上角「离线模式」开关（live 模式每次出卡片要 30-45s）。
 
 - [ ] 建档：贴报告 → SSE 进度 → 出画像。空库会降级成可信度 0.1，**这是对的**
-- [ ] 建档红旗：贴含 C11「会去咬自己的袖子」的原文 → 必须出现 urgent/self_injury
+- [ ] 建档红旗：贴含 C11「会去咬自己的袖子」的原文 → 页面**顶部**出现置顶常驻的红旗横幅
+- [ ] ★ 红旗状态：「已看到」**不**解除暂停，「已处理」才解除；已处理的移进折叠区不消失
+- [ ] ★ 提交含自伤的观察后**不刷新**横幅就多一条「来自当天观察」；
+      且那天 `observations` 真的有行（Phase 0/1 这里是 0 —— 这是本轮最要紧的修复）
 - [ ] 逐条反馈：Day1 只填 gro-007 填「不配合」，fin-001/gro-006 点「跳过」
       → 响应里 `refusal_counts` 必须是 `{'gro-007': 1}`
 - [ ] 「其他观察」框：填超市捂耳朵 → 事件进 observations，`refusal_counts` **一条都不加**

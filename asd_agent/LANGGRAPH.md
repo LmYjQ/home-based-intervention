@@ -8,7 +8,41 @@
 
 ## 🔖 换 session 先看这一屏
 
-**当前阶段：Phase 1 ✅ 已完成（图接进 HTTP）。** 下一步是 Phase 2（安全链：`escalate` 真落库 + 转诊）。
+**当前阶段：Phase 2 ✅ 已完成（红旗落库 + 转诊指引 + 置顶横幅）。**
+**下一步 = Phase 3（计划链）** —— 开工前先读本节末尾的
+「🎯 Phase 3 开工前必须知道的四件事」，那一屏是为你写的。
+
+### Phase 2 做完什么
+
+**红旗从"响应里飘一次"变成长期记录。** 三条具体后果被修掉：
+
+1. `escalate → END` → **`escalate → publish → END`**。原来 urgent 那天的
+   家长原话**从不进 `observations` 表**，最该被记下来的那天什么都没留下。
+2. 新表 `red_flags` + 唯一索引幂等 + 全部严重度都落 + 逐 code 的转诊指引。
+3. 「暂停计划生成」从一句响应里的字符串变成**可持久查询**的判据
+   `store.plan_paused(child_id)`。
+
+图级验收 **14 组**，HTTP 层 **9 组**。细节见第四节之三。
+
+### 🎯 Phase 3 开工前必须知道的四件事
+
+1. **`generate_plan` 必须调 `store.plan_paused(child_id)`，不许自己再发明一个。**
+   那是「能不能生成计划」的**唯一口径**（存在 `severity='urgent'` 且
+   `status<>'closed'` 的红旗；**按孩子不按天**）。理由与那条查询里的注释。
+   要加过期策略就改那一条 SQL，**不要**加第二处定义。
+2. **落库仍然只能在 `publish` 一个节点里。** Phase 3 要插的 `⚡ approve_plan`
+   在 `safety_gate` **之后**，所以图会变成
+   `safety_gate → escalate → publish` 与 `safety_gate → … → generate → ⚡ approve → freeze → publish`。
+   `freeze_plan` **不许自己写 `plans` 表** —— 一旦有第二个写库节点，
+   「interrupt 恢复重跑节点」（第二节 ⑤）就会在某天咬人。
+3. **`plans` 表现在只有 4 列**（`id / child_id / plan_date / created_at / payload`），
+   没有 `status` / `version`。**这是 Phase 3 要补的第一块迁移**，
+   也是当初图上故意不画计划链的原因（`builder.py` 模块 docstring 记着）。
+   `status` 的可变性有先例可抄：`red_flags.status` 的约定见第四节之三，
+   两处一起引入、只解释一遍。
+4. **`planner.plan_week` 在 HTTP 里是死代码**（无任何路由调用它）。
+   要么接进 `generate_plan`，要么**删掉整条 LLM 链路只保留 `pack_day`** ——
+   别让它继续躺着，那会让"LLM 出了个计划"这件事看起来发生过而其实没有。
 
 Phase 1 做完四件事，全部有断言或浏览器实测守着：
 
@@ -23,8 +57,8 @@ Phase 1 做完四件事，全部有断言或浏览器实测守着：
 4. **草稿存 checkpoint**：前端此前零持久化，填一半刷新即丢。
    现在存 `draft:{child_id}:{date}` 独立 thread（`graph/draft.py`）。
 
-新增两处**以前没人守**的东西：`asd_agent/http_selfcheck.py`（8 组，
-因为 `server.py` 不在任何回归集里）与 `graph/selfcheck.py` 的 [9]-[13] 组。
+新增两处**以前没人守**的东西：`asd_agent/http_selfcheck.py`（**9 组**，
+因为 `server.py` 不在任何回归集里）与 `graph/selfcheck.py` 的 [9]-[14] 组。
 
 Phase 0 之前的三件事也仍然成立：
 
@@ -48,6 +82,10 @@ docker run -d --rm --name ganyu_pg -e POSTGRES_PASSWORD=postgres \
 ```
 
 ⚠️ 本机 8000 被占，后端用 **8123**，前端 `vite.config.js` 的代理 target 要同步改。
+
+⚠️ **Phase 2 加了新表 `red_flags` —— 改了 `store.py` 的表之后必须重启后端**：
+`store._init` 只在某个 schema 的连接**首次创建**时跑，跑着的服务不会凭空多出这张表，
+新路由会 500 `relation "red_flags" does not exist`。
 
 ---
 
@@ -434,7 +472,211 @@ ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
 
 ---
 
+## 四之三、Phase 2 ✅ 已完成（2026-10-20）：红旗落库 + 转诊指引
+
+Phase 0/1 的 `safety_gate → escalate → END` 有三处具体后果，不是"功能没做完"：
+
+1. **最要紧的数据在最重要的那天丢了。** `escalate → END` 跳过了 `publish`，
+   于是"孩子今天咬自己"这句话**从不进 `observations` 表**。没有报错，
+   只是最该被记下来的那一天什么都没留下 —— 而 `observe.persist` 本来
+   会给那几行打上 `redflag_triggered`，`store.what_last_week` 的
+   "本周有几天碰到红旗"也因此一直是 0。
+2. **红旗无处可落。** `RedFlagList.vue` 吃的是一次响应里的 `report`，
+   `v-if` 一卸载就永久消失。
+3. **"暂停计划生成"只是一句响应里的字符串**，没有第二个消费者。
+
+### ★ 改的是边，不是判定
+
+`_route_safety` 一行没动（仍是 `redflag.scan` 的 `highest == "urgent"`），
+只把 `escalate → END` 换成 `escalate → publish → END`。两条理由，第二条是主要的：
+
+- urgent 那天不再是"什么都不写"的一天。
+- **Phase 3 要在 `safety_gate` 之后插 `⚡ approve_plan`。**
+  红旗若写在 `escalate` 里，那时它就落在 interrupt 之前 → resume 一次写两遍
+  （第五节 ⑤）。放进 `publish` 对那个未来的 interrupt **结构上免疫**。
+
+`publish` 仍是**唯一**写业务表的节点，现在写两张表。这不是"一个节点干两件事"，
+是"唯一一个能安全写库的位置，正好要写两张"。
+
+### ★ 红旗写入刻意在降级分支**之外**
+
+`publish` 里那个 `if degraded or not obs: ids = []`（降级时 observations 一行都不编）
+**没有**把红旗包进去。理由是 `redflag.py` 存在的第二个理由：
+「模型挂了红旗照样能报」。把这段写进那个 if，全项目最该有的保障会在一次
+"顺手重构"里没了，而且**没有任何东西会报错**。
+断言在 `selfcheck.py` [14]：`--no-llm` 跑 C11 → `observations` **0 行**、
+`red_flags` **有行**。
+
+### 表与幂等
+
+`red_flags` 一张表。幂等键 = `(child_id, observed_at, code, source_hash)`，
+靠**唯一索引 + `ON CONFLICT DO NOTHING`**，不是 SELECT-then-INSERT
+（`connect()` 是每线程一条连接，并发下两个线程都能"看到没有这行"）。
+- `source_hash` 是 sha256 —— btree unique index 遇到超长 text 会报
+  *index row size exceeds maximum*，而 `other_notes` 允许 20000 字符。
+  原文仍存 `source` 列，只是不进索引。
+- 键里**不含 `thread_id`** —— 分叉出来的 thread 重跑同一段话，
+  不应该在真实历史里多出一条红旗。
+- `ON CONFLICT DO NOTHING` 仍然会消耗 sequence 值，所以 id 会有跳号。这是正常的。
+
+**★ 全项目唯一可变的业务字段是 `status`。** 行的身份（命中了什么、哪段话）
+append-only、永不重写、从不删除；只有家长的确认在动。
+Phase 3 的 `plans.status` 会用同一套约定，两处一起引入。
+
+### 转诊指引长在 `RULES` 上
+
+`redflag.py` 每条规则多一个 `referral = {who, do, avoid, emergency}`。
+`avoid`（不要做什么）是**防害字段**，不允许为空。
+`guidance_for(report)` 纯函数聚合多个 urgent → `{summary, items, do_not, emergency}`；
+`summary` **仍是一句 str**（老 checkpoint 与老前端读的就是这个键），
+`items` 是新加的结构。
+
+之前那句硬编码在 `nodes.escalate` 的通用文案有个具体后果：
+命中"异食"和命中"撞头"给家长的是同一句话，而这两件事该找的人根本不一样。
+
+### 「暂停」= 一条查询，给 Phase 3 的合同
+
+```python
+store.plan_paused(conn, child_id)
+# 存在 severity='urgent' 且 status<>'closed' 的红旗
+```
+
+- **未关闭**而不是未看到 → fail-closed（与"模型给证据，Python 做判定"同源）
+- 按**孩子**判而不是按天判 → 10-20 的自伤必须让 10-21 的计划也停着
+- 没有为它单开一列或一张表（`plans.status` 是 Phase 3 的）
+- **Phase 3 的 `generate_plan` 必须调它，不许自己再发明一个。**
+  要加过期策略就改那一条 SQL，不要加第二处定义。
+
+`state["escalation"]["paused"]` 是**事件**（这次升级发生了），
+`plan_paused` 是**当前状态**（现在能不能生成计划）。两者回答的不是同一个问题。
+
+### 第二个写入口：`POST /api/profile`
+
+建档时 `redflag.scan(report_text)` 早就在跑，扫到的红旗同样只飘一次。
+现在走**同一对函数**（`redflag.rows_for` 纯 + `store.append_red_flags` 落），
+`source_kind='report'`（这一列不进唯一键，只为告诉前端"来自评估报告还是当天观察"）。
+⚠️ 写入必须放在 `ensure_child` **之后** —— `red_flags.child_id` 有外键。
+
+副作用（有意为之）：评估报告里几个月前的 urgent 也会暂停当前计划。
+宁可 fail-closed，横幅会显示那条旗的日期。
+
+### HTTP 与前端
+
+| 路由 | 说明 |
+|---|---|
+| `GET /api/redflags?child_id=&status=` | `{flags, paused}`，**纯读**。`paused` 与列表同一次查询算出来，前端不许自己推 |
+| `PATCH /api/redflags/{id}/status` | 只收 `Literal` 三态。422 非法值 / 404 不存在 / 409 非法转移 |
+
+```
+open → acknowledged | closed ；acknowledged → closed | open ；closed → open
+```
+
+- **只有 `closed` 解除暂停**（"已看到" ≠ "已处理"）。
+- 409 而不是 422：请求本身合法，冲突的是当前状态 —— 与 `/api/observe/resume` 那个 409 同一类。
+- 非法转移的判据是 `redflag.can_transition`，**纯函数、可单测**；
+  `store.set_red_flag_status` 只执行。刻意分成两半：混在一起就会出现
+  "为了省一次查询把判据搬进 SQL"，那就再也测不动了。
+
+前端**新建** `RedFlagBanner.vue`，没有复用 `RedFlagList.vue`：
+后者吃一次扫描结果、无按钮；前者吃已落库的行、要按状态给动作。
+放在 `TodayPage.vue` 根 div 的**第一个子元素** —— 暂停是整天的事，
+排在反馈区的话家长会先读完"今天练这三条"再看到"今天要停"。
+
+### 本轮踩到的坑（已修，勿回退）
+
+1. **`ON CONFLICT DO NOTHING` 之后 `RETURNING` 没有行** → `fetchone()` 是 `None`。
+   `append_red_flags` 因此**只返回真正新增的 id**；重跑一次得到 `[]` 是对的。
+2. **`observations.redflag_triggered` 的来源改成 safety_gate 那次扫描**。
+   原来取抽取时那次，而两次扫描的语料不一定相同（澄清把回答拼在后面）——
+   两处各判一次，迟早有一天对不上，而那是一个没有报错的数据。
+3. **判据是"存在任意一条未关闭的 urgent"，不是"那一条"**。
+   自检里一度只关掉一条就断言"暂停解除"，红了 —— 同一个孩子两次 urgent
+   是常态。这不是测试写复杂了，正是"按孩子判"那句话的后果。
+
+---
+
+## 四之四、Phase 3 待接（还没画这部分图）
+
+> 本节是从旧计划文件（`~/.claude/plans/python-llm-langgraph-hitl-time-travel-i-gleaming-octopus.md`
+> 「Phase 3」那一节）搬过来的，**新 session 不会自动读那份计划文件**。
+> 标 ⚠️ 的地方是**搬过来时没重新验证的**，动手前先读一遍真文件确认。
+
+### 图长什么样（Phase 3 接完之后）
+
+```
+… → safety_gate → (urgent? escalate ─────────────→ publish → END)
+                 └─ no → select_goal → retrieve_activities → generate_plan
+                                                          ↓
+                                                    validate_plan
+                                                          ↓
+                                          substantive_change?  ← 纯 Python 判据
+                                       ├─ 是 → ⚡ approve(approve|edit|reject)
+                                       │         edit → 回 retrieve_activities
+                                       └─ 否 ─┴─→ freeze_plan → publish → END
+```
+
+★ **注意两条支路最后都汇到 `publish`。** 红旗写入在 Phase 2 已经归它了
+（第四节之三），Phase 3 不要再造第二个写库节点。
+
+### 实质性变更判据（纯 Python，`graph/nodes.py`）
+
+`validate_plan` 比对 draft 与当前 active 版本，命中任一条即 interrupt：
+
+- `target_skill_items` 集合不同
+- 任一活动的 `materials` 集合不同
+- 任一活动的 `difficulty` 不同
+- 任一活动的 `prompt_hierarchy` **起点提示级别**不同
+- `safety_gate` 在本轮触发过
+- 计划跨度数 > 1 天（跨天安排需家长知情）
+
+**这不是简化方案 §5.1，是修正它的一个内在矛盾**：方案 §1.2 写
+"小步计划、低压力、避免每次游戏都变成训练"，而主图
+`generate_plan → approve_plan(interrupt)` 意味着每天多点一次，
+与 §10.3 自己列的"用户留存和家长负担"指标冲突。
+变更是**可判定的**，所以判据必须是代码而不是措辞。
+
+★ 落地时的坑：上面每一条都要求**拿得到"当前 active 版本"**，
+而 `plans` 表现在没有 `status`。迁移补上 `status` 时，
+`active` 版本的查询口径要写死在一个函数里（与 `store.plan_paused` 同款理由）。
+
+### 必须做的迁移
+
+| 表 | 补什么 |
+|---|---|
+| `plans` | `status`(draft/pending_review/approved/active/paused/completed/rejected) / `version` / `approved_by` / `approved_at` |
+| `sessions` | `plan_id` / `plan_version`（现在只有裸 `activity_id`） |
+
+### 验收断言（Phase 3 要补的）
+
+- 「只在真变化时审批」：连续两天同计划 → 第二天**不产生 interrupt**；
+  改一项材料 → 产生。（这条是纯 Python 判据唯一的守门人）
+- 审批 interrupt 往返（走 HTTP）+ 重复 resume 被拒（409）
+- **分叉跑出来的计划必须重新过 `safety_gate` 与必要审批**（方案 §5.5 明确要求）——
+  本项目已有实测支撑：分叉必须换 `thread_id`（第二节 ③），
+  而 `fork_config` 已经在 `state.py` 里写好了
+
+### ⚠️ 搬过来没验证的部分
+
+- `coach.py` + `planner.py` 合并成 `generate_plan` + `validate_plan` 的具体接口形状
+- `coach.today` 现在怎么出卡片、`retrieve` 的候选打分能不能直接复用
+  （`activities.retrieve/_hard_filter/_score` 是"原样复用"那一档，见计划文件的保留表）
+- `DailySummary.domain_updates` 默认值是 `(FieldInfo,)` 那个 bug ——
+  计划文件把它排在 Phase 6，并注明**别再手写最小复现**（试了 3 次全失败），
+  正确做法是**直接二分真文件**。Phase 3 重构时顺手做掉。
+
+---
+
 ## 五、待确认 / 遗留
+
+**Phase 2 期间新发现的：**
+
+- **暂停没有过期策略。** urgent 没人关就永远停着计划生成。
+  我认为这是正确的临床默认（fail-closed）且横幅让它可见可操作，
+  但 Phase 3 应该重新审视一次 —— 到时改 `store.plan_paused` 那一条 SQL。
+- **红旗状态变更没有完整审计。** 现在只有 `status_changed_at` 记时点，
+  没有"谁在什么时候从什么改成了什么"。留给 Phase 5 的 `workflow_audit_events`。
+- **`ON CONFLICT DO NOTHING` 会消耗 sequence 值**，所以 `red_flags.id` 有跳号
+  （实测 id 4 缺失）。这不是丢数据，别去"修"。
 
 **Phase 1 期间新发现的：**
 
