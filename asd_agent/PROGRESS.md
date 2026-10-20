@@ -13,8 +13,8 @@
 > - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
-> - **Phase 0 已完成**：`asd_agent/graph/` 5 个文件、7 个节点、1 个 ⚡ 澄清 interrupt、
->   图级验收 9 组断言全绿。`asd_agent/` 现有模块**一行没改**。
+> - **Phase 0 + Phase 1 均已完成**（2026-10-20）。图级验收 9 → **13 组**断言，
+>   新增 `http_selfcheck.py` **8 组**。Phase 1 的接线约束见第四节之二。
 >
 > **★ 一条会静默咬人的实测结果**：`interrupt()` 恢复会重跑所在节点这件事
 > **只在 `PostgresSaver` 下可观测**，用 `InMemorySaver` 写单测会看到"只跑了一次"，
@@ -29,23 +29,43 @@
 > 那些 `commit()` **保留**，别去「清理」。
 > 验证：12/12 离线回归 + 180 并发 0 失败 + HTTP 全链路 + 跑完无 idle-in-transaction。
 >
-> **下一步 = Phase 1**：`schema.py` 加四层字段 → `observe.py` 输出扩层 →
-> 把 Phase 0 已有的澄清 interrupt 接进 HTTP + 前端，并修 `TodayPage.vue` 的 `canSubmit`。
+> **Phase 1 做完了四件事**：
+> 1. **四层字段**（技术方案 §4）：`fact_fields` 在 `schema.Observation`（逐事件）；
+>    另三层在 `observe.ObservationBatch`（跨事件）。**全部可选带默认值** ——
+>    required 会让 `server.py` 那条裸 `except: continue` 的重校验**静默丢掉所有历史观察**。
+> 2. **澄清 interrupt 接进 HTTP**：`/api/observe/run`（可能返回 `phase:"clarify"`）→
+>    `/api/observe/resume` → `/api/observe/status`（刷新后重新发现待答的追问）。
+> 3. **`TodayPage.vue` 的 `canSubmit` 修了**：原来完全不看 `otherNotes`，
+>    家长只写自然语言观察时按钮点不动 —— 技术方案 §1.1 第一步在界面上走不通。
+> 4. **草稿存 checkpoint**：前端此前零持久化，填一半刷新即丢。
+>
+> **★ 三个会静默咬人的结论**（细节见 LANGGRAPH.md 第四之二节）：
+> - `Command(resume=...)` 打在没有 pending interrupt 的 thread 上，
+>   **会被当成新输入从头跑一遍整条图**（重新抽取、重新落库）。守卫 = 409，挡在 invoke 之前。
+> - 中断判定要用 `snap.next` / `snap.interrupts`，**不能用** state 里的 `needs_clarification`
+>   —— resume 跑完之后那是上一次的值，会把「已答过」误报成「还在等」。
+> - 写库的 `observed_at` 与幂等判据查的日期**必须同一个键**。
+>   曾不一致，于是每次跑都重写一遍、行还落到空日期上（新 selfcheck [11] 抓到的）。
+>
+> **★ prompt 的一条经验**：7B 对四层的抽象描述**三层全空**（合规输出 `null`/`[]`
+> 但没内容，schema 标不标 required 都一样）；改成「照这个例子写」才抽得出来。
+> 小模型跟例子，不跟论述。新规则单独放 `_RULES_LAYERS`，**绝不能动与 verify_schema
+> 逐字对齐的 `_RULES_1_6`**（selfcheck [12] 把这件事变成机器可验的不变量）。
+>
+> **`asd_agent/http_selfcheck.py` 是新增的**（8 组）—— `server.py` **不在任何回归集里**，
+> 而 Phase 1 往里面接了图。不补这一层就等于把刚做对的东西放在没人守的地方。
+>
+> **下一步 = Phase 2（安全链）**：`escalate` 真的落库（红旗现在只在响应里飘一次，
+> `RedFlagList.vue` 渲染完就永久消失）+ 转诊指引 + `safety_gate` 加 urgent 路由。
 
-**⚠️ 工作区未提交。** 阶段 5 的 `server.py` + `frontend/` 已写完并通过浏览器实测，
-**PostgreSQL 迁移也已完成**，但都**还没 commit**。`git status`：
+**✅ 工作区已提交**（2026-10-20，分支 `pg-langgraph-baseline`）：
 ```
- M asd_agent/observe.py     + source 列（observations 存整段原话）
- M asd_agent/store.py       ★ sqlite → PostgreSQL 全量迁移
- M asd_agent/summary.py     + domain_updates 形状校验与兜底 / PG 语法
- M asd_agent/feedback.py    PG 语法
- M asd_agent/loop.py        PG 语法
- M asd_agent/coach.py       PG 语法
- M asd_agent/planner.py     PG 语法
- M server.py                新 + PG 语法 + 删 _IO_LOCK
-?? frontend/                新
-?? .playwright-mcp/         ← 测试产物，建议加进 .gitignore
+aa70b6d Phase 0：LangGraph 编排层地基
+8a2b221 Phase 1 步 1-2：四层字段 + publish 幂等键重挂
+13d74ab Phase 1 步 3-4：图接进 HTTP（两阶段澄清 + 草稿）
+adbf9aa Phase 1 步 5：前端接上观察链 + 草稿持久化
 ```
+每一步都是可 revert 的独立 commit，改既有行为的那步（步 2）单独成步。
 
 **✅ 存储层已换成 PostgreSQL，并发 500 随之消失**（180 请求 0 失败，迁移前失败 8 个）。
 详见「✅ 迁移到 PostgreSQL 已完成」一节 —— 那里有改动清单、
@@ -78,6 +98,14 @@ cd asd_agent && ../.venv/bin/python loop.py --no-llm --script hardcoded
 ASD_DB_PATH=/tmp/ganyu_dev.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
   ./.venv/bin/python -c "import uvicorn,server; uvicorn.run(server.app,host='127.0.0.1',port=8123,log_level='warning')"
 cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
+```
+
+**三个自检入口**（改图 / 改 server.py 之后必须跑，全绿才算数）：
+```bash
+cd asd_agent
+ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 13 组
+ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
+ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 8 组
 ```
 
 **⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用
