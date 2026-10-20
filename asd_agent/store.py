@@ -36,7 +36,7 @@ import json
 import os
 import re
 import threading
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -250,6 +250,55 @@ def _init(c: psycopg.Connection) -> None:
         payload     TEXT NOT NULL      -- DailySummary 的 JSON
     );
     CREATE INDEX IF NOT EXISTS idx_dsum_child ON daily_summary(child_id, on_date DESC);
+
+    -- ★ Phase 2：红旗从「响应里飘一次」变成一条长期记录。
+    --   在此之前红旗只活在一次 HTTP 响应里（RedFlagList.vue 一卸载就消失），
+    --   而 observations.redflag_triggered 只是个布尔 —— 它回答不了
+    --   「是哪一条信号、什么时候、家长原话里哪一段」。而那正是唯一有用的问题。
+    --
+    --   ★ 这是全项目**唯一一处可变的业务字段**（status），所以边界写在这里：
+    --     · 行的**身份**（命中了什么、什么时候、哪段话）append-only，检测永不重写；
+    --     · 只有**家长的确认**在动：open → acknowledged → closed。
+    --     · 行永不删除。转移历史靠 status_changed_at 记时点，
+    --       完整的转移流水留给 Phase 5 的 workflow_audit_events 一并做。
+    --     · Phase 3 的 plans.status 会用同一套约定 —— 两处一起引入，
+    --       免得相隔两个阶段各解释一遍"为什么这张表可以改"。
+    CREATE TABLE IF NOT EXISTS red_flags (
+        id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        child_id      TEXT NOT NULL REFERENCES children(child_id),
+        observed_at   TEXT NOT NULL,
+        code          TEXT NOT NULL,
+        severity      TEXT NOT NULL,        -- urgent / high / watch
+        flags_group   TEXT NOT NULL DEFAULT '',   -- "group" 在 SQL 里是保留字
+        quote         TEXT NOT NULL DEFAULT '',   -- 家长原话里命中的那一片
+        ask           TEXT NOT NULL DEFAULT '',   -- 该追问家长的问题
+        -- 转诊指引**跟着这一行走**，不跟着规则表走：规则表在代码里，
+        -- 而"三个月前那次撞头当时该怎么处理"要能在 DB 里原样取回。
+        referral_who  TEXT NOT NULL DEFAULT '',
+        referral_do   TEXT NOT NULL DEFAULT '',
+        referral_avoid TEXT NOT NULL DEFAULT '',   -- 防害字段，不允许为空
+        referral_emergency TEXT NOT NULL DEFAULT '',
+        -- ★ 全项目唯一一处可变的业务字段。理由与边界见下面的注释块。
+        status        TEXT NOT NULL DEFAULT 'open',   -- open/acknowledged/closed
+        status_changed_at TEXT NOT NULL DEFAULT '',
+        source        TEXT NOT NULL DEFAULT '',   -- 被扫描的那整段话（人要看）
+        source_hash   TEXT NOT NULL DEFAULT '',   -- 同一段话 + 同一条 code 只落一行
+        source_kind   TEXT NOT NULL DEFAULT 'observation',  -- observation / report
+        thread_id     TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL
+    );
+    -- ★ 幂等键。ON CONFLICT DO NOTHING 靠的就是它。
+    --   为什么不用原文进唯一索引：btree unique index 遇到超长 text 会报
+    --   "index row size exceeds maximum"，而 other_notes 允许 20000 字符。
+    --   原文照样存 source 列，只是索引里放它的 sha256。
+    --   为什么不用 SELECT-then-INSERT：connect() 是每线程一条连接，
+    --   前端并发下两个线程都能看到"没有这行"然后都 INSERT。
+    --   ★ 键里**不含 thread_id** —— 分叉出来的 thread 重跑同一段话，
+    --     不应该在真实历史里多出一条红旗。
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_red_flag_once
+        ON red_flags(child_id, observed_at, code, source_hash);
+    CREATE INDEX IF NOT EXISTS idx_rf_child_status
+        ON red_flags(child_id, status, observed_at DESC);
     """)
     c.commit()
 
@@ -372,7 +421,138 @@ def log_materials(conn: psycopg.Connection, child_id: str, items: list[str]) -> 
     return int(row["id"])
 
 
+# ================================================================== 红旗（Phase 2）
+# 判定的出处是 `redflag.scan`（纯正则、零 token）；这里只管存与取。
+# 刻意不把判定搬进来 —— 否则将来有人改规则时会顺手改掉写库逻辑，
+# 而"红旗永远不会漏掉"这件事正是靠规则与模型无关保证的（见 redflag.py 顶部）。
+_RED_FLAG_COLS = ("code", "severity", "flags_group", "quote", "ask",
+                   "referral_who", "referral_do", "referral_avoid", "referral_emergency")
+
+
+def _source_hash(source: str) -> str:
+    """幂等键的一半。**只在写路径与唯一索引上用**，不做查询谓词
+    —— `nodes._source_published` 刻意不 hash 是因为它查的是非唯一列，
+    一天几行，走等值比较即可；这里是 unique 约束，必须有长度上界。"""
+    import hashlib
+    return hashlib.sha256((source or "").encode("utf-8")).hexdigest()
+
+
+def append_red_flags(conn: psycopg.Connection, child_id: str, on_date: str,
+                     rows: list[dict], *, source: str = "",
+                     source_kind: str = "observation",
+                     thread_id: str = "") -> list[int]:
+    """落一批红旗，返回**真正新插入**的 id。
+
+    `rows` 是 `redflag.rows_for(report)` 的产物（纯 dict）。
+
+    ★ 返回值刻意只含新插入的行：重跑一次得到 `[]` 是对的，
+      而如果它返回"库里现在有几条"，调用方就分不清"这次新增"和"本来就有"
+      —— 前端要说"今天记下了 2 条红旗"时，那必须是新增。
+    """
+    if not rows:
+        return []
+    src_hash = _source_hash(source)
+    created = datetime.now().isoformat(timespec="seconds")
+    ids: list[int] = []
+    for r in rows:
+        row = conn.execute(
+            "INSERT INTO red_flags(child_id,observed_at,code,severity,flags_group,"
+            "quote,ask,referral_who,referral_do,referral_avoid,referral_emergency,"
+            "source,source_hash,source_kind,thread_id,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (child_id, observed_at, code, source_hash) DO NOTHING "
+            "RETURNING id",
+            (child_id, on_date, r["code"], r["severity"], r.get("group", ""),
+             r.get("quote", ""), r.get("ask", ""),
+             r.get("referral_who", ""), r.get("referral_do", ""),
+             r.get("referral_avoid", ""), r.get("referral_emergency", ""),
+             source, src_hash, source_kind, thread_id, created)).fetchone()
+        if row:
+            ids.append(int(row["id"]))
+    conn.commit()
+    return ids
+
+
+def set_red_flag_status(conn: psycopg.Connection, flag_id: int, status: str) -> None:
+    """执行状态变更。**合法性不在这儿判** —— 判据是 `redflag.can_transition`，
+    由调用方（HTTP 层）在拿到当前值后先判一次。
+
+    刻意分成"判"与"执行"两半：判据是纯函数、可单测、无 token；
+    而这里只需要一行 UPDATE。两件事混在一个函数里，
+    就会出现"为了省一次查询，把判据也搬进 SQL"，那就再也测不动了。
+    """
+    conn.execute(
+        "UPDATE red_flags SET status=%s, status_changed_at=%s WHERE id=%s",
+        (status, datetime.now().isoformat(timespec="seconds"), flag_id))
+    conn.commit()
+
+
 # ================================================================== 读取
+def list_red_flags(conn: psycopg.Connection, child_id: str, *,
+                   status: str | None = None, limit: int = 50) -> list[dict]:
+    """红旗列表。默认按「未关闭在前 + 时间新在前」排。
+
+    ★ 排序里那个 `status='closed'` 的判断是排序键而不是过滤条件 ——
+      家长要能在同一个列表里看到"还没处理的"和"处理过但仍需回看的"，
+      只是前者排前面。全滤掉等于让"已处理"变成"消失"，
+      而消失的那条恰恰是复诊时最该拿出来的那条。
+    """
+    sql = ("SELECT * FROM red_flags WHERE child_id=%s "
+           + ("AND status=%s " if status else "")
+           + "ORDER BY (status='closed'), observed_at DESC, id DESC LIMIT %s")
+    args = (child_id, status, limit) if status else (child_id, limit)
+    return list(conn.execute(sql, args).fetchall())
+
+
+def get_red_flag(conn: psycopg.Connection, flag_id: int,
+                 child_id: str | None = None) -> dict | None:
+    """取一行。`child_id` 给了就顺带做归属校验。
+
+    归属不对时返回 None 而不是抛 —— 调用方统一翻译成 404。
+    为什么不是 403：这里根本没有多用户身份体系（Phase 6 才做），
+    "这条不属于你"与"这条不存在"对调用方是同一件事。
+    """
+    row = conn.execute("SELECT * FROM red_flags WHERE id=%s",
+                       (flag_id,)).fetchone()
+    if not row:
+        return None
+    if child_id is not None and row["child_id"] != child_id:
+        return None
+    return row
+
+
+def open_urgent_red_flags(conn: psycopg.Connection, child_id: str) -> list[dict]:
+    """未关闭的 urgent 红旗。**暂停的根据，也是横幅要显示的内容 —— 一次查询两用。**"""
+    return list(conn.execute(
+        "SELECT * FROM red_flags WHERE child_id=%s AND severity='urgent' "
+        "AND status<>'closed' ORDER BY observed_at DESC, id DESC",
+        (child_id,)).fetchall())
+
+
+def plan_paused(conn: psycopg.Connection, child_id: str) -> bool:
+    """★ 「暂停计划生成」的**唯一口径**。Phase 3 的 generate_plan 必须调它。
+
+    判据：存在一条 severity='urgent' 且 status<>'closed' 的红旗。
+
+    两个刻意的选择：
+
+    · 「未关闭」而不是「未看到」—— 家长点了"已看到"不代表这件事处理完了。
+      临床上这就是 fail-closed 的默认值，也是 LANGGRAPH.md 那条
+      「模型给证据，Python 做判定」的延伸：**拿不准的时候停下来问人**。
+
+    · 按**孩子**判而不是按天判 —— 10-20 的自伤必须让 10-21 的计划也停着。
+      按天的暂停会在第二天早上自己解开，而那正是它最不该发生的时候。
+
+    没有为它单开一列或一张表：计划链 Phase 3 才加 plans.status，
+    现在预造那套就是 builder.py 说的「画一版注定要改的图」。
+    暂停的**判据**从现在起就是稳定的，缺的只是"这次决定"的记录，
+    那属于 Phase 3。要加过期策略就改这一条 SQL，**不要**再加第二处定义。
+    """
+    return bool(conn.execute(
+        "SELECT 1 FROM red_flags WHERE child_id=%s AND severity='urgent' "
+        "AND status<>'closed' LIMIT 1", (child_id,)).fetchone())
+
+
 def latest_profile(conn: psycopg.Connection, child_id: str):
     """取最新一份能力画像（失败时返回 None，不抛 —— 调用方决定要不要降级）。"""
     from capabilities import AbilityProfile
@@ -893,8 +1073,69 @@ def _cli() -> None:
     print(f"  success_history_ids   {len(success_history_ids(conn, cid))} 条")
     print(f"  recent_scenes         {recent_scenes(conn, cid)}")
 
+    _cli_redflags(conn, cid)
+
     conn.close()
     # 迁移前这里是 shutil.rmtree(tmp) 删文件；现在是 schema，下次 reset() 会重建
+
+
+def _cli_redflags(conn: psycopg.Connection, child_id: str) -> None:
+    """Phase 2：红旗落库、幂等、状态流转、暂停判据。
+
+    这个文件是 12 个离线回归之一，所以这几条断言在这里也必须成立 ——
+    否则"改了 store 就得跑 graph.selfcheck"会成为一条总被跳过的步骤。
+    """
+    import redflag
+
+    ok = True
+
+    def check(label, cond, extra=""):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"  {'✓' if cond else '✗'} {label}{('  ' + str(extra)) if extra else ''}")
+
+    print("\n=== Phase 2：红旗 ===")
+    urgent_text = ("他最近不太喜欢那个旋转的玩具，看到就走开，"
+                   "然后会去咬自己的袖子。")
+    rep = redflag.scan(urgent_text)
+    rows = redflag.rows_for(rep)
+    ids = append_red_flags(conn, child_id, "2026-10-20", rows, source=urgent_text)
+    check("urgent 命中并落库", len(ids) == 1, ids)
+
+    n1 = conn.execute("SELECT COUNT(*) AS n FROM red_flags WHERE child_id=%s",
+                      (child_id,)).fetchone()["n"]
+    ids2 = append_red_flags(conn, child_id, "2026-10-20", rows, source=urgent_text)
+    n2 = conn.execute("SELECT COUNT(*) AS n FROM red_flags WHERE child_id=%s",
+                      (child_id,)).fetchone()["n"]
+    check("★ 同一段话 + 同一个 code 再落一次：只有一行，返回空新增",
+          n1 == n2 and ids2 == [], f"{n1} → {n2}, 新增 {ids2}")
+
+    other_text = "他今天早上出门前不肯穿鞋，我帮他他就打我的手，只好由着他光脚。"
+    ids3 = append_red_flags(conn, child_id, "2026-10-21",
+                            redflag.rows_for(redflag.scan(other_text)), source=other_text)
+    check("★ 同一天的另一段话命中另一个 code → 另起一行（两次独立的报告不合并）",
+          len(ids3) == 1, ids3)
+
+    row = get_red_flag(conn, ids[0], child_id)
+    check("行里带着该追问的问题与转诊指引",
+          bool(row["ask"]) and bool(row["referral_who"])
+          and bool(row["referral_avoid"]), row["referral_avoid"][:20])
+
+    check("★ high 级不暂停计划", not plan_paused(conn, "demo-002"))
+    check("★ urgent 存在 → 暂停", plan_paused(conn, child_id))
+    set_red_flag_status(conn, ids[0], "acknowledged")
+    check("★ 已看到不解除暂停（「已看到」≠「已处理」）",
+          plan_paused(conn, child_id))
+    set_red_flag_status(conn, ids[0], "closed")
+    check("★ 已处理之后暂停解除", not plan_paused(conn, child_id))
+    check("关掉的那条仍留在列表里（不消失，复诊要拿得出来）",
+          len(list_red_flags(conn, child_id)) == 2,
+          len(list_red_flags(conn, child_id)))
+    check("?status=closed 过滤生效",
+          len(list_red_flags(conn, child_id, status="closed")) == 1)
+
+    if not ok:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

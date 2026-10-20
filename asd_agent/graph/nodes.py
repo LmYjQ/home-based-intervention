@@ -19,12 +19,25 @@ LangGraph 让"加个节点就交给模型"变容易了，而那恰好会回退�
                  → safety_gate → escalate? → publish
 
 `publish` 之前的所有节点都是**纯读或纯计算**，一个字节都不写业务表；
-`publish` 是唯一写 `observations` 表的地方，且它排在**所有** interrupt 之后。
+`publish` 是唯一写业务表的地方（Phase 2 起写两张：`observations` 与 `red_flags`），
+且它排在**所有** interrupt 之后。
 这样"家长提交两次会不会写两遍"在结构上不存在 ——
 不是因为我们记得判重，而是因为它没有被放到能被重跑的位置上。
 
 （`publish` 自己仍然按日期做了幂等兜底，那是第二道，
 不是第一道 —— 第一道是这个节点的位置。）
+
+★ 为什么 urgent 也要走 publish（Phase 2 改的边）
+-------------------------------------------------
+Phase 0/1 时这里是 `escalate → END`。于是"孩子今天咬自己"这件事，
+**家长的原话从不进 `observations` 表** —— 没有报错，只是最该被记下来的
+那一天什么都没留下，而红旗也就无处可落（它在全图没有任何一个写库的地方）。
+
+改成 `escalate → publish → END`，判定一点没变（仍是 `redflag.scan` 的
+`highest == "urgent"`），改的只是"判完之后这一天还写不写"。
+放进 `publish` 而不是 `escalate` 还有一层：Phase 3 要在 `safety_gate` 之后
+插 `⚡ approve_plan`，那时写库放在 `escalate` 就变成"interrupt 之前写库"，
+resume 一次写两遍。**节点的位置就是那条约束，不要靠记住。**
 """
 
 from __future__ import annotations
@@ -118,11 +131,18 @@ def extract_observation(state) -> dict:
 
 
 def _rf_dump(report) -> dict:
+    """红旗报告 → **纯 dict**。
+
+    ★ 用 `redflag.dump_hit` 而不是 `h.__dict__.copy()`：`RedFlag` 现在带了一个
+      `Referral` 对象，dict() 会把它原样塞进 state，而 checkpoint 的寿命比代码长 ——
+      存对象会让老历史在重构后读不出来（与 `extract_observation` 存
+      `model_dump()` 而不是对象是同一条理由）。
+    """
     return {
         "triggered": report.triggered,
         "highest": report.highest,
         "blocking_codes": list(report.blocking_codes),
-        "hits": [h.__dict__.copy() for h in report.hits],
+        "hits": [redflag.dump_hit(h) for h in report.hits],
     }
 
 
@@ -247,35 +267,47 @@ def safety_gate(state) -> dict:
         escalate=rf.highest == "urgent",
         reasons=[f"{h.group}（{h.code}）：{h.quote}" for h in rf.hits],
         highest=rf.highest,
+        urgent_codes=list(rf.blocking_codes),
     )
     return {
         "redflags": _rf_dump(rf),
         "verdict": verdict.model_dump(),
+        # ★ 记下扫的是哪一段：publish 要用同一段算红旗的幂等键。
+        #   两处各写一遍 `clarified_text or parent_text` 必然漂移，
+        #   而漂移的后果很隐蔽 —— 红旗照样落库，只是幂等键算的是另一段话的哈希。
+        "scanned_text": text,
         "trace": mark(state, "safety_gate"),
     }
 
 
 # ================================================================== 6. 升级
 def escalate(state) -> dict:
-    """命中 urgent → **暂停计划生成**，并把转诊指引写进 state。
+    """命中 urgent → **暂停计划生成**，并把**逐 code** 的转诊指引写进 state。
 
-    ★ Phase 0 只做「暂停 + 给指引」。**红旗落库**（把红旗从"响应里飘一次"
-      变成一条长期记录）是 Phase 2 的活 —— `RedFlagList.vue` 现在
-      渲染一次就永久消失，本质上是这张表还没有列。
-      这里刻意先不落库：落库就意味着 Phase 0 要动 schema，而计划文件
-      明确要求「不动 asd_agent/ 任何现有模块」。
+    ★ 纯计算，一个字节都不写 —— 落库在 `publish`（见本文件顶部的副作用分布）。
+      这个位置不是洁癖：Phase 3 要在 `safety_gate` 之后插 `⚡ approve_plan`，
+      在这里写库就变成"interrupt 之前写库"，resume 一次写两遍。
 
-    ★ 为什么它不是 END：它产出的 state 要被前端读到并置顶展示，
-      也要被 audit 记一笔。让它直接 END 就丢了"为什么停"的上下文。
+    ★ 转诊指引来自 `redflag.guidance_for`（纯函数），不再是这里硬编码的一句话。
+      硬编码那版有个具体后果：命中"异食"和命中"撞头"给家长的是同一句话，
+      而这两件事该找的人根本不一样。
+
+    ★ `guidance` 仍然是**一句 str**，因为老 checkpoint 与老前端读的就是这个键
+      （`TodayPage.vue` 直接渲染它）。`guidance_items` / `do_not` / `emergency`
+      是并排加上去的，不是替换。
     """
     v = state.get("verdict") or {}
+    report = redflag.report_from_dump(state.get("redflags") or {})
+    g = redflag.guidance_for(report)
     return {
         "escalation": {
             "paused": True,
             "highest": v.get("highest", "urgent"),
             "reasons": v.get("reasons", []),
-            "guidance": "建议当天联系儿科/发育行为专科医生，并记录发生时间与当时情境。"
-                        "在专业评估之前，不要自行加大干预强度。",
+            "guidance": g["summary"],
+            "guidance_items": g["items"],
+            "do_not": g["do_not"],
+            "emergency": g["emergency"],
         },
         "trace": mark(state, "escalate"),
     }
@@ -284,6 +316,12 @@ def escalate(state) -> dict:
 # ================================================================== 7. 落库
 def publish(state) -> dict:
     """★ **全图唯一写业务表的地方**，且排在所有 interrupt 之后。
+
+    写两张表：`observations`（家长今天说的这段话抽出的事件）与
+    `red_flags`（这一段话命中的红旗规则）。两者判据都来自纯函数，
+    而它们的**幂等是两回事**：observations 按「这段语料」判，
+    红旗按「这段语料 × 这一条 code」判 —— 同一天说的两段话里
+    各命中一次同一个 code，那是两次独立的报告，不该合并成一行。
 
     幂等兜底（第二道保险）：**这段语料**今天已经落过库时，
     只在家长**又答了一次澄清**的情况下重写 —— 因为那次的语料真的变了。
@@ -332,6 +370,14 @@ def publish(state) -> dict:
         #   正常路径上两者相等（extract 收的就是 state["date"]），但这三条路上不等：
         #   带 observation 进来的重跑、分叉带过来的历史 state、澄清后的重抽。
         out = out.model_copy(update={"date": state["date"]})
+        # ★ `redflag_triggered` 以 safety_gate 那一次扫描为准，而不是抽取时那次。
+        #   两次扫描的语料不一定相同（澄清把回答拼在了后面），而这个布尔是
+        #   `store.what_last_week` 数"本周有几天碰到红旗"的唯一依据 ——
+        #   两处各判一次，迟早有一天它们对不上，而那是一个没有报错的数据。
+        rf_dump = state.get("redflags") or {}
+        if rf_dump:
+            out = out.model_copy(
+                update={"redflags": redflag.report_from_dump(rf_dump)})
         if reextracted:
             # 只删**上一轮那一份**语料的行。原 `_delete_today` 按 child+date 删全部，
             # 会把同一天逐条 note 写的行一起删掉 —— 那是数据丢失，不是覆盖。
@@ -342,8 +388,34 @@ def publish(state) -> dict:
 
     return {
         "observation_ids": ids,
+        "red_flag_ids": _publish_redflags(state, conn, child_id),
         "trace": mark(state, "publish"),
     }
+
+
+def _publish_redflags(state, conn, child_id: str) -> list[int]:
+    """★ 红旗落库。**刻意在 observations 那条 if 之外。**
+
+    降级（`--no-llm`）时上面那个 `if degraded or not obs` 会让 observations
+    一行都不写 —— 那是对的，编造的事件会污染状态机。
+    但红旗必须照落：`redflag.py` 存在的第二个理由就是"模型挂了红旗照样能报"，
+    把这段写进那个 if 的话，全项目最该有的那条保障就在一次"顺手重构"里没了，
+    而且**没有任何东西会报错**。
+
+    幂等靠 `store.append_red_flags` 的唯一索引（第一道是这个节点的位置）。
+    """
+    report = redflag.report_from_dump(state.get("redflags") or {})
+    # ★ `scanned_text` 是 safety_gate 记下的那段。老 checkpoint（Phase 2 之前）没有它，
+    #   于是回退到 `observed_text` —— 抽取用的是同一段。
+    #   为什么不干脆空字符串：幂等键是 `sha256(这段)`，空文本会让
+    #   **同一天同一个 code 的两次不同报告塌成一行**，而那正是这张表存在的意义。
+    scanned = state.get("scanned_text") or state.get("observed_text") or ""
+    if not report.hits:
+        return []
+    return store.append_red_flags(
+        conn, child_id, state["date"], redflag.rows_for(report),
+        source=scanned, source_kind="observation",
+    )
 
 
 def _source_published(conn, child_id: str, date: str, source: str) -> bool:

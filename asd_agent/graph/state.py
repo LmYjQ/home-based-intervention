@@ -23,6 +23,9 @@ state 里躺着一个永远为空的字段，比没有这个字段更糟：
      `daily_summary` 仍然 append-only。`publish` 节点是**唯一**写业务表的地方，
      它排在所有 interrupt 之后 —— 于是"重复提交会不会写两遍"这个问题
      在结构上就不存在。
+     Phase 2 让它写**两张**表（`observations` + `red_flags`），但仍是同一个节点：
+     将来 Phase 3 在 `safety_gate` 之后插 `⚡ approve_plan`，
+     分成两个写库节点就意味着其中一个会落在 interrupt 之前。
 
   3. **模型给证据，Python 做判定。** state 里没有任何字段的取值
      依赖"模型觉得应该是什么"。`needs_clarification` 这类判断一律由
@@ -67,6 +70,10 @@ class EscalationVerdict(BaseModel):
     reasons: list[str] = Field(
         default_factory=list, description="触发升级的 code + 引文，给人看的中文")
     highest: str = Field(default="", description="最高严重度 urgent/high/watch/空")
+    #: 触发了升级的那些 code（= `redflag.scan` 的 blocking_codes，**纯 Python 来的**）。
+    #: 单列一份是因为 `reasons` 是给人看的中文整句，
+    #: 前端要按 code 取转诊指引时不该去解析中文。
+    urgent_codes: list[str] = Field(default_factory=list)
 
 
 class PlanReview(BaseModel):
@@ -133,12 +140,22 @@ class InterventionState(TypedDict, total=False):
     #: `redflag.scan` 的报告，以 dict 存（同上，不存对象）
     redflags: dict[str, Any]
     verdict: dict[str, Any]        # EscalationVerdict.model_dump()
-    #: escalate 节点的产物：暂停 + 转诊指引。红旗**落库**是 Phase 2 的活。
+    #: escalate 节点的产物：暂停 + 转诊指引（逐 code 一条，不揉成一段）。
+    #: 里面 `guidance` 仍然是**一句 str** —— 老 checkpoint 与老前端读的就是这个键，
+    #: 换成结构会打断它们；`guidance_items` / `do_not` / `emergency` 是并排加的。
     escalation: dict[str, Any]
+    #: ★ `safety_gate` **实际扫描的那段文本**。
+    #: 单列一个字段是因为 publish 要用它算红旗的幂等键（见 store.append_red_flags），
+    #: 而两处各写一遍 `clarified_text or parent_text` 必然漂移 ——
+    #: 漂移的后果很隐蔽：红旗照样落库，只是幂等键算的是另一段话的哈希。
+    scanned_text: str
 
     # ---- 落库结果（publish 节点产出）----
     #: 写进 observations 表的行 id。**空列表是合法的**（今天没有新记录）。
     observation_ids: list[int]
+    #: 写进 red_flags 表的行 id，**只含本次新增**。重跑一次是 `[]`，
+    #: 前端要显示「今天记下了 N 条红旗」时，那必须是真的新增而不是库里总数。
+    red_flag_ids: list[int]
 
     # ---- 计划链（Phase 3 接）----
     #: 今天的候选活动 id，按分数降序
