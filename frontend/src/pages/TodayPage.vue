@@ -13,13 +13,14 @@
 // ★ 只生成一次。`/api/card` 命中后端缓存就秒回；「重新生成」才传 force。
 //   前端不做"我生成过了就别问了"这种缓存 —— 缓存键必须包含"画像有没有变"，
 //   而前端不知道画像什么时候被重新建档过。
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, watch, onMounted, toRef } from 'vue'
 import { api } from '../api.js'
 import { runJob } from '../api.js'
 import JobProgress from '../components/JobProgress.vue'
 import AgentTrace from '../components/AgentTrace.vue'
 import FeedbackItem from '../components/FeedbackItem.vue'
 import OtherNotes from '../components/OtherNotes.vue'
+import { useDraft } from '../composables/useDraft.js'
 
 const props = defineProps({ CHILD: String, date: String, hasProfile: Boolean,
                             plan: Object, setPlan: Function })
@@ -64,6 +65,9 @@ const submitting = ref(false)
 const fbResult = ref(null)
 const fbErr = ref('')
 
+// 草稿：刷新不丢。存服务端 checkpoint（不是 localStorage）
+const draft = useDraft(props.CHILD, toRef(props, 'date'), feedbacks, otherNotes)
+
 const activities = computed(() => props.plan?.activities || [])
 const pickedIds = computed(() => feedbacks.value.map(f => f.activity_id))
 
@@ -104,9 +108,78 @@ function setRow(activityId, patch) {
   feedbacks.value[i] = { ...feedbacks.value[i], ...patch }
 }
 
+// ★ canSubmit 必须看 otherNotes —— 原来的写法是
+//   `feedbacks.some(f => f.outcome) && !submitting`，**完全不看**家长写的
+//   自由文本，于是「只写观察、没做任何活动」这一天按钮是灰的，
+//   而技术方案 §1.1 的第一步恰恰就是「家长用自然语言记录」。
+//   那不是"少一个入口"，是整个自然语言入口在界面上不存在。
 const canSubmit = computed(() =>
-  feedbacks.value.some(f => f.outcome) && !submitting.value)
+  (feedbacks.value.some(f => f.outcome) || !!otherNotes.value.trim())
+  && !submitting.value && !obsRunning.value)
 const pending = computed(() => feedbacks.value.filter(f => !f.outcome).length)
+
+// ================================================================ 观察链（Phase 1）
+// 「其他观察」不再随 /api/feedbacks 一起发，而是先走图 ——
+// 因为图要能在信息不足时**停下来问家长**，而 /api/feedbacks 是一条直筒的
+// 收→写链路，结构上问不了。
+const obsRunning = ref(false)
+const obsSteps = ref([])
+const obsResult = ref(null)     // 图跑完的终态 {phase, interrupt, 四层, ...}
+const obsErr = ref('')
+const clarifyAnswer = ref('')
+
+// ★ 刷新后如果还有个问题没答，追问要**自己回来**。
+//   前端不持有任何 interrupt 状态（刷新就没了，服务端不会），
+//   所以进页面 / 换日期时要问一次服务端「这一天停在哪」。
+//   没有这一步，家长点了提交、页面一刷新，追问就永远消失了 ——
+//   而那张 thread 还停在 interrupt 上，只能靠人工去捞。
+async function loadObserveStatus() {
+  try {
+    const st = await api.observeStatus(props.CHILD, props.date)
+    obsResult.value = (st.phase === 'idle') ? null : st
+  } catch (e) {
+    console.warn('[observe] 读状态失败', e.message)
+  }
+}
+
+onMounted(() => { draft.restore(); loadObserveStatus() })
+watch(() => props.date, () => { draft.restore(); loadObserveStatus() })  // 换日期 = 换那天的草稿与追问
+
+async function submitObservation() {
+  obsRunning.value = true; obsErr.value = ''; obsResult.value = null
+  try {
+    const r = await runJob('/api/observe/run',
+      { child_id: props.CHILD, date: props.date, text: otherNotes.value },
+      (d) => obsSteps.value.push(d))
+    obsResult.value = r.result
+    // phase==='clarify' 是**正常结果**：图停在 ⚡ interrupt 上等家长回答。
+    // 这时不要往下走 —— 后面的 /api/feedbacks 会触发自动日结，
+    // 而日结读的是已落库的行，在澄清完成前收尾会把这段漏掉（顺序不变量）。
+    if (r.result?.phase === 'clarify') return
+    await afterObservation()
+  } catch (e) { obsErr.value = e.message } finally { obsRunning.value = false }
+}
+
+async function answerClarify() {
+  obsRunning.value = true; obsErr.value = ''
+  try {
+    const r = await runJob('/api/observe/resume',
+      { child_id: props.CHILD, date: props.date,
+        answer: clarifyAnswer.value, skip: !clarifyAnswer.value.trim() },
+      (d) => obsSteps.value.push(d))
+    obsResult.value = r.result
+    clarifyAnswer.value = ''
+    if (r.result?.phase === 'clarify') return   // 一天只问一次，不该走到这
+    await afterObservation()
+  } catch (e) { obsErr.value = e.message } finally { obsRunning.value = false }
+}
+
+// 观察链收尾之后才提交逐条反馈 —— 见上面的顺序不变量
+async function afterObservation() {
+  await submitFeedback()
+  // 草稿是「还没提交的东西」，提交完就不该再留着
+  if (!fbErr.value) await draft.clear()
+}
 
 async function submitFeedback() {
   submitting.value = true; fbErr.value = ''
@@ -117,9 +190,10 @@ async function submitFeedback() {
         activity_id: f.activity_id, outcome: f.outcome,
         prompt_level: f.prompt_level, steps_done: f.steps_done, note: f.note,
       }))
+    // ★ 不再发 other_notes：它已经由上面的观察链落库了（Phase 1）。
+    //   两处都发 = 同一段话抽两次、写两行、付两次 LLM。
     fbResult.value = await api.feedbacks({
       child_id: props.CHILD, date: props.date, feedbacks: filled,
-      other_notes: otherNotes.value,
     })
     emit('refresh-state')
   } catch (e) { fbErr.value = e.message } finally { submitting.value = false }
@@ -224,10 +298,67 @@ defineExpose({ load })
         没点的行<b>不会提交</b> —— "没有信息"不是一个观察结果，是没有观察。
       </p>
       <OtherNotes v-model="otherNotes" />
-      <button :disabled="!canSubmit" @click="submitFeedback">
-        {{ submitting ? '提交中…' : '提交今天的反馈' }}
+
+      <p class="hint">
+        <span v-if="draft.savedAt.value">草稿已存 {{ draft.savedAt.value }}（刷新不会丢）</span>
+        <span v-else-if="draft.restored.value">已恢复上次填到一半的内容</span>
+        <span v-else>填一半也没关系 —— 草稿会自动存服务端。</span>
+      </p>
+
+      <button :disabled="!canSubmit" @click="submitObservation">
+        {{ obsRunning ? '处理中…' : submitting ? '提交中…' : '提交今天的反馈' }}
       </button>
+      <p v-if="obsErr" class="err">{{ obsErr }}</p>
       <p v-if="fbErr" class="err">{{ fbErr }}</p>
+
+      <JobProgress :steps="obsSteps" :done="!obsRunning && obsSteps.length > 0" />
+
+      <!-- ⚡ 澄清 interrupt：图停在等人上，这是 Phase 1 的核心展示点 -->
+      <div v-if="obsResult?.phase === 'clarify'" class="clarify">
+        <h4>⚡ 有一处想跟你确认一下</h4>
+        <p class="q">{{ obsResult.interrupt?.question }}</p>
+        <p class="hint">
+          我没把握的地方写下来是因为<strong>记错比记少更糟</strong> ——
+          记错会误导明天的干预安排。你答完我会把两段话合起来重新理解一遍。
+        </p>
+        <textarea v-model="clarifyAnswer" rows="3"
+          placeholder="补充一句就行；想不起来可以跳过"></textarea>
+        <div class="row">
+          <button class="mini-btn" :disabled="obsRunning" @click="answerClarify">
+            {{ obsRunning ? '处理中…' : '答完，重新理解一遍' }}
+          </button>
+          <button class="ghost" :disabled="obsRunning" @click="clarifyAnswer = ''; answerClarify()">
+            跳过（按「确实不知道」继续）
+          </button>
+        </div>
+      </div>
+
+      <!-- 四层：事实 / 家长的解读 / 待验证的假设 / 还缺的信息 -->
+      <div v-if="obsResult?.phase === 'done'" class="layers">
+        <h4>这段话我读到了什么</h4>
+        <p v-if="obsResult.degraded" class="warn">
+          离线模式下不抽取事件 —— 一条都不编。
+        </p>
+        <template v-else>
+          <div v-if="obsResult.n_events">
+            抽出 <b>{{ obsResult.n_events }}</b> 条事件。
+          </div>
+          <div v-if="obsResult.parent_interpretation" class="layer">
+            <span class="tag">你自己的解读</span>{{ obsResult.parent_interpretation }}
+          </div>
+          <div v-if="obsResult.hypotheses?.length" class="layer">
+            <span class="tag hyp">待验证的假设</span>
+            <span class="dim">（不是结论）</span>
+            <ul><li v-for="(h, i) in obsResult.hypotheses" :key="i">{{ h }}</li></ul>
+          </div>
+          <div v-if="obsResult.missing_information?.length" class="layer">
+            <span class="tag miss">还缺</span>{{ obsResult.missing_information.join('；') }}
+          </div>
+          <div v-if="obsResult.escalation" class="esc">
+            <b>⚠ 建议当天联系医生：</b>{{ obsResult.escalation.guidance }}
+          </div>
+        </template>
+      </div>
 
       <div v-if="fbResult" class="result">
         <h4>反馈处理结果</h4>
@@ -300,6 +431,33 @@ h3 { margin: 0; font-size: 15px; }
 .err { color: #dc2626; font-size: 13px; }
 .mono { font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap;
   background: #f9fafb; padding: 10px 12px; border-radius: 6px; margin: 4px 0; }
+
+/* ⚡ 澄清 interrupt —— 图停下来等人的那一下，是 Phase 1 的核心展示点 */
+.clarify { border: 1px solid #bfdbfe; background: #eff6ff;
+  border-radius: 8px; padding: 12px 14px; margin-top: 12px; }
+.clarify h4 { margin: 0 0 6px; color: #1d4ed8; }
+.clarify .q { font-size: 15px; margin: 6px 0; font-weight: 600; }
+.clarify textarea { width: 100%; box-sizing: border-box; font-family: inherit;
+  font-size: 13px; padding: 8px 10px; border: 1px solid #d1d5db;
+  border-radius: 6px; margin-top: 6px; }
+.clarify .row { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+.mini-btn { background: #2563eb; color: #fff; border: 0; border-radius: 6px;
+  padding: 8px 16px; font-size: 13px; cursor: pointer; }
+.mini-btn:disabled { background: #9ca3af; }
+.ghost { background: none; border: none; color: #6b7280;
+  font-size: 12px; cursor: pointer; text-decoration: underline; }
+
+/* 四层 */
+.layers { margin-top: 14px; border-top: 1px solid #f3f4f6; padding-top: 10px; font-size: 13px; }
+.layers h4 { margin: 0 0 8px; }
+.layer { margin: 6px 0; }
+.layer ul { margin: 3px 0 0 18px; padding: 0; }
+.tag { display: inline-block; font-size: 11px; border-radius: 10px;
+  padding: 1px 8px; margin-right: 6px; background: #e5e7eb; color: #374151; }
+.tag.hyp { background: #ede9fe; color: #6d28d9; }
+.tag.miss { background: #fef3c7; color: #b45309; }
+.esc { background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+  padding: 8px 12px; border-radius: 6px; margin-top: 8px; }
 h4 { font-size: 13px; margin: 12px 0 4px; color: #374151; }
 button.mini { background: #2563eb; color: #fff; border: 0; border-radius: 6px;
   padding: 6px 14px; font-size: 13px; cursor: pointer; margin-left: auto; }

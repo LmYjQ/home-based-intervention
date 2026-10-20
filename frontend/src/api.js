@@ -35,6 +35,26 @@ export const api = {
   progress: (cid) => req(`/api/progress/${cid}`),
   transitions: (cid, item) =>
     req(`/api/transitions/${cid}${item ? `?skill_item=${encodeURIComponent(item)}` : ''}`),
+
+  // ---- 观察链（Phase 1）----
+  // ★ run / resume 是**两阶段**：run 可能返回 phase:"clarify"（图停在
+  //   interrupt 上等家长回答），那不是错误是正常结果，要再调 resume。
+  //   两者的连续性靠 (child_id, date) → thread_id，不靠 job_id ——
+  //   前端不持有任何 interrupt 状态，那是服务端的事（刷新就没了）。
+  observeRun: (body) => req('/api/observe/run', { method: 'POST', body: JSON.stringify(body) }),
+  observeResume: (body) =>
+    req('/api/observe/resume', { method: 'POST', body: JSON.stringify(body) }),
+  // 刷新页面后靠它知道「还有个问题没答」—— 纯读 checkpoint，毫秒级
+  observeStatus: (cid, date) =>
+    req(`/api/observe/status?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+
+  // 草稿（存服务端 checkpoint，不是 localStorage）
+  draftGet: (cid, date) =>
+    req(`/api/draft?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+  draftPut: (body) => req('/api/draft', { method: 'PUT', body: JSON.stringify(body) }),
+  draftDelete: (cid, date) =>
+    req(`/api/draft?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`,
+        { method: 'DELETE' }),
 }
 
 // ★ 慢路径统一走 SSE。两条慢路径（建档 18-47s、出卡片 30-45s）共用这一份。

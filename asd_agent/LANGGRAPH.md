@@ -8,18 +8,30 @@
 
 ## 🔖 换 session 先看这一屏
 
-**当前阶段：Phase 0 ✅ 已完成，图已跑通并有 9 组断言守着。** 下一步是 Phase 1（观察链扩层 + 澄清 interrupt 接进 HTTP）。
+**当前阶段：Phase 1 ✅ 已完成（图接进 HTTP）。** 下一步是 Phase 2（安全链：`escalate` 真落库 + 转诊）。
 
-已完成三件事，都实测过：
+Phase 1 做完四件事，全部有断言或浏览器实测守着：
 
-1. **`store.connect()` 改 autocommit**（`store.py:100`，一个参数 + docstring）。
-   这是接入 checkpointer 的**硬前置** —— 原来长连接非 autocommit 会留下永不结束的事务，
-   把 `PostgresSaver.setup()` 的 `CREATE INDEX CONCURRENTLY` 卡死。
-2. **LangGraph 全部关键行为已实测**（`asd_agent/_spike_lg.py` / `_spike_fork.py`，15 条断言全绿）。
-   **不要凭记忆或文档抄 API**，下面「实测结论」一节是照着实际输出写的，1.x 与网上 0.x 示例有出入。
-3. **`asd_agent/graph/` 已落地**（Phase 0，2026-10-20）：state / checkpointer / nodes / builder / selfcheck。
-   7 个节点、1 个 ⚡ 澄清 interrupt、图级验收全绿，`asd_agent/` 现有模块一行没改。
-   图的形状与「落库只在 interrupt 之后」这条结构约束见第四节。
+1. **四层字段**（技术方案 §4）：`fact_fields` 在 `schema.Observation`（逐事件），
+   `parent_interpretation` / `hypotheses` / `missing_information` 在 `observe.ObservationBatch`（跨事件）。
+   **全部可选带默认值**，原因见第四节「向后兼容」那条。
+2. **澄清 interrupt 接进 HTTP**：`POST /api/observe/run` → 可能返回 `phase:"clarify"`，
+   `POST /api/observe/resume` 回答，`GET /api/observe/status` 供刷新后重新发现待答的问题。
+3. **`TodayPage.vue` 的 `canSubmit` 修了**：原来只看 `feedbacks.some(f => f.outcome)`、
+   完全不看 `otherNotes` → 家长只写自然语言观察时按钮点不动，
+   技术方案 §1.1 的第一步在界面上根本走不通。
+4. **草稿存 checkpoint**：前端此前零持久化，填一半刷新即丢。
+   现在存 `draft:{child_id}:{date}` 独立 thread（`graph/draft.py`）。
+
+新增两处**以前没人守**的东西：`asd_agent/http_selfcheck.py`（8 组，
+因为 `server.py` 不在任何回归集里）与 `graph/selfcheck.py` 的 [9]-[13] 组。
+
+Phase 0 之前的三件事也仍然成立：
+
+- **`store.connect()` 改 autocommit**（`store.py:100`）—— 接入 checkpointer 的硬前置。
+- **LangGraph 全部关键行为已实测**（`_spike_lg.py` / `_spike_fork.py`）。
+  **不要凭记忆或文档抄 API**，第二节是照着实际输出写的。
+- **`asd_agent/graph/` 的形状与「落库只在 interrupt 之后」这条结构约束见第四节。**
 
 ### 环境
 
@@ -335,7 +347,110 @@ ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
 
 ---
 
+## 四之二、Phase 1 ✅ 已完成（2026-10-20）：图接进 HTTP
+
+`server.py` 此前**完全没有 import 过 `graph/`** —— 编排能力离线可验、线上不可达。
+现在接上了，顺带修掉两个**一接线就生效**的潜伏缺陷。
+
+### 新增路由
+
+| 路由 | 形态 | 说明 |
+|---|---|---|
+| `POST /api/observe/run` | job+SSE | `{child_id, date, text, no_llm?}` → `{job_id}`；终帧 `phase = clarify \| done` |
+| `POST /api/observe/resume` | job+SSE | 同 `thread_id` + `Command(resume=...)` |
+| `GET /api/observe/status` | 直接 JSON | 纯 `get_state`。**刷新后靠它发现待答的追问** |
+| `GET/PUT/DELETE /api/draft` | 直接 JSON | 毫秒级，不走 job |
+
+### ★ 四条接线约束（改之前先读）
+
+1. **resume 的身份是 `(child_id, date)`，不是 `job_id`。**
+   `_Job` 是进程内一次性容器（重启即失、没有 resume 概念），
+   `api.js` 的 `streamJob` 也只管一次 job 寿命 —— **两者都不用改**。
+   连续性在 checkpoint 里，这正是引入 checkpointer 的理由。
+
+2. **★ 没有待回答的澄清时 `resume` 必须 409。**
+   `Command(resume=...)` 打在没有 pending interrupt 的 thread 上，
+   LangGraph 会把它当成**新输入从头跑一遍整条图** → 重新抽取、重新落库。
+   **不报错、不抛异常，就是数据写了两遍。**
+   守卫必须在 `graph.invoke` 之前。断言在 `http_selfcheck.py` 的 [6] 与 [8]。
+
+3. **中断判定用 `snap.next` / `snap.interrupts`，不用 state 里的 `needs_clarification`。**
+   resume 跑完之后那个字段是**上一次**的值，拿它判会把「已经答过了」
+   误报成「还在等」。
+
+4. **「其他观察」只有一个写入口。**
+   `/api/feedbacks` 不再把 `other_notes` 传给 `apply_feedbacks`（否则同一段话抽两次、
+   写两行、付两次 LLM，`refusal` 与 `recent_scenes` 被算两遍）。
+   `apply_feedbacks` **本身没改** —— `loop.py` 的 CLI 还在用它那条路径。
+   `FeedbackIn.other_notes` 保留但标 deprecated，避免旧前端静默丢掉家长写的话。
+
+### ★ 修掉的三个既有缺陷（图一接进 HTTP 就生效）
+
+1. **`publish` 的幂等判据从「这一天」换成「这一段语料」。**
+   原判据 `_today_has_observations(child, date)`（这天有没有**任何**一行）在 Phase 0
+   成立，是因为当时只有图一个写入口。现在 `apply_feedbacks` 同一天也会从逐条活动的
+   note 写 `observations` 行 → 那个粗判据会把「其他观察」误判成「今天已落库」而
+   **静默跳过**。改成按 `observations.source` 判/删，**不需要任何迁移**
+   （source 列早就在存整段原话）。顺带与读侧对齐 —— `server.py` 早就按
+   `(observed_at, source)` 分组了。
+
+2. **`_delete_today` 按 `child+date` 删全部 → 改成按 source 删。**
+   澄清重抽时原来会连带删掉同一天逐条 note 写的行。那是数据丢失，不是覆盖。
+
+3. **写库键与查库键不一致（新 selfcheck [11] 暴露的）。**
+   `publish` 的幂等判据查 `state["date"]`，而 `observe.persist` 写的是
+   `observed_at=outcome.date`。两者不等时「查的那天」和「写的那天」不是同一天，
+   幂等判据永远匹配不上 —— **每次跑都重写一遍**，行还落到了空日期上。
+   现在把 date 钉成 `state["date"]`：图的坐标是权威。
+   分叉、恢复、带 observation 重跑这三条路上两者本来就不相等。
+
+### 向后兼容：为什么四个新字段绝不能 required
+
+`server.py` 的教练诊断用**裸 `except: continue`** 重校验历史 `observations.payload`，
+`graph/nodes.py` 的 publish 同样重校验旧 checkpoint。
+新字段一旦 required：**每一条旧 observation 都会校验失败并被静默跳过**（没有报错，
+只是家长和教练突然看不到几个月前的观察），旧 checkpoint 直接 raise。
+断言在 `selfcheck.py` 的 [9] 组（含一条 Phase 1 之前的 payload 字面量）。
+
+同理，`--no-llm` 降级时四层**全空、一条都不编**（断言 [10]）——
+空不是「坏了」，是没得说。
+
+### ★ 提示词：小模型跟例子，不跟论述
+
+四层的三条（parent_interpretation / hypotheses / missing_information）
+**抽象描述版实测三层全空** —— 7B 合规地输出了 `null`/`[]`，但内容是空的
+（schema 标不标 required 都一样：required 时是「合规但空」）。
+改成「照这个例子写」之后，家长确实说了解读时能抽出来，家长没说时正确留 null。
+规则单独放在 `_RULES_LAYERS`（`observe.py`）——
+**绝不能塞进 `_RULES_1_6`**，那个块与 `verify_schema.build_prompt()` 逐字对齐，
+断言在 `selfcheck.py` 的 [12] 组。
+
+### 草稿为什么不复用主图
+
+`graph/draft.py` 用独立 thread 前缀 `draft:`。三条理由，最后一条是要害：
+**草稿图从不 invoke**（只用 `update_state` 写 / `get_state` 读），
+没有任何节点会被执行，所以「interrupt 恢复会重跑节点」这条硬约束
+**在结构上不可能被违反** —— 而不是靠加一个「记得判重」的 if。
+
+---
+
 ## 五、待确认 / 遗留
+
+**Phase 1 期间新发现的：**
+
+- **7B 对四层的「内容」仍然偏保守**：家长说了解读时 `parent_interpretation` 能抽到，
+  但 `hypotheses` / `missing_information` 在多数输入上仍是空的。
+  这是模型诚实（规则 10 明写「宁可空着不要凑满」），不是 bug。
+  演示时若要展示这两层，建议用**家长明确说了「我猜他是…」**的输入。
+- **澄清按日期挂 thread**：家长第二天才回答 → 那个 thread 成孤儿。
+  demo 范围可接受，但产品上需要「未完成的澄清」列表。
+- **`_JOBS` 无 TTL、无上限**（`server.py`，Phase 0 就有），
+  每跑一次 observe 就多一条，长跑的 demo 会慢慢涨。
+- **前端 `otherNotes` 提交后不清空**：`App.vue` 保持 TodayPage 挂载，
+  家长重复点提交会把同一段话再发一次。`publish` 的幂等键能挡住落库，
+  但会白跑一次抽取。
+
+**Phase 1 之前就有的，仍然未动：**
 
 - **`DailySummary.domain_updates` 默认值是 `(FieldInfo,)` 元组不是 `[]`**，
   只在 live 路径触发，12 个离线回归一个都没报。已用形状校验挡住后果但**根因未定位**。
@@ -347,13 +462,12 @@ ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
 - **`refusal_counts >= 2` 没有冷却期结束条件**（老问题，语义变过但问题还在）。
 - **`/api/feedbacks` 无幂等保护**（只有 `/api/close` 有）。重复提交会让
   `refusal_counts` 翻倍 → 当天误触冷却阈值 2。Phase 4 改由 checkpoint 保证。
-- **`TodayPage.vue:107` 的 `canSubmit` 只看 `feedbacks.some(f => f.outcome)`，
-  完全不看 `otherNotes`** → 家长只写自然语言观察、没做任何活动时**按钮点不动**。
-  而技术方案 §1.1 第一步恰恰是「家长用自然语言记录」。Phase 1 一起修。
-- **前端零持久化**（grep `localStorage` 空）→ 家长填一半刷新即丢。草稿改存 checkpoint。
 - **技能/场景归属靠进程内活动库反查**，全库没有指向 `activity_id` 的外键
   （`sessions.activity_id` 是裸 TEXT，`sessions_for_skill` 靠 `load_activities()` 建 by_id）。
   「生活片段一等输入」若要关联活动，没有数据库约束可依赖。
+- **`llm.py` 的 capture 模式只存 response 不存 prompt**，replay 的 key 是 prompt 的
+  sha256 —— **改一行 prompt 全线 fixture 失效**（Phase 1 改了两处 prompt）。
+  方案 §6 要求审计，Phase 0 计划改成同时落 prompt 原文与 trace，**尚未做**。
 
 ---
 

@@ -98,17 +98,17 @@ class ObservationBatch(BaseModel):
     #   模型只负责说清「我不知道的是哪一块」。
     parent_interpretation: str | None = Field(
         default=None, max_length=200,
-        description="家长自己说出的解读或担心（**不是你的判断**）。"
-                    "他没表达就填 null，不要替他总结想法")
+        description="家长自己说出口的解读或担心，如「我猜他是困了」"
+                    "（**是他的话，不是你的判断**）。他没表达就填 null")
     hypotheses: list[str] = Field(
         default_factory=list, max_length=3,
-        description="1-3 条对这段话的**可能**解释，每条一句话，按可能性从高到低。"
-                    "它们是待验证的假设，不是结论；想不出就留空数组")
+        description="你对这段话的可能解释，每条一句话，按可能性从高到低。"
+                    "它们是**待验证的假设，不是结论**；想不出就留空数组")
     missing_information: list[str] = Field(
         default_factory=list, max_length=3,
-        description="这段话里还缺、且会影响下一步判断的信息，每条一个短语"
-                    "（如「不知道他当时在做什么」）。**这里记「缺什么」而不是「问什么」**。"
-                    "信息够就填 []，不要为了凑数把有的东西说成缺的")
+        description="你还缺、且会影响下一步判断的信息，每条一个短语"
+                    "（如「不知道他昨晚睡了多久」）。**记「缺什么」不是「问什么」**。"
+                    "信息够就填 []")
 
 
 class ObservationOutcome(BaseModel):
@@ -214,25 +214,31 @@ _RULES_SINGLE = """
 
 # ★ 规则 9-10 单独成常量，**绝不能塞进上面的 _RULES_1_6** ——
 #   那个块与 verify_schema.build_prompt() 的规则 1-6 是逐字对齐的
-#   （graph/selfcheck.py 有一条断言守着这件事，见 _check_rules_alignment）。
+#   （graph/selfcheck.py 有一条断言守着这件事，见 check_rules_alignment）。
 #   改动它 = 让 verify_schema 那份 12/12 的 A/B 结论不再代表生产链路。
 #   技术方案 §4 场景 A 要求的四层写在这里，追加在既有规则之后。
+#
+# ★ 为什么规则 9 是「给例子」而不是「讲道理」（2026-10-20 实测）
+#   抽象描述版的三层，7B 实测**三层全空**（它合规地输出了 null/[]，但内容是空的）。
+#   换成这一条带具体例子的版本后，`parent_interpretation` 在家长确实说了
+#   解读时能被抽出来，家长没说时也正确地留 null。
+#   小模型跟例子，不跟论述 —— 这条经验对后面任何加字段的提示词都适用。
 _RULES_LAYERS = """
-9. **事实、解读、假设、缺失，分开写，不要混。**
-   - `events` 是事实，每个字段尽量来自原话；
-     `fact_fields` 标出这条事件里**哪些字段是原话直接写着的**，
-     推断出来的字段不要列进去 —— 家长要能对照着核。
-   - `parent_interpretation` 是**家长自己说的**解读或担心，不是你的判断。
-     他没表达就填 null，不要替他总结想法。
-   - `hypotheses` 是你对这段话的**可能**解释，每条一句话，按可能性排序。
-     它们是待验证的假设，**不是结论** —— 想不出就留空数组。
-   - `missing_information` 记的是**你缺什么信息**，不是「该问家长什么」。
-     信息够就填 []，不要为了凑数把已经有的东西说成缺的。
+9. **事实、解读、假设、缺失，四层分开写。照这个例子写：**
+   家长说「今天他不太配合，我猜他是困了」→
+     events 里那条行为是 refusal，fact_fields 只列原话直接写着的字段
+       （behavior、raw_quote —— 推断出来的字段不要列）；
+     parent_interpretation = 「我猜他是困了」（**家长自己说的**，不是你的判断）；
+     hypotheses = ["疲劳导致抗拒"]（你的推测，**待验证的假设，不是结论**）；
+     missing_information = ["不知道他昨晚睡了多久"]
+     （这里记「你缺什么信息」，不是「该问家长什么」）。
+   ★ 家长说的解读进 parent_interpretation，**不许**塞进 events 当成事实；
+     你的推测一律进 hypotheses。
 
-10. **宁可空着，不要凑满。** 上面四个字段全都允许为空。
-    编造的事实会进 `refusal_counts` 与红旗的按天计数，
-    而那两条都会改变第二天的干预计划 —— 一次编造污染一个可判定的通道。
-    拿不准就留空，并在 confidence 里说实话。"""
+10. **宁可空着，不要凑满。** 家长没表达解读就 parent_interpretation=null；
+     想不出解释就 hypotheses=[]；信息够就 missing_information=[]。
+     编造的事实会进 `refusal_counts` 与红旗的按天计数，
+     而那两条都会改变第二天的干预计划 —— 一次编造污染一个可判定的通道。"""
 
 _SYSTEM_HEAD_OTHER = """你是一个自闭症儿童干预记录助手，负责把家长口述的一段话，
 转成结构化的行为观察记录。**一次输入里可能包含多次事件，请全部抽出来。**"""
