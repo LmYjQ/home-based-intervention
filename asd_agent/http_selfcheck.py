@@ -198,8 +198,119 @@ def main() -> int:
     print("\n[9] 红旗：刷新后还在 + 状态流转")
     check_redflags(c, check)
 
+    # =============================================== 10. 计划链（Phase 3）
+    print("\n[10] 计划链：审批 interrupt 的 HTTP 往返")
+    check_plans(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_plans(c, check) -> None:
+    """★ 计划链的 HTTP 面（Phase 3）。
+
+    守的是三件事，缺一不可：
+
+    1. **两阶段协议**：跑 → 可能停在审批上 → 回答 → 跑完。
+       `phase="review"` 是一个**正常结果**，不是错误。
+    2. **409 守卫**：没有待审批的计划时 `review` 必须 409。
+       与 `/api/observe/resume` 完全同款 ——
+       `Command(resume=...)` 打在没有 pending interrupt 的 thread 上，
+       LangGraph 会把它当成**新输入从头跑一遍整条图**，
+       于是 plans 表里多出一行版本。**不报错、不抛异常，就是数据多了一版。**
+    3. **路由不被参数路由吃掉**：`/api/plan/status` 与
+       `/api/plan/{child_id}` 形状相同，FastAPI 按声明顺序匹配 ——
+       顺序错了，`status` 会被当成 child_id，
+       而那条老路由报的是「还没有这个孩子的画像」，完全指不到真正的原因。
+
+    用另一个孩子，与前面各组隔开（`plan_paused` 是按孩子判的）。
+    """
+    import store as store_mod
+    from capabilities import ParentConstraints
+    from profile import _fallback_profile
+
+    cid = "http-check-plan"
+    conn = store_mod.connect(DB)
+    store_mod.ensure_child(conn, cid, name="计划链自检娃", age_months=34)
+    store_mod.save_profile(conn, _fallback_profile(cid, 34, ParentConstraints()))
+
+    d = "2026-10-25"
+
+    # ---- 跑 ----
+    r = c.post("/api/plan/run", json={"child_id": cid, "date": d})
+    check("/api/plan/run 200", r.status_code == 200, r.status_code)
+    body = r.json()
+    check("★ phase=review（第一版必审批，这是正常结果）",
+          body.get("phase") == "review", body.get("phase"))
+    check("★ 载荷带理由与允许的动作",
+          bool(body.get("interrupt", {}).get("changes"))
+          and set(body["interrupt"].get("allowed_actions") or [])
+          == {"approve", "edit", "reject"},
+          body.get("interrupt", {}).get("changes"))
+    check("★ 审批之前 plans 表零写入",
+          conn.execute("SELECT count(*) AS n FROM plans WHERE child_id=%s",
+                       (cid,)).fetchone()["n"] == 0)
+
+    # ---- 刷新后还读得到（前端不持有 interrupt 状态）----
+    st = c.get("/api/plan/status", params={"child_id": cid, "date": d})
+    check("★ /api/plan/status 200 且 phase=review",
+          st.status_code == 200 and st.json().get("phase") == "review",
+          (st.status_code, st.json().get("phase") if st.status_code == 200 else st.text[:80]))
+    check("★ status 没被 /api/plan/{child_id} 吃掉（路由顺序）",
+          "还没有这个孩子的画像" not in str(st.json()), st.json())
+
+    # ---- 回答 ----
+    r = c.post("/api/plan/review",
+               json={"child_id": cid, "date": d, "action": "approve"})
+    check("/api/plan/review 200", r.status_code == 200, r.status_code)
+    check("★ phase=done", r.json().get("phase") == "done", r.json().get("phase"))
+    n = conn.execute("SELECT count(*) AS n FROM plans WHERE child_id=%s",
+                     (cid,)).fetchone()["n"]
+    check("★ 落库恰好一行", n == 1, n)
+
+    # ---- 重复 review 必须 409 ----
+    r = c.post("/api/plan/review",
+               json={"child_id": cid, "date": d, "action": "approve"})
+    check("★ 没有待审批时 review → 409（否则会多写一版）",
+          r.status_code == 409, r.status_code)
+    n2 = conn.execute("SELECT count(*) AS n FROM plans WHERE child_id=%s",
+                      (cid,)).fetchone()["n"]
+    check("★ 409 之后 plans 表没有多行", n2 == 1, n2)
+
+    # ---- 非法动作 → 400，且理由来自图自己的 schema ----
+    # ★ 必须先造出一次**真变化**，否则那一天不会停在审批上
+    #   （输入相同 → 不审批，那正是「只在真变化时审批」判据在工作），
+    #   于是 review 拿到的是 409 而不是 400 —— 测的就不是想测的那件事了。
+    d2 = "2026-10-26"
+    conn.execute("UPDATE plans SET payload = jsonb_set(payload::jsonb, "
+                 "'{fingerprint,skills}', '[\"不存在的技能\"]'::jsonb)::text "
+                 "WHERE child_id=%s", (cid,))
+    conn.commit()
+    c.post("/api/plan/run", json={"child_id": cid, "date": d2})
+    check("★ 造出真变化后确实停在审批上",
+          c.get("/api/plan/status", params={"child_id": cid, "date": d2}
+                ).json().get("phase") == "review")
+    r = c.post("/api/plan/review",
+               json={"child_id": cid, "date": d2, "action": "banana"})
+    check("★ 非法 action → 400（不是 422：那层不重复声明字面量）",
+          r.status_code == 400, r.status_code)
+    check("★ 400 的理由说的是图里那三个动作",
+          "approve" in str(r.json().get("detail", "")), str(r.json().get("detail"))[:80])
+
+    # ---- 版本列表可查 ----
+    r = c.get("/api/plan/versions", params={"child_id": cid, "date": d})
+    check("/api/plan/versions 200 且有一行",
+          r.status_code == 200 and len(r.json().get("versions") or []) == 1,
+          r.json())
+
+    # ---- 没画像 → 400 ----
+    r = c.post("/api/plan/run", json={"child_id": "no-such-child", "date": d})
+    check("没有画像 → 400", r.status_code == 400, r.status_code)
+
+    # ---- 多余字段 → 422（FastAPI 层，extra=forbid）----
+    r = c.post("/api/plan/run",
+               json={"child_id": cid, "date": d, "bogus": 1})
+    check("多余字段 → 422", r.status_code == 422, r.status_code)
 
 
 def check_redflags(c, check) -> None:

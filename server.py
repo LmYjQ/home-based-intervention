@@ -59,7 +59,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import llm
 import observe
@@ -84,8 +84,9 @@ from schema import Observation
 #   `saver_for()` 每次调用都开一条新连接并（首次）跑一次 setup()
 #   （里面含 CREATE INDEX CONCURRENTLY），绝不能每请求调一次。
 from graph import draft as graph_draft
-from graph.runtime import get_graph, get_draft_graph
-from graph.state import ClarifyAnswer, thread_config
+from graph.plan_graph import MAX_EDIT_LOOPS, plan_inputs
+from graph.runtime import get_graph, get_draft_graph, get_plan_graph
+from graph.state import ClarifyAnswer, plan_config, thread_config
 
 app = FastAPI(title="家长干预教练 Agent", version="0.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
@@ -329,6 +330,34 @@ class DraftIn(BaseModel):
     other_notes: str = Field(default="", max_length=20000)
 
 
+class PlanIn(BaseModel):
+    """跑一遍计划链。**不需要 no_llm** —— 计划链全程零 LLM（纯 Python 装箱）。"""
+
+    model_config = {"extra": "forbid"}
+
+    child_id: str
+    date: str
+
+
+class PlanReviewIn(BaseModel):
+    """对审批 interrupt 的回答。
+
+    ★ 这里**不**重复声明 action 的三个取值：图里 `approve_plan` 节点
+      已经挂了 `response_schema=PlanReview`，校验发生在**恢复那一刻**。
+      在 FastAPI 这层再抄一份 `Literal` 就是两处口径 ——
+      抄的那份迟早会落后，而落后时前端传 `approv` 得到的是一个
+      "参数不合法"却不知道该传什么的 422。
+      这里只保证形状是 dict，语义交给图（与 ObserveResumeIn 同一条理由）。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    child_id: str
+    date: str
+    action: str = Field(min_length=1)
+    note: str = Field(default="", max_length=500)
+
+
 class RedFlagStatusIn(BaseModel):
     """改一条红旗的状态。
 
@@ -429,7 +458,7 @@ def api_card(inp: CardIn):
         # ---- 已生成过就直接读（换页面/刷新都不重算）----
         prof_id = store.latest_profile_id(conn, inp.child_id)
         if not inp.force:
-            saved = store.latest_plan(conn, inp.child_id, inp.date)
+            saved = store.latest_card(conn, inp.child_id, inp.date)
             if saved and saved.get("profile_id") == prof_id:
                 step(f"{inp.date} 已经生成过（{len(saved.get('activities') or [])} 条），直接读")
                 return saved | {"cached": True}
@@ -510,7 +539,13 @@ def api_card(inp: CardIn):
         }
         # 落库在最后：只有整份都算完才写，中途失败不会留下一份半截的缓存
         # —— 半截缓存会被下一次直接读出去，而读的人看不出它是半截的。
-        store.save_plan(conn, inp.child_id, inp.date, payload)
+        #
+        # ★ Phase 3：写的是 `day_cards`，**不再是 `plans`**。
+        #   plans 从 Phase 3 起是「版本化的计划」，而这里存的是
+        #   「今天这一张卡片」—— 两种东西挤在一张表上的后果见
+        #   store._init 里 day_cards 那段注释（active_plan 会把卡片
+        #   当成已批准的计划，于是**真变化再也不打断家长**）。
+        store.save_card(conn, inp.child_id, inp.date, payload)
         return payload
 
     return {"job_id": _start_job(f"card:{inp.child_id}:{inp.date}", work)}
@@ -625,6 +660,124 @@ def api_state(child_id: str):
         "no_llm": _NO_LLM,
         "llm_mode": os.getenv("DEMO_MODE", "live"),
     }
+
+
+# ★ 注册位置很要紧：`/api/plan/{child_id}` 这条路由的参数在路径里，
+#   FastAPI 按**声明顺序**匹配，而 `/api/plan/status` 也是 `/api/plan/xxx` 的一种。
+#   把这一段放在 `{child_id}` 之后，`GET /api/plan/status` 会被当成
+#   `child_id="status"` 命中那条老路由 —— 症状是 400「还没有这个孩子的画像」，
+#   而那条路由根本没读过 profile。**报错信息完全指不到真正的原因。**
+# ================================================================== 计划链（Phase 3）
+def _plan_result(g, cfg: dict) -> dict:
+    """把计划链的 checkpoint 读成前端要的形状。**纯读**。
+
+    三种 phase（与观察链同款的三态协议）：
+      idle    —— 从没跑过
+      review  —— 停在 ⚡ approve_plan 上，等家长拍板
+      done    —— 跑完了（含"因为红旗停着"这一种）
+
+    ★ 中断判定用 `snap.next` / `snap.interrupts`，**不用** state 里的
+      `needs_review`：resume 跑完之后那个字段是上一次的值，
+      拿它判会把「已经批过了」误报成「还在等」——
+      这是观察链踩过的同一个坑（见 `_observe_result` 的注释）。
+    """
+    snap = g.get_state(cfg)
+    vals = snap.values or {}
+    nxt = tuple(snap.next or ())
+    ints = list(getattr(snap, "interrupts", None) or [])
+
+    if not vals and not nxt:
+        return {"phase": "idle", "thread_id": cfg["configurable"]["thread_id"],
+                "interrupt": None, "paused": False, "changes": [],
+                "plan_id": None, "plan_version": None, "trace": []}
+
+    interrupted = bool(nxt) and bool(ints)
+    return {
+        "phase": "review" if interrupted else "done",
+        "thread_id": cfg["configurable"]["thread_id"],
+        "interrupt": _jsonable(ints[0].value) if ints else None,
+        "plan_id": vals.get("plan_id"),
+        "plan_version": vals.get("plan_version"),
+        "plan_status": vals.get("plan_status"),
+        # ★ 暂停时前端要显示"今天没排"，并指向红旗横幅。
+        "paused": bool(vals.get("plan_paused")),
+        "activities": list(vals.get("plan_activity_ids") or []),
+        "total_minutes": vals.get("plan_total_minutes", 0),
+        "focus_domain": vals.get("focus_domain", ""),
+        "focus_reason": vals.get("focus_reason", ""),
+        "changes": list(vals.get("changes") or []),
+        "trace": list(vals.get("trace") or []),
+    }
+
+
+@app.post("/api/plan/run")
+def api_plan_run(inp: PlanIn):
+    """跑计划链。**毫秒级，不用 job** —— 全程纯 Python（检索 + 装箱），零 LLM。
+
+    ★ 与观察链最大的不同：这条路径**通常不会停**。
+      `needs_review=False` 时一路跑到 `publish_plan`，返回 `phase="done"`；
+      只有"相对当前生效的那一版有实质变更"或"第一版"才会停在审批上。
+      这正是"只在真变化时审批"这条判据的对外表现。
+
+    ★ `force` 参数刻意没有：`thread_id` 天然按天唯一（`plan:{child}:{date}`），
+      同一���天重复调用会接着上次的 checkpoint 跑（实测 ④），
+      所以"重新生成"是 `POST /api/plan/review` + `edit` 那条路，
+      而不是在这里加一个 force。
+    """
+    conn = _conn()
+    _profile_or_400(conn, inp.child_id)     # 没画像不该走到这一步
+    g = get_plan_graph()
+    cfg = plan_config(inp.child_id, inp.date)
+    try:
+        g.invoke(plan_inputs(conn, inp.child_id, inp.date), cfg)
+    except LookupError as e:
+        raise HTTPException(400, str(e))
+    return _plan_result(g, cfg)
+
+
+@app.post("/api/plan/review")
+def api_plan_review(inp: PlanReviewIn):
+    """回答审批 interrupt，让图接着跑。
+
+    ★★ 没有待审批的计划时**必须 409** —— 与 `/api/observe/resume` 完全同款：
+      `Command(resume=...)` 打在没有 pending interrupt 的 thread 上，
+      LangGraph 会把它当成**新输入从头跑一遍整条图**，
+      于是 plans 表里多出一行版本 —— **不报错、不抛异常，就是数据多了一版**。
+      守卫必须在 `graph.invoke` 之前。
+
+    ★ 400 而不是 422：`action` 的合法取值由图里的 `PlanReview` 判，
+      传错时是 `graph.invoke` 抛的 Pydantic ValidationError，
+      翻译成 400 并把图自己的报错原样带出去 ——
+      家长点错按钮时看到的是"approve/edit/reject 三个里选一个"。
+    """
+    g = get_plan_graph()
+    cfg = plan_config(inp.child_id, inp.date)
+    snap = g.get_state(cfg)
+    if not (getattr(snap, "interrupts", None) or []):
+        raise HTTPException(
+            409, "这一天没有待审批的计划（可能已经批过了，或者压根没跑过计划链）")
+    try:
+        g.invoke(Command(resume={"action": inp.action, "note": inp.note}), cfg)
+    except ValidationError as e:
+        raise HTTPException(400, f"审批动作不合法：{e.errors()[0]['msg']}")
+    return _plan_result(g, cfg)
+
+
+@app.get("/api/plan/status")
+def api_plan_status(child_id: str, date: str):
+    """计划链现在停在哪。**纯读 checkpoint，毫秒级。**
+
+    刷新页面后靠它发现"还有个计划等你批" ——
+    前端不持有任何 interrupt 状态（刷新就没了，服务端不会）。
+    """
+    return _plan_result(get_plan_graph(), plan_config(child_id, date))
+
+
+@app.get("/api/plan/versions")
+def api_plan_versions(child_id: str, date: str):
+    """某一天的全部版本。家长改过几次、哪一版被拒了，都在这里。"""
+    conn = _conn()
+    return {"versions": store.plan_versions(conn, child_id, date)}
 
 
 @app.get("/api/plan/{child_id}")
