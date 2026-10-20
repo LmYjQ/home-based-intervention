@@ -57,7 +57,7 @@ ganyu/
 ├── c3bcca26-*.png             干预模式分类参考图（活动库方法标签的依据）
 └── asd_agent/
     ├── PROGRESS.md            ← 进度交接、实测结果、踩过的坑（换 session 动手前先读）
-    ├── GRILLING.md            面试拷问清单（"答不上来的项 = 现场会被问倒的项"）
+    ├── LANGGRAPH.md           ← LangGraph 编排层：实测结论（别抄文档，1.x 与网上示例有出入）
     ├── sources.md             方法级溯源（文献出处 / 国内指南锚点 / 证据边界）
     ├── results/2026-10-16/    verify_schema 的 A/B 实验产物
     │
@@ -76,7 +76,16 @@ ganyu/
     ├── coach.py               教练 Agent：诊断（可校验推理链）→ 家长卡片
     ├── evaluator.py           评估 Agent：只给证据，判定留给状态机
     ├── observe.py             家长一段话 → 多条结构化事件 + 红旗 + 降级
-    └── loop.py                ★ 唯一 demo 入口：端到端链路 + 三日闭环
+    ├── feedback.py            逐条家长反馈 → quality_for()（纯 Python、可重放）
+    ├── summary.py             日结 Agent（方向判断已移交 Python 的 weekly_direction）
+    ├── loop.py                ★ 唯一 demo 入口：端到端链路 + 五日闭环
+    │
+    └── graph/                 ★ 编排层（LangGraph）：让流程第一次能"等人"
+        ├── state.py           InterventionState + interrupt 载荷的 Pydantic 约束
+        ├── checkpointer.py    PostgresSaver，跟随 ASD_DB_PATH 的 schema 隔离
+        ├── nodes.py           7 个节点体，全是现有纯函数的薄封装
+        ├── builder.py         StateGraph 定义 + 条件路由
+        └── selfcheck.py       图级验收（interrupt / resume / time travel / 分叉隔离）
 ```
 
 ---
@@ -113,6 +122,37 @@ ganyu/
                                    ▼
                      抗拒计数 / 场景分布 ──► 明天候选真的变了
 ```
+
+### 编排层 `graph/`（进行中）
+
+上面那条链是**顺序执行**的：流程里没有任何一个点等人。`graph/` 用 LangGraph
+把其中一段变成有 checkpoint 的流程，第一次让「等人」成为可能 ——
+澄清 interrupt 停一下等家长回答，答完接着跑而不是从头再来。
+
+```
+START → record_intake → extract_observation → validate_observation
+                                          ├─ 缺信息？→ ⚡ clarify → 回抽取
+                                          └─ safety_gate → urgent？├─ 是 → escalate → END
+                                                          └─ 否 → publish → END
+```
+
+三条边界（写在 `graph/state.py` 顶部，因为它们要在定义层就被看见）：
+
+1. **Checkpoint 与业务数据库是两回事。** `sessions` / `observations` /
+   `skill_state` / `daily_summary` 全部保留 append-only；checkpoint 是**追加的**
+   resume + provenance 层。**别因为"反正有 checkpoint 了"去删业务表。**
+2. **模型给证据，Python 做判定。** `observe.extract_observations` 提供**文案**，
+   `validate_observation` / `safety_gate` 决定**要不要问 / 要不要拦**。
+3. **`publish` 排在所有 interrupt 之后，且是全图唯一写业务表的节点。**
+   因为 `interrupt()` 恢复会**重跑所在节点** —— 写库放在 interrupt 之前，
+   resume 一次就写两遍。**这条靠节点位置保证，不靠记得判重。**
+
+> ⚠️ 第 3 条有实测陷阱：**这个重跑现象只在 `PostgresSaver` 下可观测**，
+> 用 `InMemorySaver` 写单测会看到"只跑了一次"，从而放心地把写库放到
+> interrupt 之前 —— 上生产就双写。详见 `LANGGRAPH.md` ⑤。
+
+状态：**Phase 0 已完成**（7 节点 + 1 个 interrupt + 9 组图级断言全绿，
+`asd_agent/` 现有模块一行没改）。计划链与反馈链待 Phase 3/4 接。
 
 ### 三个 Agent 各自的职责边界
 
@@ -271,7 +311,7 @@ cd asd_agent
 1. `loop.py --no-llm --script hardcoded --seed-history` → 闭环 + 升级闸门对照（0.1s）
 2. `loop.py --no-llm --script hardcoded` → 三天链路，7 阶段全展开（检索 → 教练 → 执行 → 写入 → 观察 → 评估 → 明天的候选）
 3. `activities.py --validate` → 50 条活动的自检（引用了存在但放错位置的 ID 靠交叉验证才发现）
-4. 挑一个没做用户访谈就承认、说明观察来源（见 `GRILLING.md`）
+4. 挑一个没做用户访谈就承认、说明观察来源
 
 ---
 
@@ -302,13 +342,23 @@ cd asd_agent
 
 ## 下一步
 
-代码层面阶段 4（闭环接线）已完成，`loop.py` 覆盖全部技术叙事。剩下的是包装层：
+包装层已完成（`server.py` + `frontend/`，13 条路由 + Vue 8 个组件，已通过浏览器实测）。
+**当前主线是 LangGraph 编排层**（路线见 `LANGGRAPH.md`，逐阶段独立可验收）：
 
-- `server.py`（~300）—— 同步路由 + JobManager + SSE。**所有 LLM 路径一律 job_id + SSE，绝不让前端同步等。**
-- `static/index.html`（~450）—— 原生 JS 三 tab + Agent Trace 面板，**不引任何 CDN**（现场无网会白屏）。
-- fixtures 回放 + 演示脚本。
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Phase 0 | `graph/` 地基：state / checkpointer / 7 节点 / ⚡ 澄清 interrupt / 图级验收 | ✅ |
+| Phase 1 | 观察链：`schema.py` 四层字段 → `observe.py` 扩层；把澄清 interrupt 接进 HTTP + 前端，并修 `TodayPage.vue` 的 `canSubmit`（只写观察不做活动时按钮点不动） | 待做 |
+| Phase 2 | 安全链：`escalate` 真正暂停计划 + **红旗落库**（现在红旗只在响应里飘一次，`RedFlagList.vue` 渲染完就永久消失） | 待做 |
+| Phase 3 | 计划链：`plans` 表加 `status`/`version`；实质性变更判据（纯 Python）+ ⚡ 审批 interrupt | 待做 |
+| Phase 4 | 反馈链：`sessions` 语义拆分 + `apply_transitions` 幂等键 + `next_action` | 待做 |
+| Phase 5 | Time travel：checkpoint 列表 + 分叉视图 + `workflow_audit_events` 落库 | 待做 |
+| Phase 6 | 鉴权（单用户版）+ 收紧 CORS | 待做 |
 
-**降级方案**：时间紧就砍掉这一层，直接交 CLI demo。技术叙事一点不少，0.1s 跑通。
+**降级方案**：时间紧就砍掉编排层后续阶段，直接交 CLI demo
+（`loop.py --no-llm --script hardcoded --seed-history`，0.1s 跑完）。
+技术叙事（多 Agent / 结构化检索 / 长期记忆 / 状态机 / 闭环）一点不少，
+Phase 0 的图作为「下一步已经在做」的增量单独讲。
 
 ---
 
@@ -317,7 +367,7 @@ cd asd_agent
 | 文件 | 内容 |
 |---|---|
 | [`asd_agent/PROGRESS.md`](asd_agent/PROGRESS.md) | 进度交接：实际做到哪、验证结果、**踩过的坑（勿回退）** |
-| [`asd_agent/GRILLING.md`](asd_agent/GRILLING.md) | 面试拷问清单 |
+| [`asd_agent/LANGGRAPH.md`](asd_agent/LANGGRAPH.md) | LangGraph 编排层：实测结论与 Phase 0-6 路线 |
 | [`asd_agent/sources.md`](asd_agent/sources.md) | 方法级溯源 + 证据边界 |
 | [`plan.md`](plan.md) | 实现计划（设计决策的出处） |
 | [`demand.md`](demand.md) | 需求原文 |

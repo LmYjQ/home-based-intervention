@@ -8,17 +8,18 @@
 
 ## 🔖 换 session 先看这一屏
 
-**当前阶段：Phase 0 前置已做完，图本身还没写。**
+**当前阶段：Phase 0 ✅ 已完成，图已跑通并有 9 组断言守着。** 下一步是 Phase 1（观察链扩层 + 澄清 interrupt 接进 HTTP）。
 
-已完成两件事，都实测过：
+已完成三件事，都实测过：
 
 1. **`store.connect()` 改 autocommit**（`store.py:100`，一个参数 + docstring）。
    这是接入 checkpointer 的**硬前置** —— 原来长连接非 autocommit 会留下永不结束的事务，
    把 `PostgresSaver.setup()` 的 `CREATE INDEX CONCURRENTLY` 卡死。
 2. **LangGraph 全部关键行为已实测**（`asd_agent/_spike_lg.py` / `_spike_fork.py`，15 条断言全绿）。
    **不要凭记忆或文档抄 API**，下面「实测结论」一节是照着实际输出写的，1.x 与网上 0.x 示例有出入。
-
-**还没写一行图代码。** `asd_agent/graph/` 目录不存在。
+3. **`asd_agent/graph/` 已落地**（Phase 0，2026-10-20）：state / checkpointer / nodes / builder / selfcheck。
+   7 个节点、1 个 ⚡ 澄清 interrupt、图级验收全绿，`asd_agent/` 现有模块一行没改。
+   图的形状与「落库只在 interrupt 之后」这条结构约束见第四节。
 
 ### 环境
 
@@ -156,6 +157,26 @@ def saver_for(path: str | None = None) -> PostgresSaver:
 **节点在 `interrupt()` 之前不得有任何不可重复的副作用**（DB 写入、通知、发消息）。
 这是硬约束，不是建议。
 
+> ⚠️ **2026-10-20 补测：这个现象只在 `PostgresSaver` 下出现，用 `InMemorySaver` 验不出来。**
+> 同一个探针（节点在 interrupt 之前原地改 state）：
+>
+> | checkpointer | 恢复后 hits |
+> |---|---|
+> | `InMemorySaver` | `['before_interrupt', 'after']` ← **看不出重跑** |
+> | `PostgresSaver` | `['before_interrupt', 'before_interrupt', 'after']` |
+>
+> 后果很具体：谁拿 `InMemorySaver` 写单测，看到"只执行了一次"，
+> 就会推断"恢复不重跑"，然后放心地把写库放到 interrupt 之前 ——
+> 上生产（用 PG）就双写。**任何验这条约束的测试必须用生产 saver。**
+> 探针在 `graph/selfcheck.py::_probe_rerun`，与图一起走，别把它删了。
+>
+> 顺带一个推论：**别指望在 state 里"记录"重跑**。生产节点在 interrupt
+> 之前不做任何事，所以真图里根本没有可观测的重跑痕迹 ——
+> 这说明约束被遵守了，不是说明重跑不存在。
+> （我一度想用 `Annotated[list, operator.add]` 在 trace 里留痕，实测无效：
+> 返回值只在节点**完成**时 apply，原地 append 跨不过 checkpoint 序列化。
+> 与 reducer 选哪个无关，是机制本身。）
+
 ### ⑥ `Command.resume` 有两种形态
 
 ```python
@@ -227,20 +248,79 @@ graph.stream(...) / graph.astream(...)
 
 ---
 
-## 四、下一步：Phase 0（还没开始写）
+## 四、Phase 0 ✅ 已完成（2026-10-20）
 
-建 `asd_agent/graph/` 三个文件，**不动 `asd_agent/` 任何现有模块**，
-12 个离线回归必须始终全绿：
+`asd_agent/graph/` 已落地，**`asd_agent/` 任何现有模块一行没改**，
+12 个离线回归 + `activities --validate` + `loop.py --script hardcoded` 全绿。
 
 | 文件 | 内容 |
 |---|---|
-| `asd_agent/graph/state.py` | `InterventionState` TypedDict（技术方案 §5.3，但**按现有实体收敛**，别照抄那 20 多个字段） |
-| `asd_agent/graph/checkpointer.py` | 上面实测过的 `saver_for()` |
-| `asd_agent/graph/builder.py` | `StateGraph` 定义、节点边、条件路由 |
+| `graph/state.py` | `InterventionState`（**按现有实体收敛到 20 个字段**，不是方案 §5.3 那二十多个）、`ClarifyAnswer` / `EscalationVerdict` / `PlanReview`、`thread_id_for` / `fork_config` |
+| `graph/checkpointer.py` | 上面实测过的 `saver_for()` + 自检 |
+| `graph/nodes.py` | 7 个节点体，全部是现有纯函数的薄封装（每个都注明调的是哪个函数） |
+| `graph/builder.py` | `StateGraph` 定义、边、条件路由 |
+| `graph/selfcheck.py` | **图级验收，9 组断言**（Phase 0 的验收标准） |
 
-跑什么图见计划文件；`extract_observation` / `safety_gate` / `approve_plan`
-三个节点的底座现有代码里都有（`observe.extract_observations`、`redflag.scan`、
-`statemachine.propose_transition`），**都当纯函数直接调，一行不改**。
+### 图现在长什么样（只画底座已存在的部分）
+
+```
+START → record_intake → extract_observation → validate_observation
+                                            ├─ needs_clarification? → ⚡ clarify → 回抽取
+                                            └─ safety_gate → urgent? ├─ 是 → escalate → END
+                                                              └─ 否 → publish → END
+```
+
+**计划链（select_goal / retrieve / generate / validate_plan / approve_plan / freeze_plan）
+和反馈链（record_execution / analyze_outcome / next_action）故意没画** ——
+它们各自缺一块 Phase 0 明确不许动的东西：`plans` 表没有 `status`/`version`，
+`sessions` 没有 `plan_id`/`run_id`，红旗没有落库位置。
+现在画就只能画一版**注定要改**的图，而图的形状会渗进 checkpoint 的历史里。
+`state.py` 已经把 `PlanReview` 的形状定好，Phase 3 接的时候不必再改 state 定义。
+
+### ★ 图的形状不是审美，是一条实测约束的结果
+
+`publish` 是**全图唯一写业务表的节点，且排在所有 interrupt 之后**。
+理由是 ⑤：恢复会重跑所在节点，于是凡是在 interrupt 之前写过库的东西，
+resume 一次就写两遍。**这条不能靠"我记得判重"，只能靠节点的位置。**
+
+（`publish` 自己仍按日期做了幂等兜底 —— 那是第二道，不是第一道。）
+
+### 跑法
+
+```bash
+cd asd_agent
+ASD_DB_PATH=/tmp/graph_selfcheck.db ../.venv/bin/python -m graph.selfcheck   # 图级验收
+ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
+```
+
+### Phase 0 踩到的坑（已修，勿回退）
+
+1. **★ `clarify → extract → validate` 是环，没有出口守卫会死循环。**
+   澄清后重抽，若仍判"缺信息"就会再问一遍同一个问题 ——
+   而重复追问不只是烦，是**系统把自己没听懂的锅推给人**。
+   → `clarify_asked` 只允许问一次。答完不管清不清楚都往下走；
+   真需要更细的信息是 Phase 1 `missing_information` 的活，不是再问一遍。
+
+2. **★ 抽取的幂等判据不能用"observation 字段在不在"。**
+   澄清之后该字段还在，但语料**确实变了**，那一轮必须重抽。
+   → 判据是 `observed_text == parent_text`（语料变没变），
+   顺带白赚一件事：分叉出来的 thread 带着上一轮结果直接继续时不会重复付 LLM。
+
+3. **★ `publish` 里曾用 `clarified_text != parent_text` 判"要不要重落库"** ——
+   而 `_reextract` 会把 `parent_text` 直接改成 merged，两者恒相等，
+   那个比较永远为假，于是澄清后的重抽结果**永远不落库**（静默丢数据）。
+   → 改用 `clarify_asked`。**这类 bug 没有任何报错**，是本次最险的一处。
+
+4. **我写的两条断言本身是错的**（PROGRESS.md 阶段 4 / 4b 同款）：
+   - "新 thread 的语料不含原 thread 的澄清回答" —— 分叉**就该继承**历史 state，
+     断言它不继承等于把方案 §5.5 要的能力（"昨天那条其实做了"→ 改掉再看今天怎么变）
+     断言成了"不该继承"。
+   - "interrupt 前节点都跑过了" 写成 `"extract_observation" in trace` ——
+     而 trace 里那一项是 `extract_observation(reused)`，列表成员判断要求完全相等。
+
+5. **`people_present=["parent"]` 被 Pydantic 拒了** ——
+   词表里是 `mother`/`father`，没有 `parent`。**这是 schema 在正常工作**，
+   写验收脚本时它会替你挡住"看起来合理"的假数据。
 
 ### 两个必须写死的边界（否则一定会有人踩回来）
 
@@ -250,6 +330,8 @@ graph.stream(...) / graph.astream(...)
 2. **模型给证据，Python 做判定。** 节点体默认写纯函数；引入 LLM 节点必须写清楚
    它为什么不能是判定函数。LangGraph 让「加个节点就交给模型」变容易了，
    而这恰好会回退现有设计最好的那条原则。
+   本项目的落法：`observe.extract_observations` 提供**文案**，
+   `validate_observation` / `safety_gate` 决定**要不要问 / 要不要拦**。
 
 ---
 

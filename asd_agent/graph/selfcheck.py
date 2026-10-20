@@ -1,0 +1,299 @@
+# -*- coding: utf-8 -*-
+"""
+Phase 0 验收
+============
+
+图级断言。跑法：
+
+    cd asd_agent && ASD_DB_PATH=/tmp/graph_selfcheck.db \\
+        ../.venv/bin/python -m graph.selfcheck
+
+★ 写断言前先读一遍被断言的节点（PROGRESS.md 阶段 4 坑 2 / 阶段 4b 坑 1-2，
+  两次都是"按直觉写断言，第一次跑就误报 3 条，挡住的全是正确行为"）。
+  下面每条断言的依据写在注释里，凭据是节点源码或实测输出，
+  不是"应该就是这样"。
+
+★ 关于 interrupt 的验证方式
+----------------------------
+澄清分支在 `--no-llm` 下**永远进不去**（`validate_observation` 里
+`degraded` 为真时恒判 false —— 降级时打断家长只会得到"我不知道"）。
+所以要验 interrupt 往返，就得让图**带着一份已抽好的 observation 进去**。
+
+那不是 mock，是真数据：`ObservationBatch` 的字段全部来自 `schema.py`
+的真实约束，`model_dump` 出来就是 `ObservationOutcome.model_dump` 的形状。
+这里手工构造它，是因为 Phase 0 不该依赖 LLM 存活才能验编排 ——
+编排的断言必须能在**模型挂了**的情况下也跑出来，这正是它的价值所在。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
+import observe                                          # noqa: E402
+import redflag                                          # noqa: E402
+import schema                                           # noqa: E402
+import store                                            # noqa: E402
+from langgraph.types import Command                     # noqa: E402
+
+from .builder import build_graph                        # noqa: E402
+from .checkpointer import saver_for, close_all          # noqa: E402
+from .state import thread_config, fork_config           # noqa: E402
+
+DB = os.getenv("ASD_DB_PATH", "/tmp/graph_selfcheck.db")
+CID = "graph-check"
+
+
+def _counts(conn, cid: str) -> dict:
+    q = lambda t: conn.execute(          # noqa: E731
+        f"SELECT count(*) AS n FROM {t} WHERE child_id=%s", (cid,)).fetchone()["n"]
+    return {"observations": q("observations"),
+            "sessions": q("sessions"),
+            "skill_state": q("skill_state")}
+
+
+def _seed_observation(*, needs_clarification: bool,
+                      question: str, source: str) -> dict:
+    """构造一份**真实 schema 约束下**的 observation dump（非降级）。"""
+    ev = schema.Observation(
+        scene="indoor_play", behavior="refusal", antecedent="unclear",
+        consequence="none", intensity=2, duration_sec=None,
+        people_present=["mother"], raw_quote="他今天不太配合",
+        spans=[], confidence=0.5,
+        needs_clarification=needs_clarification,
+        clarifying_question=question if needs_clarification else None)
+    out = observe.ObservationOutcome(
+        source_text=source, date="", events=[ev],
+        redflags=redflag.CLEAN,
+        degraded=False)          # ★ 非降级 —— 这是澄清分支能进的前提
+    return out.model_dump(mode="json")
+
+
+def main() -> int:
+    ok = True
+
+    def check(label, cond, extra=""):
+        nonlocal ok
+        ok = ok and bool(cond)
+        print(f"  {'✓' if cond else '✗'} {label}{('  ' + str(extra)) if extra else ''}")
+
+    store.reset(DB)
+    conn = store.connect(DB)
+    store.ensure_child(conn, CID)
+    g = build_graph(saver_for(DB))
+
+    # =============================================== 1. 干净输入直通
+    print("\n[1] --no-llm：降级路径一路走到 publish")
+    d1 = "2026-10-20"
+    cfg1 = thread_config(CID, d1)
+    text = "今天在客厅玩积木，他自己拿了两块叠起来，然后拿给我看。"
+    out = g.invoke({"child_id": CID, "date": d1, "parent_text": text,
+                    "no_llm": True}, cfg1)
+    tr = out.get("trace", [])
+    check("没停在 interrupt", g.get_state(cfg1).next == (),
+          g.get_state(cfg1).next)
+    check("走完 extract → safety → publish",
+          tr == ["record_intake", "extract_observation", "validate_observation",
+                 "safety_gate", "publish"], tr)
+    check("降级时恒不打断（问也只会得到「我不知道」）",
+          out.get("needs_clarification") is False)
+    check("红旗干净", (out.get("verdict") or {}).get("highest") == "",
+          (out.get("verdict") or {}).get("reasons"))
+    check("★ 降级时一条 observation 都不编造",
+          out.get("observation_ids") == [], out.get("observation_ids"))
+    c1 = _counts(conn, CID)
+    check("业务表零写入", c1 == {"observations": 0, "sessions": 0, "skill_state": 0}, c1)
+
+    # =============================================== 2. interrupt 能停
+    print("\n[2] ⚡ 澄清 interrupt 能停住")
+    d2 = "2026-10-21"
+    cfg2 = thread_config(CID, d2)
+    obs2 = _seed_observation(needs_clarification=True,
+                             question="是哪个环节不配合？当时在做什么？",
+                             source="他今天不太配合")
+    stop = g.invoke({"child_id": CID, "date": d2, "no_llm": True,
+                     "parent_text": "他今天不太配合",
+                     "observation": obs2, "observed_text": "他今天不太配合",
+                     "clarifying_question": "是哪个环节不配合？当时在做什么？"},
+                    cfg2)
+    check("首次调用停在 interrupt（不返回）",
+          g.get_state(cfg2).next == ("clarify",),
+          f"next={g.get_state(cfg2).next}")
+    snap2 = g.get_state(cfg2)
+    check("★ 图确实停在 clarify 节点上", snap2.next == ("clarify",), snap2.next)
+    check("interrupt 前节点都跑过了",
+          any(t.startswith("extract_observation")
+              for t in (snap2.values or {}).get("trace", [])),
+          (snap2.values or {}).get("trace"))
+    check("interrupt 后节点没跑（safety_gate 还没到）",
+          not any(t.startswith("safety_gate")
+                  for t in (snap2.values or {}).get("trace", [])),
+          (snap2.values or {}).get("trace"))
+    check("interrupt 前业务表仍是空的",
+          _counts(conn, CID) == c1, _counts(conn, CID))
+
+    # =============================================== 3. resume 接上
+    print("\n[3] resume 接上，且节点被重跑")
+    final = g.invoke(Command(resume={"answer": "其实是我让他先洗手，他就不玩了",
+                                     "skip": False}), cfg2)
+    tr2 = final.get("trace", [])
+    print(f"     trace = {tr2}")
+    check("resume 后走完了后续节点", tr2[-1] == "publish", tr2[-1:])
+    check("澄清回答已并入语料（是追加，不是替换）",
+          "不太配合" in final.get("clarified_text", "")
+          and "先洗手" in final.get("clarified_text", ""),
+          repr(final.get("clarified_text")))
+    check("answer 落到 state", "先洗手" in final.get("clarification_answer", ""))
+    check("澄清只发生一次（循环出口守卫生效，没有反复追问）",
+          tr2.count("clarify") == 1, f"clarify × {tr2.count('clarify')}")
+
+    # --- 重跑这件事本身，用一个专门的探针图验 ---
+    check("★ interrupt 恢复会重跑所在节点（PG checkpointer 下实测）",
+          _probe_rerun(), "见 _probe_rerun 的 docstring：这条是整个副作用约束的依据")
+
+    # =============================================== 4. 重复 resume 不重复写库
+    print("\n[4] ★ 副作用只发生一次")
+    n_obs = conn.execute(
+        "SELECT count(*) AS n FROM observations WHERE child_id=%s",
+        (CID,)).fetchone()["n"]
+    check("★ 降级路径一条都没落库（publish 里 degraded 为真就不写）", n_obs == 0, n_obs)
+
+    # =============================================== 5. time travel
+    print("\n[5] time travel")
+    snaps = list(g.get_state_history(cfg2))
+    check("★ 能读出多个 checkpoint", len(snaps) >= 4, f"{len(snaps)} 个")
+    check("snapshot 有 values / next / config / metadata",
+          all(hasattr(s, "values") for s in snaps) and all(hasattr(s, "metadata") for s in snaps))
+    last = g.get_state(cfg2)
+    check("跑完后图已结束", last.next == (), last.next)
+    check("metadata 带 step（Phase 5 audit 的现成来源）",
+          last.metadata.get("step") is not None,
+          {k: last.metadata.get(k) for k in ("step", "source")})
+    mid = next((s for s in snaps if (s.values or {}).get("parent_text")), None)
+    check("找得到可 fork 的中间态", mid is not None)
+
+    # =============================================== 6. 分叉不污染
+    print("\n[6] 分叉隔离（方案 §5.5 的技术前提）")
+    hist_before = len(list(g.get_state_history(cfg2)))
+    counts_before = _counts(conn, CID)
+    if mid is not None:
+        edited = {**(mid.values or {}),
+                  "parent_text": "他今天不太配合（其实做了）"}
+        fcfg = fork_config(CID, d2, "manual")
+        forked = g.invoke(edited, fcfg)
+        check("分叉跑通", "trace" in forked, forked.get("trace"))
+        # ★ 分叉的语义是"从某个历史态另起一条"，
+        #   所以它**继承**历史 state（含澄清回答），但写在**另一个 thread** 上。
+        #   之前我断言"新 thread 不含澄清回答"，那是在断言一个从未被要求过的性质 ——
+        #   而且它恰好把方案 §5.5 要的能力（把昨天的输入改掉再看今天怎么变）
+        #   断言成了"不该继承"。
+        check("分叉带进了编辑内容",
+              "其实做了" in (forked.get("parent_text") or ""),
+              forked.get("parent_text"))
+        check("★ 分叉落在与原 thread 不同的 thread_id 上",
+              fcfg["configurable"]["thread_id"]
+              != cfg2["configurable"]["thread_id"],
+              fcfg["configurable"]["thread_id"])
+
+    check("★ 原 thread 的 checkpoint 数不变",
+          len(list(g.get_state_history(cfg2))) == hist_before,
+          f"{hist_before} → {len(list(g.get_state_history(cfg2)))}")
+    check("★ 原 thread 的 state 不变（编辑没串过去）",
+          "其实做了" not in json_str(g.get_state(cfg2).values))
+    check("★ 业务表行数不变", _counts(conn, CID) == counts_before,
+          f"{counts_before} → {_counts(conn, CID)}")
+
+    # =============================================== 7. thread_id 不可复用
+    print("\n[7] thread_id 不可复用（同名 run 的 checkpoint 会累积）")
+    n_a = len(list(g.get_state_history(cfg2)))
+    g.invoke({"child_id": CID, "date": d2, "no_llm": True,
+              "parent_text": "又跑一次同样的日期"}, cfg2)
+    n_b = len(list(g.get_state_history(cfg2)))
+    check("★ 同名 thread 第二次跑会追加 checkpoint（所以生产上用日期做后缀）",
+          n_b > n_a, f"{n_a} → {n_b}")
+
+    # =============================================== 8. 安全闸门
+    print("\n[8] 安全闸门（纯正则，零 token）")
+    d8 = "2026-10-24"
+    cfg8 = thread_config(CID, d8)
+    # redflag.scan 的已知真阳性：verify_schema 的 C11
+    out8 = g.invoke({"child_id": CID, "date": d8, "no_llm": True,
+                     "parent_text": "他最近不太喜欢那个旋转的玩具，看到就走开，"
+                                    "然后会去咬自己的袖子。"}, cfg8)
+    v8 = out8.get("verdict") or {}
+    check("C11 命中 urgent", v8.get("highest") == "urgent", v8.get("highest"))
+    check("走 escalate 而非 publish",
+          (out8.get("trace") or [])[-1] == "escalate", (out8.get("trace") or [])[-1:])
+    check("★ escalate 暂停计划生成", (out8.get("escalation") or {}).get("paused") is True)
+    check("escalate 给了转诊指引",
+          bool((out8.get("escalation") or {}).get("guidance")))
+
+    close_all()
+    print("\n" + ("✓ Phase 0 图级验收全绿" if ok else "✗ 有失败项，见上"))
+    return 0 if ok else 1
+
+
+def _probe_rerun() -> bool:
+    """★ 单独验「`interrupt()` 恢复时会重跑所在节点」。
+
+    为什么不在真图上验：真图的生产节点**在 interrupt 之前不做任何副作用**
+    （那正是本项目的硬约束），所以真图里根本没有可观测的重跑痕迹 ——
+    这恰恰说明约束被遵守了，而不是说明重跑不存在。
+
+    所以这里用一个**故意违规**的探针节点：它在 interrupt 之前原地改 state。
+    若重跑发生，那一行会出现两次。
+
+    ★★ 一个必须记住的实测结果（2026-10-20）
+    --------------------------------------
+    **这个现象只在 PostgresSaver 下出现，用 InMemorySaver 验不出来。**
+    实测同一个探针：
+        InMemorySaver → ['before_interrupt', 'after']              （重跑没留下痕迹）
+        PostgresSaver → ['before_interrupt', 'before_interrupt', 'after']
+
+    后果很具体：谁要是拿 InMemorySaver 写个单测，看到"只执行了一次"，
+    就会推断"恢复不会重跑节点"，然后放心地在 interrupt 之前写库 ——
+    然后在生产（用 PG）上双写。所以这个探针**必须用生产 saver**，
+    且这条结论要跟着代码一起走，别只在测试里成立。
+    """
+    from typing import TypedDict
+    from langgraph.graph import START, END, StateGraph
+    from langgraph.types import interrupt
+
+    class P(TypedDict, total=False):
+        hits: list[str]
+
+    def probe(state) -> dict:
+        hits = state.get("hits", [])
+        hits.append("before_interrupt")       # ← 故意的副作用，用来暴露重跑
+        ans = interrupt("q")
+        hits.append("after")
+        return {"hits": hits}
+
+    pg = StateGraph(P)
+    pg.add_node("probe", probe)
+    pg.add_edge(START, "probe")
+    pg.add_edge("probe", END)
+    gr = pg.compile(checkpointer=saver_for(DB))
+
+    cfg = {"configurable": {"thread_id": "probe-rerun"}}
+    gr.invoke({"hits": []}, cfg)
+    out = gr.invoke(Command(resume="ok"), cfg)
+    hits = out.get("hits", [])
+    print(f"     探针 hits = {hits}")
+    return hits.count("before_interrupt") == 2
+
+
+def json_str(v) -> str:
+    import json
+    try:
+        return json.dumps(v, ensure_ascii=False, default=str)
+    except Exception:
+        return str(v)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

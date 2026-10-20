@@ -13,7 +13,13 @@
 > - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
-> - Phase 0 的三个待建文件与两条必须写死的边界
+> - **Phase 0 已完成**：`asd_agent/graph/` 5 个文件、7 个节点、1 个 ⚡ 澄清 interrupt、
+>   图级验收 9 组断言全绿。`asd_agent/` 现有模块**一行没改**。
+>
+> **★ 一条会静默咬人的实测结果**：`interrupt()` 恢复会重跑所在节点这件事
+> **只在 `PostgresSaver` 下可观测**，用 `InMemorySaver` 写单测会看到"只跑了一次"，
+> 于是推断"恢复不重跑"，再把写库放到 interrupt 之前 —— 上生产就双写。
+> 探针在 `graph/selfcheck.py::_probe_rerun`，别删。
 >
 > **`store.py` 已改：连接加 `autocommit=True`（`store.py:100`）** —— 这不是风格调整。
 > 原长连接非 autocommit + 全项目零 `rollback()` ⇒ 每次读都留下永不结束的事务 ⇒ 连接长期停在
@@ -23,7 +29,8 @@
 > 那些 `commit()` **保留**，别去「清理」。
 > 验证：12/12 离线回归 + 180 并发 0 失败 + HTTP 全链路 + 跑完无 idle-in-transaction。
 >
-> 图本身**还没写**（`asd_agent/graph/` 不存在）。
+> **下一步 = Phase 1**：`schema.py` 加四层字段 → `observe.py` 输出扩层 →
+> 把 Phase 0 已有的澄清 interrupt 接进 HTTP + 前端，并修 `TodayPage.vue` 的 `canSubmit`。
 
 **⚠️ 工作区未提交。** 阶段 5 的 `server.py` + `frontend/` 已写完并通过浏览器实测，
 **PostgreSQL 迁移也已完成**，但都**还没 commit**。`git status`：
