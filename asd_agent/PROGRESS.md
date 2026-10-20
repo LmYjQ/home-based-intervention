@@ -13,10 +13,13 @@
 > - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
-> - **Phase 0 / 1 / 2 均已完成**（2026-10-20）。图级验收 9 → **14 组**断言，
->   `http_selfcheck.py` **9 组**。Phase 1 的接线约束见第四节之二；
+> - **Phase 0 / 1 / 2 / 3 均已完成**（2026-10-21 复核全绿）。图级验收 9 → **14 → 23 组**断言，
+>   `http_selfcheck.py` **9 → 10 组**。Phase 1 的接线约束见第四节之二；
 >   **Phase 3 开工必读 = 第四节之三末尾的「给 Phase 3 的合同」+ 整个第四节之四**
 >   （图长什么样、实质性变更判据、要补的迁移、验收断言；带 ⚠️ 的没重新验证过）。
+> - **★ 下一步 = Phase 4（反馈链）**。**开工前必读 LANGGRAPH.md 顶部的
+>   「🎯 Phase 4 开工前必须知道的四件事」**（暂停的唯一口径、计划链是独立的图、
+>   唯一写库节点、以及 Phase 3 刚为反馈链铺好的路）。
 >
 > **★ 一条会静默咬人的实测结果**：`interrupt()` 恢复会重跑所在节点这件事
 > **只在 `PostgresSaver` 下可观测**，用 `InMemorySaver` 写单测会看到"只跑了一次"，
@@ -54,7 +57,7 @@
 > 小模型跟例子，不跟论述。新规则单独放 `_RULES_LAYERS`，**绝不能动与 verify_schema
 > 逐字对齐的 `_RULES_1_6`**（selfcheck [12] 把这件事变成机器可验的不变量）。
 >
-> **`asd_agent/http_selfcheck.py` 是新增的**（**9 组**）—— `server.py` **不在任何回归集里**，
+> **`asd_agent/http_selfcheck.py` 是新增的**（**9 → 10 组**）—— `server.py` **不在任何回归集里**，
 > 而 Phase 1 往里面接了图。不补这一层就等于把刚做对的东西放在没人守的地方。
 >
 > **Phase 2 ✅（2026-10-20，安全链：红旗落库 + 转诊指引）**。细节见 LANGGRAPH.md 第四节之三：
@@ -75,16 +78,44 @@
 > - 前端新建 `RedFlagBanner.vue`（不复用 `RedFlagList.vue`：一个吃扫描结果无按钮，
 >   一个吃已落库的行要按状态给动作），**置顶**在"今天的安排"之上。
 >
-> **下一步 = Phase 3（计划链）**：`plans` 表加 `status`/`version`；
-> 审批 interrupt（`approve`/`edit`/`reject`）；实质性变更判据（纯 Python）；
-> `planner.plan_week` 的死代码问题。
-> **开工顺序**：先读 `LANGGRAPH.md` 的「🎯 Phase 3 开工前必须知道的四件事」
-> 与「四之四、Phase 3 待接」两节 —— 后者是从旧计划文件搬过来的，
-> 带 ⚠️ 的地方**搬过来时没重新验证**，动手前先读真文件。
-> **别只读这一屏就开工**：Phase 3 会碰 `plans` 迁移与第二个 interrupt，
-> 那两处的结构约束（落库只在 `publish`）踩坏了是**静默双写**。
+> **Phase 3 ✅（2026-10-21，计划链：审批 interrupt + 计划版本化）**。
+> 细节见 LANGGRAPH.md 第四节之四，**Phase 4 必读那一节**：
+> - **"系统排的计划"第一次要家长点头。** `plans` 表从 4 列变 8 列
+>   （`status`/`version`/`approved_by`/`approved_at`）—— 之前"最后写入即生效"，
+>   而"生效"这件事没有任何记录。`status` 沿用 `red_flags` 同一套可变字段约定。
+> - **计划链是独立的一张图**（`graph/plan_graph.py`，thread 前缀 `plan:`），
+>   不是观察图后面接一段。**它与观察图不共用 thread** —— 同 thread 的 invoke
+>   会接着上一次跑，两条链共用的话家长写一段话就会把计划链的 run 续下去。
+> - **实质性变更判据** = `planner.is_substantive_change()`（纯函数、零 token），
+>   比的是**指纹**不是逐字段 diff。逐字段比会把每次重新生成都变成一次打断，
+>   把"只在真变化时审批"这条判据自己吃掉。
+> - **`/api/card` 的卡片缓存搬到新表 `day_cards`**。原先它写 `plans` 表，
+>   于是 `active_plan()` 把一张卡片当成一份已批准的计划端出去 ——
+>   卡片 payload 没有 fingerprint，下次审批拿它比指纹判成"什么都没变"，
+>   **任何真变化都不再打断家长，审批从此静默失效。**
+> - **暂停时落 `status='paused'`**，否则 `/api/card` 会把"今天什么都不做"
+>   当成一份合法计划端出去。
+> - **`planner.plan_week` 的去留已定**：保留作 CLI demo 的周计划，HTTP 走 `pack_day`。
+>   接进 `generate_plan` 是错的（一个是周、一个是天，会每天都判成有变更）。
+>
+> **下一步 = Phase 4（反馈链）**：`sessions` → `outcomes` 语义拆分；
+> `apply_transitions` 幂等键 + `run_id` 隔离；`next_action`
+> （`continue`/`adjust`/`pause`/`escalate`，主体调 `statemachine.propose_transition`）；
+> `/api/feedbacks` 的幂等保护（现在只有 `/api/close` 有）。
+> **开工顺序**：先读 `LANGGRAPH.md` 的「🎯 Phase 4 开工前必须知道的四件事」
+> 与「四之四、Phase 3 ✅ 已完成」那一节 —— 里面有本轮踩到的六个坑。
+> **别只读这一屏就开工**：Phase 4 会碰 `apply_transitions` 的幂等，
+> 那处踩坏了是**静默的状态抖动**（重跑一次多一行转移）。
+>
+> **★ Phase 3 已为反馈链铺好路**（LANGGRAPH.md 顶部第 4 条）：
+> `sessions` 有 `plan_id`/`plan_version`，`store.log_session` 会**自动**把练习
+> 挂到那天生效的那一版计划下（查不到存 NULL，不乱挂）——
+> "这次执行属于哪一版安排"因此有了落点，
+> 而 `apply_transitions` 的幂等键可以用
+> `(child_id, skill_item, run_id, from_state, to_state)`，
+> 其中 `run_id` 由 thread_id + checkpoint_id 派生，分叉天然不撞。
 
-**✅ 工作区已提交**（2026-10-20，分支 `pg-langgraph-baseline`）：
+**✅ 工作区已提交**（2026-10-21，分支 `pg-langgraph-baseline`）：
 ```
 aa70b6d Phase 0：LangGraph 编排层地基
 8a2b221 Phase 1 步 1-2：四层字段 + publish 幂等键重挂
@@ -94,8 +125,22 @@ adbf9aa Phase 1 步 5：前端接上观察链 + 草稿持久化
 a25acc5 Phase 2 步 1：红旗落库能力（规则 + 表 + 节点体）
 14e1f38 Phase 2 步 2：改边 + HTTP 面（escalate 之后仍然走 publish）
 b30c28c Phase 2 步 3：置顶红旗横幅（前端）
+d0dccbf PROGRESS/LANGGRAPH：交接屏更新到 Phase 2
+7d74d2a Phase 3 步 1：计划链底座（plans 版本化 + 实质性变更判据）
+ba68932 Phase 3 步 2：计划链图 + 审批 interrupt
+d082899 Phase 3 步 3：图级验收 14 → 23 组
+78362f4 Phase 3 步 4：审批 interrupt 接进 HTTP（HTTP 自检 9 → 10 组）
+8bf40ec Phase 3 步 5：前端接上计划审批面板
 ```
 每一步都是可 revert 的独立 commit，改既有行为的那步单独成步。
+
+> Phase 3 沿用 Phase 2 的拆法：步 1 只加能力（表 + 判据 + 迁移）不动图的边；
+> 步 2 才建图；步 3 补断言（与建图分开是因为这一轮**没有改既有断言**——
+> 与 Phase 2 不同，Phase 3 没动观察图的边，所以不存在"旧断言把 bug 写成规范"的问题）；
+> 步 4 接 HTTP；步 5 是前端（依赖步 4 的 API）。
+
+**⚠️ 提交时未纳入版本库**：`p3-review-panel.png` / `p3-after-approve.png`
+（Phase 3 手测截图，纯留档）。
 
 > Phase 2 刻意拆成三步而不是一个大 commit：
 > 步 1 只加能力（规则 + 表 + 节点体），**不改图的边**；
@@ -140,9 +185,9 @@ cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
 **三个自检入口**（改图 / 改 server.py 之后必须跑，全绿才算数）：
 ```bash
 cd asd_agent
-ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 14 组
+ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 23 组
 ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
-ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 9 组
+ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 10 组
 ```
 
 **⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用

@@ -3,14 +3,75 @@
 > 配套 `PROGRESS.md`（老规矩：动手前先读那份）。本文件只记 **LangGraph 接入**这件事。
 > 完整设计在 `~/.claude/plans/python-llm-langgraph-hitl-time-travel-i-gleaming-octopus.md`
 > （新 session 不会自动读，需手动打开或让我重述）。
+>
+> **进度：Phase 0 / 1 / 2 / 3 均已完成（2026-10-21 复核全绿）。下一步 = Phase 4（反馈链）。**
 
 ---
 
 ## 🔖 换 session 先看这一屏
 
-**当前阶段：Phase 2 ✅ 已完成（红旗落库 + 转诊指引 + 置顶横幅）。**
-**下一步 = Phase 3（计划链）** —— 开工前先读本节末尾的
-「🎯 Phase 3 开工前必须知道的四件事」，那一屏是为你写的。
+**当前阶段：Phase 3 ✅ 已完成并已提交（计划链 + 审批 interrupt + 计划版本化）。**
+**下一步 = Phase 4（反馈链）。**
+
+### Phase 3 做完什么
+
+**"系统排的计划"第一次要家长点头。** 三条具体后果被修掉：
+
+1. **`plans` 表从 4 列变成 8 列**（`status` / `version` / `approved_by` /
+   `approved_at`）。改之前它只有 `id / child_id / plan_date / created_at / payload`，
+   也就是说"最后写入的那条就是当前生效的计划"——而"生效"这件事没有任何记录。
+2. **新增 ⚡ 审批 interrupt**（`approve` / `edit` / `reject`），
+   挂在**实质性变更**上：连续两天输入相同 → 第二天**不打断家长**。
+3. **`/api/card` 的卡片缓存搬到了新表 `day_cards`**。它原来写的是 `plans` 表，
+   两种东西挤在一张表上的后果见第四节之四。
+
+图级验收 **14 → 23 组**，HTTP 层 **9 → 10 组**，两个自检 2026-10-21 实跑全绿。
+细节见第四节之四。
+
+### 🎯 Phase 4 开工前必须知道的四件事
+
+1. **`store.plan_paused(child_id)` 仍是「暂停计划生成」的唯一口径。**
+   Phase 3 的 `generate_plan` **不自己判断暂停**，它读 `state["paused"]`，
+   而那个值由图入口 `plan_graph.plan_inputs()` 调 `store.plan_paused()` 算好注入。
+   **别在节点体里再写一遍 `exists urgent ...`** —— 那就是第二处定义。
+2. **计划链是独立的一张图**（`graph/plan_graph.py`），thread 前缀 `plan:`。
+   它与观察图**不共用 thread**（`{child}:{date}` vs `plan:{child}:{date}`）：
+   同 thread 的 invoke 会接着上一次跑（第二节 ③ 的实测），
+   两条链共用一个 thread 的话，家长写一段话就会把计划链的 run 续下去。
+   → 反馈链同理：**第三张独立的图**，前缀自己定（`feedback:` / `run:` / `session:`），
+   别图省事挂到观察链的 thread 上。
+3. **计划链的 `publish_plan` 是它唯一写业务表的节点**，排在 ⚡ 之后。
+   `freeze_plan` **不许自己写 `plans` 表** —— 第二个写库节点意味着
+   interrupt 恢复重跑时会双写（第二节 ⑤）。
+   → 反馈链的 `apply_transitions` 同理，它必须是反馈链**唯一**的写库节点。
+4. **实质性变更判据在 `planner.is_substantive_change()`**（纯函数，零 token）。
+   它比的是**指纹**（`planner.plan_fingerprint`），不是逐字段 diff ——
+   逐字段比会把每次重新生成都变成一次打断，于是"只在真变化时审批"
+   这条判据被它自己吃掉了。
+
+★ Phase 4 有一条 Phase 3 刚铺好的路：
+  `sessions` 现在有 `plan_id` / `plan_version` 两列，
+  `store.log_session` 会**自动**把练习挂到那一天生效的那一版计划下
+  （查不到就存 NULL，不乱挂）。
+  反馈链的"这次执行属于哪一版安排"因此有了落点，
+  而 `apply_transitions` 的幂等键也可以用
+  `(child_id, skill_item, run_id, from_state, to_state)` —— 其中 `run_id`
+  由 thread_id + checkpoint_id 派生，分叉天然不撞。
+
+### ⚠️ Phase 4 开工前要知道的两件环境事（本轮实测踩到）
+
+1. **`server.py` 在仓库根目录，不在 `asd_agent/`。**
+   `cd asd_agent && ../.venv/bin/python -m uvicorn server:app` 会
+   `Could not import module "server"`。PROGRESS.md 入口那节的
+   `-c "import uvicorn,server"` 写法（带 `PYTHONPATH=.:./asd_agent`）才是对的。
+2. **PG 容器是 `--rm` 的，跑完就没了。**
+   2026-10-21 复核时 `ganyu_pg` 已不存在，连接直接 `Connection refused`。
+   每次开工第一步先 `docker ps -a --filter name=ganyu_pg`，没有就按
+   PROGRESS.md 那条 `docker run` 重起（**端口绑 127.0.0.1**）。
+
+Phase 2 做完什么（回顾）：
+
+**红旗从"响应里飘一次"变成长期记录。**
 
 ### Phase 2 做完什么
 
@@ -595,84 +656,215 @@ open → acknowledged | closed ；acknowledged → closed | open ；closed → o
 
 ---
 
-## 四之四、Phase 3 待接（还没画这部分图）
+## 四之四、Phase 3 ✅ 已完成（2026-10-21 提交）：计划链 + 审批 interrupt
 
-> 本节是从旧计划文件（`~/.claude/plans/python-llm-langgraph-hitl-time-travel-i-gleaming-octopus.md`
-> 「Phase 3」那一节）搬过来的，**新 session 不会自动读那份计划文件**。
-> 标 ⚠️ 的地方是**搬过来时没重新验证的**，动手前先读一遍真文件确认。
-
-### 图长什么样（Phase 3 接完之后）
+### 图长什么样（接完之后）
 
 ```
-… → safety_gate → (urgent? escalate ─────────────→ publish → END)
-                 └─ no → select_goal → retrieve_activities → generate_plan
-                                                          ↓
-                                                    validate_plan
-                                                          ↓
-                                          substantive_change?  ← 纯 Python 判据
-                                       ├─ 是 → ⚡ approve(approve|edit|reject)
-                                       │         edit → 回 retrieve_activities
-                                       └─ 否 ─┴─→ freeze_plan → publish → END
+START → select_goal → retrieve_activities → generate_plan → validate_plan
+                → substantive_change? ──是──→ ⚡ approve_plan ─┐
+                                                       approve ─┤
+                                                       reject ──┤→ freeze_plan
+                                                              │
+                                          否 ──────────────────┘
+                                                                  ↓
+                                                          publish_plan → END
 ```
 
-★ **注意两条支路最后都汇到 `publish`。** 红旗写入在 Phase 2 已经归它了
-（第四节之三），Phase 3 不要再造第二个写库节点。
+**★ 计划链是独立的一张图**（`graph/plan_graph.py`），不是观察图后面接一段。
+技术方案 §5.1 画的是同一张图，落地时拆开了，三个理由：
 
-### 实质性变更判据（纯 Python，`graph/nodes.py`）
+1. **触发时机不同。** 观察链由「家长写了一段话」触发，
+   计划链由「家长打开今天 / 重新生成」触发。焊在一起的话，
+   家长写一句"今天他在超市捂耳朵"就会重排一次计划 ——
+   而他要的是被记下来。
+2. **thread_id 会打架。** 同 thread 的 `invoke` 会**接着上一次跑**
+   （第二节 ③ 的实测）。两张图共用 `{child}:{date}` 的话，
+   家长写一段话就会把计划链的 run 续下去。
+   计划链用 `plan:` 前缀，与草稿的 `draft:` 一样是**命名空间隔离**。
+3. **写库节点会变成两个。** 观察图的 `publish` 写 observations + red_flags，
+   计划链的 `publish_plan` 写 plans。两条链各有各的末尾写库节点，
+   各自满足「所有 interrupt 之后才落库」。
 
-`validate_plan` 比对 draft 与当前 active 版本，命中任一条即 interrupt：
+### ★ 实质性变更判据（纯 Python，`planner.is_substantive_change`）
 
-- `target_skill_items` 集合不同
-- 任一活动的 `materials` 集合不同
-- 任一活动的 `difficulty` 不同
-- 任一活动的 `prompt_hierarchy` **起点提示级别**不同
-- `safety_gate` 在本轮触发过
-- 计划跨度数 > 1 天（跨天安排需家长知情）
+判据只有一条，但它是**整个 Phase 3 的守门人**：
+「这份草稿与当前生效的那一版有没有实质区别」。
 
-**这不是简化方案 §5.1，是修正它的一个内在矛盾**：方案 §1.2 写
-"小步计划、低压力、避免每次游戏都变成训练"，而主图
-`generate_plan → approve_plan(interrupt)` 意味着每天多点一次，
-与 §10.3 自己列的"用户留存和家长负担"指标冲突。
-变更是**可判定的**，所以判据必须是代码而不是措辞。
+比的是**指纹**（`planner.plan_fingerprint`），不是逐字段 diff。指纹只收
+**会影响执行**的字段：目标技能集合、每条活动的材料集合 / 难度 /
+**提示阶梯起点级别** / 时长。
 
-★ 落地时的坑：上面每一条都要求**拿得到"当前 active 版本"**，
-而 `plans` 表现在没有 `status`。迁移补上 `status` 时，
-`active` 版本的查询口径要写死在一个函数里（与 `store.plan_paused` 同款理由）。
+★ 为什么用指纹而不是逐字段比：
+  审批要回答的是"有没有**实质区别**"，而家长点"重新生成"之后
+  卡片文案（why_this / 家长提醒）几乎必然不同 —— 那不是实质区别，
+  那是同一次安排的两种说法。逐字段比会把每次重新生成都变成一次打断，
+  于是"只在真变化时审批"这条判据**被它自己吃掉了**。
 
-### 必须做的迁移
+★ 判据的六条（任一命中即算变更）：
+  · 目标技能集合不同
+  · 任一活动的材料集合不同
+  · 任一活动的难度不同
+  · 任一活动的**提示阶梯起点级别**不同
+    （只取 `prompt_hierarchy[0]`，即"从哪一级开始提示"；
+      阶梯中间那级变了不影响执行）
+  · `safety_gate` 在本轮触发过
+  · 计划跨度数 > 1 天
 
-| 表 | 补什么 |
+★ 改难度 / 改材料 / 改起点提示级别，各自都能触发 ——
+  自检 [18] 组实测：`daily_minutes` 从 30 砍到 12 →
+  `['不再练：命名物体、因果理解、涂鸦、踢球', '去掉活动：fin-008、gro-006']`。
+
+### 必须做的迁移（已做）
+
+| 表 | 补什么 | 为什么 |
+|---|---|---|
+| `plans` | `status` / `version` / `approved_by` / `approved_at` | 之前"最后写入即生效"，而"生效"没有任何记录 |
+| `sessions` | `plan_id` / `plan_version` | 练习记录要能回答"孩子做的是哪一版安排下的" |
+| `day_cards`（**新表**） | `/api/card` 的当天卡片缓存 | 见下 |
+
+★ **迁移不是 `CREATE TABLE IF NOT EXISTS` 就完事的**：
+  那个语句**不会给已存在的表加列**。实测报
+  `UndefinedColumn: column "status" does not exist` ——
+  在**新库**上全绿，在**用过的库**上直接炸，而那正是开发中天天在用的那个。
+  → 补列走 `_migrate()` 里的 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`（幂等）。
+
+★ 而且**索引不能建在补列之前**：
+  建表块里引用 `status` 列的 `CREATE INDEX` 会在老库上先炸一次。
+  补列与建索引必须都在 `_migrate()` 里，且**索引跟着补列走**。
+
+### ★ `/api/card` 的卡片缓存必须搬出 `plans`
+
+原来卡片缓存写的是 `plans` 表。Phase 3 起 `plans` 是**版本化的计划**，
+两者挤在一张表上的后果不是"字段多了几个"：
+
+**`active_plan()` 会把一张卡片当成一份已批准的计划端出去。**
+卡片 payload 里没有 fingerprint，下一次审批就拿它去比指纹，
+判出来是"什么都没变" —— 于是**任何真变化都不会再打断家长**。
+
+这是一个静默到极点的 bug：界面上一切正常，只是审批从此不再生效。
+（实测：`/api/card` 跑完之后 `active_plan()` 返回的就是卡片 payload。）
+
+→ 新表 `day_cards`，`/api/card` 改写 `save_card` / `latest_card`。
+
+### 审批 interrupt 的两阶段协议
+
+| 路由 | 说明 |
 |---|---|
-| `plans` | `status`(draft/pending_review/approved/active/paused/completed/rejected) / `version` / `approved_by` / `approved_at` |
-| `sessions` | `plan_id` / `plan_version`（现在只有裸 `activity_id`） |
+| `POST /api/plan/run` | 跑计划链。**毫秒级，不用 job**（全程纯 Python，零 LLM）。返回 `phase=review\|done` |
+| `POST /api/plan/review` | 回答审批。没有待审批时**必须 409** |
+| `GET /api/plan/status` | 纯读 checkpoint，刷新后靠它发现"还有个计划等你批" |
+| `GET /api/plan/versions` | 某一天的全部版本（家长改过几次、哪一版被拒了） |
 
-### 验收断言（Phase 3 要补的）
+★ **409 守卫与 `/api/observe/resume` 完全同款**：
+  `Command(resume=...)` 打在没有 pending interrupt 的 thread 上，
+  LangGraph 会把它当成**新输入从头跑一遍整条图** ——
+  plans 表里多出一行版本。**不报错、不抛异常，就是数据多了一版。**
+  断言在 `http_selfcheck.py` 的 [10] 组。
 
-- 「只在真变化时审批」：连续两天同计划 → 第二天**不产生 interrupt**；
-  改一项材料 → 产生。（这条是纯 Python 判据唯一的守门人）
-- 审批 interrupt 往返（走 HTTP）+ 重复 resume 被拒（409）
-- **分叉跑出来的计划必须重新过 `safety_gate` 与必要审批**（方案 §5.5 明确要求）——
-  本项目已有实测支撑：分叉必须换 `thread_id`（第二节 ③），
-  而 `fork_config` 已经在 `state.py` 里写好了
+★ **非法 action → 400 而不是 422**：
+  FastAPI 那层**不重复声明** `Literal`（抄一份就是两处口径，
+  抄的那份迟早落后）。语义由图里 `response_schema=PlanReview` 判，
+  报错信息直接用图自己的话："Input should be 'approve', 'edit' or 'reject'"。
 
-### ⚠️ 搬过来没验证的部分
+★ **路由注册顺序很要紧**：
+  `/api/plan/status` 与 `/api/plan/{child_id}` 形状相同，
+  FastAPI 按**声明顺序**匹配。顺序错了，
+  `GET /api/plan/status` 会被当成 `child_id="status"` 命中那条老路由 ——
+  症状是 400「还没有这个孩子的画像」，而那条路由根本没读过 profile。
+  **报错信息完全指不到真正的原因。**
 
-- `coach.py` + `planner.py` 合并成 `generate_plan` + `validate_plan` 的具体接口形状
-- `coach.today` 现在怎么出卡片、`retrieve` 的候选打分能不能直接复用
-  （`activities.retrieve/_hard_filter/_score` 是"原样复用"那一档，见计划文件的保留表）
-- `DailySummary.domain_updates` 默认值是 `(FieldInfo,)` 那个 bug ——
-  计划文件把它排在 Phase 6，并注明**别再手写最小复现**（试了 3 次全失败），
-  正确做法是**直接二分真文件**。Phase 3 重构时顺手做掉。
+### ★ `edit` 的处理与循环守卫
 
----
+`edit` = 家长说"改一下"。这一版的需求是**改**不是**批**，
+所以 `edit` 回到 `retrieve_activities` 再走一遍，然后**不再弹第二次审批**
+（`already_reviewed`）—— 家长已经表达过不满了，再问一次
+"这次可以吗"是在追问而不是在尊重。
+
+守卫有**两条**，缺一不可：
+1. `already_reviewed` —— edit 之后不打断（上面那条）
+2. `edit_loop` + `MAX_EDIT_LOOPS` —— **兜底**。
+   有了 (1) 之后这条在正常路径上够不着，
+   但它守的是"将来有人把 (1) 去掉"之后的世界。
+   而那个环在界面上看不出来（图每轮都"成功"了），
+   唯一的表现是 CPU 一直在转、plans 表一直不写。
+
+★ 两条守卫都留在代码里，是因为删掉 (2) 的人会说"(1) 已经挡住了" ——
+  而这正是删它的理由：(2) 守的正是 (1) 被删掉之后的世界。
+  守卫写在**节点体**里（`approve_plan`）而不是条件边里 ——
+  条件边拿到的是 state 的只读视图，在那里赋值看着生效、下一轮读到的还是旧值。
+
+### `planner.plan_week` 的去留（搬过来的未验证项，已定）
+
+结论：**保留它，但只作为 CLI demo 的周计划**；HTTP 的计划链走 `pack_day`。
+
+- 它**不是死代码** —— `loop.py` 的五日闭环 demo 每天用它排一周
+  （`--no-llm` 时用 `greedy_fallback_plan`）。那是"多 Agent 协作"展示点之一。
+- **接进 `generate_plan` 是错的**：图里的计划链是**一天**的，它是**一周**的。
+  塞进去的话 `validate_plan` 会**每天都判成有变更**（七天内容各不相同），
+  于是每天打断家长一次 —— 正是技术方案 §10.3 要防的"家长负担"。
+- LANGGRAPH.md 第四节之三真正要防的是"**看起来发生过而其实没有**"：
+  读代码的人以为"LLM 出了个计划"，而 HTTP 上根本没有 LLM 参与。
+  → 边界写在 `planner.plan_week` 的 docstring 里。
+
+### 本轮踩到的坑（已修，勿回退）
+
+1. **`current_fingerprint` 忘了带进图 → 第二天输入完全相同也弹审批。**
+   理由还写着"第一次生成计划"（因为 `active_plan` 返回 None）。
+   实测：补上之后，第二天 `needs_review=False`，一路跑到 `publish_plan`。
+   ★ 指纹取的是**存进去时算好的那份**，不是现在从活动库重算 ——
+   活动库改了一条活动的难度，会让一份半年前的计划凭空变成"有变更"，
+   而那次变更根本没人提过。
+2. **暂停的那份计划落成了 `status='active'`** ——
+   `/api/card` 读到它会把"今天什么都不做"当成一份合法计划端出去。
+   → 暂停落 `status='paused'`，`latest_plan` 读不到它。
+3. **`PlanRequest` 是 dataclass、`PreferenceSet` 是 Pydantic**，
+   放进 state 后 msgpack 打出
+   `Deserializing unregistered type ... will be blocked in a future version`。
+   也就是说**今天能读、明天可能直接 raise**，而 checkpoint 的寿命比代码长。
+   → 新增 `activities.request_to_dict` / `request_from_dict`，
+   state 存**纯 dict**（与 observation 存 dict 同一条理由）。
+4. **`edit` 的计数写在条件边里 → 守卫形同虚设**（见上）。
+5. **路由顺序 → `/api/plan/status` 被参数路由吃掉**（见上）。
+6. **自检里 `o4` 可能未绑定**：`for` 循环第一次就 break 时变量不存在。
+   写断言前先想清楚循环体可能跑几次（PROGRESS.md 阶段 4 坑 2 的同款）。
 
 ## 五、待确认 / 遗留
+
+**Phase 4 开工时该优先解决的三条**（按建议顺序，均在下面有详述）：
+
+| # | 问题 | 位置 |
+|---|---|---|
+| 1 | `/api/feedbacks` **无幂等保护**，重复提交让 `refusal_counts` 翻倍误触冷却阈值 2 | 下面「Phase 1 之前就有的」 |
+| 2 | `apply_transitions` 幂等键要加 `run_id` 隔离，否则**重跑一次多一行转移**（静默的状态抖动） | 顶部「Phase 4 铺好的路」 |
+| 3 | `/api/card` 与计划链两条独立路径，Phase 4 合并（让卡片**读**已生效计划） | 下面「Phase 3 期间新发现的」 |
+
+**Phase 3 期间新发现的：**
+
+- **计划链与 `/api/card` 是两条独立的路径，虽然现在结果一致。**
+  两者都走 `pack_day` + 同一个 `PlanRequest`，实测选出的活动完全相同
+  （`['gro-007', 'gro-006', 'fin-008']`）—— 但那是**当前恰好一致**，
+  不是结构上保证一致。将来任何一个改了装箱规则（比如 `/api/card` 加了
+  教练诊断的焦点优先），两条路就会分叉，
+  而家长看到的卡片与被批准的计划不是同一份。
+  → Phase 4 应当让 `/api/card` **读**已生效的计划，而不是自己再排一次。
+- **计划链目前不产生卡片。** 它排的是"今天做哪几条"，
+  卡片（步骤 / 提示阶梯 / 退路）仍然只有 `/api/card` 那条 LLM 路径能出。
+  家长批准的是"做哪几条"，看不到"具体怎么做" ——
+  这在 Phase 4 合并两条路径时一并解决。
+- **暂停仍然没有过期策略。** urgent 没人关就永远停着计划生成。
+  Phase 3 **没有**重新审视它 —— 结论是**维持现状**：
+  这是正确的临床默认（fail-closed），横幅让它可见可操作，
+  而 Phase 3 引入的 `plans.status='paused'` 让"停着"这件事**有了一条记录**
+  （以前是静默的）。要加过期策略仍只改 `store.plan_paused` 那一条 SQL。
+- **审批只发生在"计划变了"时，而计划变了多半来自家长自己的反馈。**
+  也就是说：家长填完昨天的反馈 → 今天的计划变了 → 要家长再点一次批准。
+  听起来绕，但它保证了"每天点一次"不会发生 ——
+  变的只有**实质**部分（技能/材料/难度/提示级别），文案变了不算。
 
 **Phase 2 期间新发现的：**
 
 - **暂停没有过期策略。** urgent 没人关就永远停着计划生成。
-  我认为这是正确的临床默认（fail-closed）且横幅让它可见可操作，
-  但 Phase 3 应该重新审视一次 —— 到时改 `store.plan_paused` 那一条 SQL。
 - **红旗状态变更没有完整审计。** 现在只有 `status_changed_at` 记时点，
   没有"谁在什么时候从什么改成了什么"。留给 Phase 5 的 `workflow_audit_events`。
 - **`ON CONFLICT DO NOTHING` 会消耗 sequence 值**，所以 `red_flags.id` 有跳号
