@@ -732,3 +732,63 @@ def load_all_for_cli() -> list[Activity]:
 
 if __name__ == "__main__":
     _cli()
+
+
+# ================================================================== PlanRequest 序列化
+def request_to_dict(req: PlanRequest) -> dict:
+    """`PlanRequest` → **纯 dict**（给 checkpoint 用）。
+
+    ★ 为什么必须转：LangGraph 的 checkpointer 用 msgpack 序列化 state，
+      而 `PlanRequest` 是 dataclass、`PreferenceSet` 是 Pydantic 模型 ——
+      两者都"不在默认允许的模块里"。实测存进去时已经打出警告：
+      `Deserializing unregistered type activities.PlanRequest from checkpoint.
+      This will be blocked in a future version.`
+      也就是说**今天能读、明天可能直接 raise**，而 checkpoint 的寿命比代码长。
+
+      与 `graph/state.py` 里 `observation` 存 dict 而不是对象是同一条理由，
+      只是这里更隐蔽：对象存在时序列化看着是成功的。
+
+    两个集合字段（`materials_at_home` / `success_history_ids`）转成 list，
+    反序列化时再转回 set —— 检索器里它们只被 `in` / 差集用，
+    而把 set 存成 list 会让"集合相等"这个判据变得不可靠
+    （`{'a'}` 与 `['a']` 在 msgpack 里是两个不同的值）。
+    """
+    return {
+        "levels": dict(req.levels),
+        "target_states": dict(req.target_states),
+        "priority_domains": list(req.priority_domains),
+        "daily_minutes": req.daily_minutes,
+        "materials_at_home": sorted(req.materials_at_home),
+        "avoid_load_sensory": req.avoid_load_sensory,
+        "known_refusals": list(req.known_refusals),
+        "refusal_counts": dict(req.refusal_counts),
+        "success_counts": dict(req.success_counts),
+        "recent_activity_ids": list(req.recent_activity_ids),
+        "success_history_ids": sorted(req.success_history_ids),
+        "recent_scenes": list(req.recent_scenes),
+        "successes_outside_home": dict(req.successes_outside_home),
+        "preferences": req.preferences.model_dump(mode="json"),
+        "recent_summary": list(req.recent_summary),
+    }
+
+
+def request_from_dict(d: dict) -> PlanRequest:
+    """`request_to_dict` 的逆。**老 checkpoint 缺字段时取默认值** ——
+    加字段不能让半年前那次 run 读不出来。"""
+    return PlanRequest(
+        levels=d.get("levels") or {},
+        target_states=d.get("target_states") or {},
+        priority_domains=d.get("priority_domains") or [],
+        daily_minutes=int(d.get("daily_minutes") or 30),
+        materials_at_home=set(d.get("materials_at_home") or []),
+        avoid_load_sensory=bool(d.get("avoid_load_sensory")),
+        known_refusals=list(d.get("known_refusals") or []),
+        refusal_counts=d.get("refusal_counts") or {},
+        success_counts=d.get("success_counts") or {},
+        recent_activity_ids=list(d.get("recent_activity_ids") or []),
+        success_history_ids=set(d.get("success_history_ids") or []),
+        recent_scenes=list(d.get("recent_scenes") or []),
+        successes_outside_home=d.get("successes_outside_home") or {},
+        preferences=PreferenceSet.model_validate(d.get("preferences") or {}),
+        recent_summary=list(d.get("recent_summary") or []),
+    )

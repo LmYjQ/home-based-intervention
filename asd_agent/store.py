@@ -190,14 +190,49 @@ def _init(c: psycopg.Connection) -> None:
     );
     CREATE INDEX IF NOT EXISTS idx_state_child ON skill_state(child_id, skill_item, id);
 
+    -- ★ Phase 3：/api/card 的**当天卡片缓存**搬到这里。
+    --   为什么必须搬：原来它写的是 plans 表，而 Phase 3 起 plans 表是
+    --   **版本化的计划**（有 status / version / 指纹）。
+    --   两者挤在一张表上的后果不是"字段多了几个"，而是
+    --   **`active_plan()` 会把一张卡片当成一份已批准的计划端出去** ——
+    --   卡片 payload 里没有 fingerprint，下一次审批就会拿它去比指纹，
+    --   判出来是"什么都没变"，于是**任何真变化都不会再打断家长**。
+    --   这是一个静默到极点的 bug：界面上一切正常，只是审批从此不再生效。
+    --   （实测：/api/card 跑完之后 active_plan() 返回的就是卡片 payload。）
+    CREATE TABLE IF NOT EXISTS day_cards (
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        child_id    TEXT NOT NULL REFERENCES children(child_id),
+        card_date   TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        payload     TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_card_child ON day_cards(child_id, card_date DESC);
+
+    -- ★ Phase 3：plans 从「每天一张卡片」变成「版本化的计划」。
+    --   改它之前那张表只有 4 列，没有 status / version —— 那意味着
+    --   "最后写入的那条就是当前生效的计划"，而"生效"这件事没有任何记录。
     CREATE TABLE IF NOT EXISTS plans (
         id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         plan_date   TEXT NOT NULL,
         created_at  TEXT NOT NULL,
-        payload     TEXT NOT NULL
+        payload     TEXT NOT NULL,
+        -- ★ 全项目第二个可变的业务字段（第一个是 red_flags.status），
+        --   边界与那里完全一致：行的身份（哪天、什么内容）append-only，
+        --   只有 status 在动，且只由**家长的确认**驱动。
+        status      TEXT NOT NULL DEFAULT 'active',
+        version     INTEGER NOT NULL DEFAULT 1,
+        approved_by TEXT NOT NULL DEFAULT '',
+        approved_at TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_plan_child ON plans(child_id, plan_date DESC);
+    -- ★ idx_plan_active（"当前生效的那一版"）刻意**不在这里**建，
+    --   它建在 `_migrate()` 里。理由是一个实测出来的失败：
+    --   这个 CREATE 块里引用 `status` 列，而 status 是 ALTER 加上去的 ——
+    --   对一个**已经存在**的 plans 表，`CREATE TABLE IF NOT EXISTS` 整条跳过，
+    --   于是下面的索引语句去找一个还不存在的列，直接
+    --   `UndefinedColumn: column "status" does not exist`。
+    --   建表语句与补列语句必须分开，且**索引跟着补列走**。
 
     CREATE TABLE IF NOT EXISTS sessions (
         id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -300,7 +335,43 @@ def _init(c: psycopg.Connection) -> None:
     CREATE INDEX IF NOT EXISTS idx_rf_child_status
         ON red_flags(child_id, status, observed_at DESC);
     """)
+    _migrate(c)
     c.commit()
+
+
+# ================================================================== 迁移
+def _migrate(c: psycopg.Connection) -> None:
+    """★ 补列。`CREATE TABLE IF NOT EXISTS` **不会**给已存在的表加列。
+
+    这是 Phase 3 踩到的第二个"纸面上看不见"的坑（第一个是 autocommit）：
+    `_init` 里那张 `CREATE TABLE IF NOT EXISTS plans (...)` 写全了新列，
+    但那个 schema 上一轮已经建过表了 —— IF NOT EXISTS 整条跳过，
+    于是代码里 `SELECT status FROM plans` 在**新库**上全绿、
+    在**用过的库**上直接 `UndefinedColumn`，而那个库正是开发中天天在用的那个。
+
+    `ADD COLUMN IF NOT EXISTS` 让两件事同时成立：新库建表时列就在，
+    老库进来时补上，而且补多少次都一样（幂等）。
+    刻意不写成"改 schema 文件然后 drop 重建" —— 那会让 demo 库的历史全丢。
+    """
+    for ddl in (
+        # plans：Phase 3 加的四列。默认值让**老行**有意义：
+        # 老行是 Phase 2 之前写的卡片缓存，一律按"已生效的第 1 版"对待。
+        "ALTER TABLE plans ADD COLUMN IF NOT EXISTS "
+        "status TEXT NOT NULL DEFAULT 'active'",
+        "ALTER TABLE plans ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE plans ADD COLUMN IF NOT EXISTS approved_by TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE plans ADD COLUMN IF NOT EXISTS approved_at TEXT NOT NULL DEFAULT ''",
+        # sessions → plans：练习记录挂在**哪一版计划**下面。
+        # 没有这个外键，"计划改了"与"孩子做过什么"就分属两个时空，
+        # 而状态机拿 sessions 去算状态转移时根本不知道该按哪版的目标难度。
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS plan_id BIGINT",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS plan_version INTEGER NOT NULL DEFAULT 0",
+    ):
+        c.execute(ddl)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_plan_active "
+              "ON plans(child_id, status, plan_date DESC, version DESC)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_session_plan "
+              "ON sessions(child_id, plan_id)")
 
 
 # ================================================================== 写入
@@ -346,15 +417,160 @@ def append_state(conn: psycopg.Connection, child_id: str, transition) -> int:
     return int(row["id"])
 
 
-def save_plan(conn: psycopg.Connection, child_id: str, plan_date: str, payload) -> int:
+def save_plan(conn: psycopg.Connection, child_id: str, plan_date: str, payload,
+              *, status: str = "active", version: int = 1,
+              approved_by: str = "", approved_at: str = "") -> int:
     row = conn.execute(
-        "INSERT INTO plans(child_id,plan_date,created_at,payload) "
-        "VALUES(%s,%s,%s,%s) RETURNING id",
+        "INSERT INTO plans(child_id,plan_date,created_at,payload,status,version,"
+        "approved_by,approved_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (child_id, plan_date, date.today().isoformat(),
+         payload.model_dump_json() if hasattr(payload, "model_dump_json")
+         else json.dumps(payload, ensure_ascii=False),
+         status, version, approved_by, approved_at)).fetchone()
+    conn.commit()
+    return int(row["id"])
+
+
+#: 计划版本的 status 词表。**刻意与 redflag.ALLOWED_TRANSITIONS 同一套形状**：
+#: 纯数据 + 一个纯函数判转移，执行留在 store（理由见 LANGGRAPH.md 第四节之三）。
+PLAN_STATUSES = ("draft", "pending_review", "approved", "active",
+                 "paused", "completed", "rejected")
+
+#: 只有 approved 与 active 算「这份计划算数」。
+PLAN_LIVE = ("approved", "active")
+
+#: draft → pending_review → approved → active → completed，另有 rejected / paused。
+PLAN_ALLOWED_TRANSITIONS: dict[str, set[str]] = {
+    "draft": {"pending_review", "rejected", "paused"},
+    "pending_review": {"approved", "rejected", "paused"},
+    "approved": {"active", "rejected", "paused"},
+    "active": {"completed", "paused", "rejected"},
+    "paused": {"active", "completed", "rejected"},
+    "completed": set(),
+    "rejected": {"draft"},
+}
+
+
+def can_plan_transition(frm: str, to: str) -> bool:
+    """计划状态转移判定。**纯 Python、零 token、可重放**（与 `redflag.can_transition` 同款）。
+
+    ★ 为什么"批准"与"生效"是**两个**状态而不是一个：
+      家长点了批准，不等于此刻已经生效 —— 中间还有 `freeze_plan`
+      要按批准的那一版算出 sessions 挂在哪个 plan_id 下。
+      合成一个状态就意味着"批准"那一刻起 sessions 就已经挂上去了，
+      而那一版可能还没冻结完。
+
+    ★ "完成的计划不许复活"（`completed` 的后继集合是空）：
+      一份家长已经执行完的计划被重新激活，会让状态机拿着旧的目标难度
+      去判新一批记录。`rejected → draft` 是唯一的回头路，
+      因为"被拒绝的那份"仍然值得改成新的一版重提。
+    """
+    if frm == to:
+        return frm in PLAN_ALLOWED_TRANSITIONS
+    return to in PLAN_ALLOWED_TRANSITIONS.get(frm, set())
+
+
+def save_card(conn: psycopg.Connection, child_id: str, card_date: str, payload) -> int:
+    """写当天的卡片缓存。**取代 Phase 3 之前往 plans 表写卡片的那条路。**
+
+    理由见 `_init` 里 `day_cards` 那段注释：卡片与计划是两种东西，
+    挤在一张表上会让 `active_plan()` 把卡片当成已批准的计划。
+    """
+    row = conn.execute(
+        "INSERT INTO day_cards(child_id,card_date,created_at,payload) "
+        "VALUES(%s,%s,%s,%s) RETURNING id",
+        (child_id, card_date, date.today().isoformat(),
          payload.model_dump_json() if hasattr(payload, "model_dump_json")
          else json.dumps(payload, ensure_ascii=False))).fetchone()
     conn.commit()
     return int(row["id"])
+
+
+def latest_card(conn: psycopg.Connection, child_id: str, card_date: str) -> dict | None:
+    """取某一天已生成的卡片。**没有就是 None**（调用方据此决定要不要重新生成）。
+
+    与 `latest_plan` 同款语义（只追加、取最新一条），但读的是**另一张表**。
+    """
+    row = conn.execute(
+        "SELECT payload FROM day_cards WHERE child_id=%s AND card_date=%s "
+        "ORDER BY id DESC LIMIT 1", (child_id, card_date)).fetchone()
+    return json.loads(row["payload"]) if row else None
+
+
+def active_plan(conn: psycopg.Connection, child_id: str,
+                on: str | None = None) -> dict | None:
+    """★ 「当前生效的计划」——**这个口径只在本文件里定义一次**。
+
+    Phase 3 之前的 `latest_plan` 是按 `plan_date` 精确查某一天的，
+    而 Phase 3 要回答的是两个不同的问题：
+      · "今天这一版要不要打断家长" → 比的是**当前生效的那一版**（可能是昨天定的）
+      · "今天执行的练习属于哪一版" → 要那一天生效的那一版（给 sessions.plan_id）
+    三条口径散在调用点，迟早有一处写成 `ORDER BY id DESC LIMIT 1` ——
+    那正是 Phase 3 之前的状态，而它的后果很具体：
+    **家长 reject 掉的草稿 id 更大，却照样会被端出来执行。**
+    「最后写入」与「当前生效」在有审批之后就是两件事。
+
+    `on=None` → 该孩子最近一次定下来的生效版本（跨日期）。
+    `on="2026-10-21"` → 那一天生效的那一版。
+    """
+    cols = "id,plan_date,version,status,approved_by,approved_at,payload"
+    if on:
+        row = conn.execute(
+            f"SELECT {cols} FROM plans WHERE child_id=%s AND plan_date=%s "
+            "AND status='active' ORDER BY version DESC, id DESC LIMIT 1",
+            (child_id, on)).fetchone()
+    else:
+        row = conn.execute(
+            f"SELECT {cols} FROM plans WHERE child_id=%s AND status='active' "
+            "ORDER BY plan_date DESC, version DESC, id DESC LIMIT 1",
+            (child_id,)).fetchone()
+    return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+
+
+def plan_versions(conn: psycopg.Connection, child_id: str, plan_date: str) -> list[dict]:
+    """某一天的全部版本，按版本升序。**纯读**，自检与"家长改了几次"用它。"""
+    return [dict(r) for r in conn.execute(
+        "SELECT id,version,status,approved_by,approved_at,created_at FROM plans "
+        "WHERE child_id=%s AND plan_date=%s ORDER BY version, id",
+        (child_id, plan_date)).fetchall()]
+
+
+def next_plan_version(conn: psycopg.Connection, child_id: str, plan_date: str) -> int:
+    """下一个版本号。**一条 SQL 算完，不做 SELECT-then-INSERT**——
+    `connect()` 是每线程一条连接，两个线程会同时算出同一个版本号。"""
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version),0) AS v FROM plans WHERE child_id=%s AND plan_date=%s",
+        (child_id, plan_date)).fetchone()
+    return int(row["v"]) + 1
+
+
+def set_plan_status(conn: psycopg.Connection, plan_id: int, status: str) -> None:
+    """改一版计划的 status。**行的其余部分一个字都不动**（append-only 的那条边界）。"""
+    conn.execute("UPDATE plans SET status=%s WHERE id=%s", (status, plan_id))
+    conn.commit()
+
+
+def activate_plan(conn: psycopg.Connection, plan_id: int) -> None:
+    """让某一版生效，**并把那一天上一版降级为 completed**。一条语句。
+
+    ★ 为什么必须放在一个函数里，而不是让调用方先查后写：
+      实测过一次"两行同时 status='active'"—— 先把 v2 批准再单独 activate，
+      而 activate 只是 UPDATE 目标行，于是 v1 仍然是 active。
+      `active_plan` 靠 `ORDER BY version DESC` 取到了对的那一行，
+      **看起来一切正常**；但"这一天有两个生效版本"这件事本身是错的：
+      下一次改状态时按 `WHERE plan_date=%s AND status='active'` 去降级，
+      会漏掉其中一版，而漏掉的那一版可能才是 sessions 挂着的那个 id。
+
+      一条 `UPDATE ... WHERE status='active' AND id<>目标` 让这个状态
+      **在结构上不可达**，而不是靠调用方记得写第二句。
+    """
+    conn.execute(
+        "UPDATE plans SET status='completed' "
+        "WHERE child_id=(SELECT child_id FROM plans WHERE id=%s) "
+        "AND plan_date=(SELECT plan_date FROM plans WHERE id=%s) "
+        "AND status='active' AND id<>%s", (plan_id, plan_id, plan_id))
+    conn.execute("UPDATE plans SET status='active' WHERE id=%s", (plan_id,))
+    conn.commit()
 
 
 def latest_plan(conn: psycopg.Connection, child_id: str, plan_date: str) -> dict | None:
@@ -366,15 +582,20 @@ def latest_plan(conn: psycopg.Connection, child_id: str, plan_date: str) -> dict
       变的只有等待时间。生成一次、之后直接读，落库比前端缓存强：
       前端缓存换个标签页就丢，而"今天的卡片"本就该跨会话不变。
 
-      只追加不替换（同 ability_profile），取 id 最大的一条。
+    ★ Phase 3 改了口径：原来 `ORDER BY id DESC LIMIT 1`（最后写入的那条），
+      现在按 `status='active'` 查。这**不是等价替换** ——
+      见 `active_plan` 那段注释：被 reject 的草稿 id 更大，却不该生效。
+      这里只保留「某一天」这一个维度（卡片缓存要的就是这个），
+      跨日期的"当前版本"去 `active_plan`。
     """
     row = conn.execute(
-        "SELECT payload FROM plans WHERE child_id=%s AND plan_date=%s "
-        "ORDER BY id DESC LIMIT 1", (child_id, plan_date)).fetchone()
+        "SELECT payload FROM plans WHERE child_id=%s AND plan_date=%s AND status='active' "
+        "ORDER BY version DESC, id DESC LIMIT 1", (child_id, plan_date)).fetchone()
     return json.loads(row["payload"]) if row else None
 
 
-def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "") -> int:
+def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "",
+                plan_id: int | None = None, plan_version: int | None = None) -> int:
     """记一次练习。rec 是 statemachine.SessionRecord。
 
     note 之前没被写进 INSERT（表里有列，语句里没有）。接上闭环之后这成了一个
@@ -382,13 +603,24 @@ def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "") ->
     而第一条是家长明确报告的那次 —— 两者 outcome/quality 完全一样，
     没有 note 就没法在 DB 里回答"为什么今天有两条"。
     """
+    # plan_id / plan_version 不传就**自己查**那一天生效的那一版。
+    # 刻意不要求调用方传 —— 一旦靠调用方传，就总会有一处漏传，
+    # 而漏传的后果是这条练习看起来不属于任何计划：
+    # "孩子做的是哪一版安排下的"答不出来，状态机也只能拿一个
+    # 说不清来源的目标难度去判它。查不到就存 NULL / 0，
+    # 那是诚实的「那天没有生效的计划」。
+    if plan_id is None:
+        _cur = active_plan(conn, child_id, on=rec.date)
+        plan_id = int(_cur["id"]) if _cur else None
+        plan_version = int(_cur["version"]) if _cur else 0
     # out_of_routine 直接传 bool：列已经是 BOOLEAN，迁移前的 int(...) 是
     # 在假装它是整数。
     row = conn.execute(
         "INSERT INTO sessions(child_id,session_date,activity_id,outcome,quality,"
-        "out_of_routine,note) VALUES(%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "out_of_routine,note,plan_id,plan_version) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (child_id, rec.date, rec.activity_id, rec.outcome, rec.quality,
-         bool(rec.out_of_routine), note)).fetchone()
+         bool(rec.out_of_routine), note, plan_id, plan_version)).fetchone()
     conn.commit()
     return int(row["id"])
 

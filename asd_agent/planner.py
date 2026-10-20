@@ -348,7 +348,31 @@ def plan_week(
     today: str | None = None,
     on_step=None,
 ) -> WeeklyPlan:
-    """生成一周计划。**一次 LLM 调用 + 三道后置校验；任何失败都返回合法计划。**"""
+    """生成一周计划。**一次 LLM 调用 + 三道后置校验；任何失败都返回合法计划。**
+
+    ★★ 这个函数**不在 HTTP 路径上**。Phase 3 之前它是"死代码"，
+      之前 Phase 3 的交接文档判定为：要么接进 `generate_plan`，
+      要么删掉整条 LLM 链路只保留 `pack_day`。
+
+      现在的结论是**保留它，但只作为 CLI demo 的周计划**，
+      而 HTTP 的计划链走 `pack_day`（纯 Python，见
+      `graph/plan_nodes.py::generate_plan` 的注释）。三条理由：
+
+      1. **它不是死代码** —— `loop.py` 的五日闭环 demo 每天用它排一周
+         （`--no-llm` 时用 `greedy_fallback_plan`）。那是本项目
+         "多 Agent 协作"四个展示点之一，删了就没了。
+      2. **接进 `generate_plan` 是错的**：图里的计划链是**一天**的计划，
+         而它是**一周**的。把周计划塞进日计划链，
+         `validate_plan` 的"实质性变更"就会**每天都判成有变更** ——
+         因为七天里每天的内容都不一样 ——
+         于是每一天都打断家长一次，正是技术方案 §10.3
+         自己列的"用户留存和家长负担"指标要防的那件事。
+      3. **★ 真正要防的是"看起来发生过而其实没有"**：
+         LANGGRAPH.md 第四节之三的担心是，
+         读代码的人以为"LLM 出了个计划"，而 HTTP 上根本没有 LLM 参与。
+         所以这里**把这个边界写在 docstring 里**，
+         而不是删掉一个能跑的功能让后人重新发明一遍。
+    """
     days = max(1, min(days, MAX_DAYS))
 
     # ---- 检索在 Python 里完成，LLM 只看结果 ----
@@ -451,6 +475,90 @@ def pack_day(cands: list[ScoredActivity], budget_minutes: int, *,
     return picked
 
 
+# ================================================================== 实质性变更判据
+def plan_fingerprint(acts: list[Activity]) -> dict:
+    """一份计划的可比较"指纹"。**纯函数、零 token、可重放。**
+
+    ★ 为什么是指纹而不是逐字段 diff：
+      审批要回答的是"这份计划和上一版**有没有实质区别**"，
+      而家长点"重新生成"之后卡片文案（why_this / 家长提醒）几乎必然不同 ——
+      那不是实质区别，那是同一次安排的两种说法。
+      逐字段比会把每次重新生成都变成一次打断，于是"只在真变化时审批"这条
+      就被它自己吃掉了。所以指纹**只收会影响执行的字段**。
+
+    ★ 为什么用 `materials` 的**集合**而不是有序列表：
+      `Activity.materials` 的顺序是数据录入顺序，改它不改变孩子要做的事。
+      `prompt_hierarchy` 同理 —— 提示阶梯**从轻到重**排，
+      "起点提示级别"取的是 `[0]`（最轻的那一级），
+      也就是"从哪一级开始提示"，那才是执行上的区别。
+    """
+    return {
+        "skills": sorted({it for a in acts for it in a.target_skill_items}),
+        "activities": sorted(
+            (a.activity_id,
+             sorted({m.name for m in a.materials}),
+             a.difficulty,
+             # 起点提示级别 = 提示阶梯最轻的那一级
+             (a.prompt_hierarchy[0] if a.prompt_hierarchy else ""),
+             a.duration_min * a.sessions_per_day)
+            for a in acts),
+    }
+
+
+#: 指纹里哪些字段变了算"实质性变更"。**一张表，不是一个 if 链** ——
+#: 因为半年后有人加一条判据时，要改的地方必须一眼看得见。
+SUBSTANTIVE_FIELDS = ("skills", "activities")
+
+
+def is_substantive_change(new_fp: dict, old_fp: dict | None) -> tuple[bool, list[str]]:
+    """★ 「今天要不要打断家长」——**唯一的判据，纯 Python、零 token、可重放**。
+
+    `old_fp is None`（从来没有生效过的计划）→ 一定算变更。
+    那不是"第一版也要审批"的礼节问题：第一次生成计划时家长手里什么都没有，
+    而"要不要现在就做这三条"恰恰是最该由人拍板的一次。
+    把它判成"无变更"等于让系统替家长做了第一次决定。
+
+    返回 `(是否实质性变更, 理由列表)`。理由是**给人看的中文**，
+    前端直接渲染 —— 让家长知道"到底哪里变了"，
+    否则一个"同意/不同意"的按钮就是在让人盲签。
+    """
+    if old_fp is None:
+        return True, ["第一次生成计划，之前没有生效的版本可比"]
+    reasons: list[str] = []
+    for field in SUBSTANTIVE_FIELDS:
+        if new_fp.get(field) == old_fp.get(field):
+            continue
+        if field == "skills":
+            a, b = set(old_fp.get("skills") or []), set(new_fp.get("skills") or [])
+            add, drop = sorted(b - a), sorted(a - b)
+            if add:
+                reasons.append("新增练习目标：" + "、".join(add))
+            if drop:
+                reasons.append("不再练：" + "、".join(drop))
+        else:
+            old_map = {x[0]: x for x in (old_fp.get("activities") or [])}
+            new_map = {x[0]: x for x in (new_fp.get("activities") or [])}
+            added = sorted(set(new_map) - set(old_map))
+            removed = sorted(set(old_map) - set(new_map))
+            if added:
+                reasons.append(f"新增活动：{'、'.join(added)}")
+            if removed:
+                reasons.append(f"去掉活动：{'、'.join(removed)}")
+            for aid in sorted(set(new_map) & set(old_map)):
+                o, n = old_map[aid], new_map[aid]
+                if o[1] != n[1]:
+                    reasons.append(f"{aid} 材料变了：" + "→".join(
+                        ["、".join(o[1]) or "无", "、".join(n[1]) or "无"]))
+                if o[2] != n[2]:
+                    reasons.append(f"{aid} 难度 {o[2]}→{n[2]}")
+                if o[3] != n[3]:
+                    reasons.append(f"{aid} 起点提示级别变了")
+                if o[4] != n[4]:
+                    reasons.append(f"{aid} 时长 {o[4]}→{n[4]} 分钟")
+    return bool(reasons), reasons
+
+
+# ================================================================== CLI
 def _cli() -> None:
     import store
     from capabilities import ParentConstraints

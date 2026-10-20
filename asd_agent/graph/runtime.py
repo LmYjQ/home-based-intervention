@@ -35,8 +35,9 @@ from .builder import build_graph                      # noqa: E402
 from .checkpointer import saver_for                   # noqa: E402
 
 _LOCK = threading.Lock()
-_GRAPHS: dict[str, object] = {}        # schema 名 -> CompiledStateGraph
+_GRAPHS: dict[str, object] = {}        # schema 名 -> 观察链 CompiledStateGraph
 _DRAFTS: dict[str, object] = {}        # schema 名 -> 草稿图
+_PLANS: dict[str, object] = {}         # schema 名 -> 计划链 CompiledStateGraph
 
 
 def _key(path: str | None) -> str:
@@ -62,12 +63,29 @@ def get_draft_graph(path: str | None = None):
     return _cached(_DRAFTS, _key(path), lambda: draft.build_draft_graph(saver_for(path)))
 
 
+def get_plan_graph(path: str | None = None):
+    """计划链图（Phase 3）。与观察链**分开缓存**。
+
+    ★ 为什么必须分开而不是共用一个 dict：
+      两张图的 saver 用的是**同一个连接**（`saver_for` 按 schema 缓存），
+      而编译出来的 CompiledStateGraph 各自持有节点表。
+      共用一个 key 的话，第二张图会把第一张覆盖掉，
+      而 `/api/observe/run` 拿到的是计划链的图 ——
+      症状是"观察端点返回了一个计划"，没有任何报错。
+    """
+    def _build(path=path):
+        from .plan_graph import build_plan_graph
+        return build_plan_graph(saver_for(path))
+    return _cached(_PLANS, _key(path), _build)
+
+
 def close_all() -> None:
     """关掉本进程持有的 saver 连接 + 清缓存。**只给测试与关停用。**"""
     from .checkpointer import close_all as _close
     with _LOCK:
         _GRAPHS.clear()
         _DRAFTS.clear()
+        _PLANS.clear()
     _close()
 
 
@@ -80,4 +98,7 @@ if __name__ == "__main__":
     d1, d2 = get_draft_graph(), get_draft_graph()
     print(f"草稿同一实例  = {d1 is d2}")
     print(f"草稿≠主图     = {d1 is not g1}")
+    p1, p2 = get_plan_graph(), get_plan_graph()
+    print(f"计划图同一实例= {p1 is p2}")
+    print(f"计划图≠观察图 = {p1 is not g1}")
     close_all()

@@ -77,15 +77,89 @@ class EscalationVerdict(BaseModel):
 
 
 class PlanReview(BaseModel):
-    """审批 interrupt 的载荷（Phase 3 接；此处先定义形状，Phase 0 不画这个节点）。
+    """审批 interrupt 的载荷。
 
-    ★ `Literal` 而不是 str：模型或前端传了第四种动作就在恢复那一刻被拒。
+    ★ `Literal` 而不是 str：前端传了第四种动作就在**恢复那一刻**被拒
+    （`interrupt(..., response_schema=PlanReview)`），而不是顺着流程
+    流到落库才炸。这正是技术方案 §5.4「前端提交的操作必须经过服务端
+    Schema 校验」的落点。
+
+    ★ `note` 允许为空但 `action` 必填 —— 家长点"批准"时不该被要求写理由。
+      `reject` 时理由有意义，但**不强制**：强制了就有一批家长卡在按钮上，
+      而这批人恰恰是最需要被听到的（拒绝而不说原因，正是
+      "这个安排我们做不到"）。理由记不记得住由 `freeze_plan` 决定。
     """
 
     model_config = {"extra": "forbid"}
 
     action: Literal["approve", "edit", "reject"]
     note: str = Field(default="", max_length=500)
+
+
+# ================================================================== 计划链 state
+class PlanState(TypedDict, total=False):
+    """**独立的** state，与 `InterventionState` 分开。
+
+    ★ 为什么不用同一个 TypedDict：
+      两条链的字段几乎不重叠，而共用一个会让"这个字段是谁写的"
+      变成一个每次都要查的问题。更实际的后果是 checkpoint 体积 ——
+      观察链的 observation / redflags 会被原样存进每一次计划 run 的
+      checkpoint，而计划链一次 run 的历史没人会翻。
+      两张 state 的代价是 `mark()` 之类的助手要写两遍（真的只多了一行）。
+
+    `total=False` 的理由同 `InterventionState`：节点只写自己产出的那几项。
+    """
+
+    # ---- 身份与坐标 ----
+    child_id: str
+    date: str
+    profile_id: int | None
+
+    #: ★ 由图入口调 `store.plan_paused(conn, child_id)` 算好后传进来。
+    #: 计划链里**只有这一个暂停口径**（LANGGRAPH.md 第四节之三），
+    #: 节点体不自己查库、也不自己判断，见 plan_nodes.generate_plan 的注释。
+    paused: bool
+
+    #: `loop.build_request(...)` 的产物，以**纯 dict** 存
+    #: （`activities.request_to_dict`）。**唯一来源是那个函数** ——
+    #: server.py 的 `_build_request` 也是它的薄封装，
+    #: 全项目只有一处"画像 + 状态机 + 记忆库 → 检索请求"的装配。
+    #: ★ 存 dict 而不是对象：checkpointer 用 msgpack，
+    #:   dataclass / Pydantic 属于未注册类型，实测已打出
+    #:   "will be blocked in a future version" 的警告。
+    #:   节点用 `plan_nodes._req()` 现还原。
+    plan_request: dict[str, Any]
+
+    # ---- 检索与草稿 ----
+    candidate_ids: list[str]
+    excluded: list[dict[str, Any]]
+    plan_activity_ids: list[str]
+    plan_total_minutes: int
+    draft_fingerprint: dict[str, Any]
+    #: ★ **当前生效的那一版**的指纹，由图入口从 `plans` 表读回来。
+    #: 比"从活动库重算"可靠：活动库改了一条活动的难度，
+    #: 会让一份半年前的计划凭空变成"有变更"，而那次变更没人提过。
+    current_fingerprint: dict[str, Any] | None
+
+    # ---- 审批 ----
+    needs_review: bool
+    changes: list[str]
+    review: dict[str, Any]          # PlanReview.model_dump()
+    #: "改一下"已经用了几轮。循环出口守卫，见 plan_nodes.approve_plan。
+    edit_loop: int
+    #: 家长已经在这个 thread 上批过一次（哪怕那次批的是"改一下"）。
+    #: 之后重新生成的那一版不再打断 —— 只由 approve_plan 写。
+    already_reviewed: bool
+
+    # ---- 冻结与落库 ----
+    plan_status: str
+    plan_action: str
+    plan_note: str
+    plan_paused: bool
+    plan_id: int
+    plan_version: int
+
+    trace: list[str]
 
 
 # ================================================================== state
@@ -205,3 +279,23 @@ def fork_config(child_id: str, date: str, checkpoint_id: str) -> dict:
     return {"configurable": {
         "thread_id": f"{child_id}:{date}#fork@{checkpoint_id}",
     }}
+
+
+#: 计划链的 thread 前缀。与 `draft.DRAFT_PREFIX` 同一个理由：
+#: **靠命名空间保证隔离，不是在代码里靠自觉 if。**
+PLAN_PREFIX = "plan:"
+
+
+def plan_thread_id(child_id: str, date: str) -> str:
+    """`plan:{child_id}:{date}`。
+
+    ★ 为什么不能与观察链共用 `{child_id}:{date}`：
+      实测（LANGGRAPH.md ③）同 thread 的 `invoke` 会**接着上一次跑**，
+      于是家长写一段观察会把计划链的 run 续下去（或者反过来）。
+      前缀是这个问题的结构性答案，不是命名偏好。
+    """
+    return f"{PLAN_PREFIX}{child_id}:{date}"
+
+
+def plan_config(child_id: str, date: str) -> dict:
+    return {"configurable": {"thread_id": plan_thread_id(child_id, date)}}
