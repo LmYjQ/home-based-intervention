@@ -497,6 +497,11 @@ class RefusalHit:
     note: str
     event_index: int
     behavior: str
+    #: ★ Phase 4：这一条是**同一次执行里的第几条**桥接补记（1、2…）。
+    #:   它进 `sessions` 的幂等键 —— 家长点的那条恒为 seq=0，
+    #:   桥接补记的从 1 起，于是"一次练习里的又一次抗拒"与
+    #:   "家长报的那次抗拒"是**两行**，而不是互相覆盖。
+    seq: int = 1
 
 
 def refusal_sessions(outcome: ObservationOutcome, activity_id: str | None, *,
@@ -565,12 +570,21 @@ def refusal_sessions(outcome: ObservationOutcome, activity_id: str | None, *,
                  + (f"，当天第 {n} 次" if n > 1 else "") + "）",
             event_index=idx,
             behavior=e.behavior,
+            # ★ Phase 4：seq 在**这里**定，不在调用方定 ——
+            #   n 就是"这条活动当天第几次抗拒"，而幂等键要靠它
+            #   把两次抗拒分成两行（家长点的那条是 seq=0）。
+            #   在调用方编号的话，每个调用方都得自己记得编号，
+            #   漏一个就是"两条抗拒撞成一条" —— 而抗拒计数是冷却期的依据。
+            seq=n,
         ))
     return hits
 
 
-def log_refusals(conn, child_id: str, hits: list[RefusalHit]) -> list[int]:
-    return [store.log_session(conn, child_id, h.session, h.note) for h in hits]
+# ★ Phase 4：`log_refusals` **已删**。原来只有 `feedback.apply_feedbacks` 调它，
+#   而那个函数现在拆成了 plan / write 两半 —— 写的那半带着
+#   `seq`（幂等键的一部分）与 `run_id`，而这个函数两样都传不了：
+#   少了 seq，两条桥接记录会撞成一行（DO UPDATE 覆盖掉一条）。
+#   写库搬到了 `feedback.write_feedbacks`。
 
 
 # ================================================================== 转换
@@ -759,7 +773,12 @@ def _cli() -> None:
     # -- Day 1：观察落库 + 抗拒落 session --
     for e in out.events:
         store.log_observation(conn, cid, out.date, e, False)
-    log_refusals(conn, cid, hits)
+    # ★ Phase 4：`observe.log_refusals` 已删（它传不了 seq/run_id，
+    #   而那两样是 `sessions` 幂等键的一部分）。写库搬到了
+    #   `feedback.write_feedbacks`。
+    for h in hits:
+        store.log_session(conn, cid, h.session, h.note,
+                          source="bridge", seq=h.seq)
 
     rc = store.refusal_counts(conn, cid)
     print(f"  写入后 refusal_counts = {rc}")

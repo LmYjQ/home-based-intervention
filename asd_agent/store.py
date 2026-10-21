@@ -53,6 +53,26 @@ DEFAULT_DB = os.getenv("ASD_DB_PATH", str(
 _TLS = threading.local()      # 每线程一份连接，见 connect()
 
 
+#: 「一天的执行」的身份。**它同时是 checkpoint 的命名空间与落库行的 run_id。**
+#:
+#: ★ 为什么这两件事是同一个字符串：
+#:   反馈链的 thread_id 决定"这次执行的状态存在哪"，run_id 决定"这行数据是谁写的"。
+#:   让它们是同一个东西，于是"重跑一次同一天"在两处都是同一个身份 ——
+#:   checkpoint 里认得出这是同一次执行，落库时也认得出，于是幂等键自然成立。
+#:   分叉出来的 thread 是 `run:{child}:{date}#fork@{checkpoint_id}`，
+#:   run_id 跟着变，于是分叉的行不会撞上真实历史（方案 §5.5）。
+RUN_PREFIX = "run:"
+
+
+def day_run_id(child_id: str, on_date: str) -> str:
+    """`run:{child_id}:{date}` —— 一次「一天的执行」的身份。
+
+    ★ 计划链的 thread 前缀是 `plan:`，草稿是 `draft:`，这里是 `run:` ——
+      **靠命名空间保证隔离，不是在代码里靠自觉 if**（理由见 LANGGRAPH.md 第三节）。
+    """
+    return f"{RUN_PREFIX}{child_id}:{on_date}"
+
+
 def _schema_of(path: str) -> str:
     """/tmp/feedback_check.db → "feedback_check"。
 
@@ -186,7 +206,12 @@ def _init(c: psycopg.Connection) -> None:
         to_state    TEXT NOT NULL,
         at_date     TEXT NOT NULL,
         reason      TEXT NOT NULL DEFAULT '',
-        evidence    TEXT NOT NULL DEFAULT '{}'   -- 触发它的那几个数字
+        evidence    TEXT NOT NULL DEFAULT '{}',   -- 触发它的那几个数字
+        -- ★ Phase 4：这条转移是**哪一次执行**判出来的。
+        --   行的身份（判据与结论）append-only 照旧，但**幂等键**要带 run_id：
+        --   同一次执行重跑一次不该多出一行（那是"静默的状态抖动"），
+        --   而分叉出来的执行（run_id 不同）不该撞上真实历史。
+        run_id      TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_state_child ON skill_state(child_id, skill_item, id);
 
@@ -245,7 +270,27 @@ def _init(c: psycopg.Connection) -> None:
         --   读的时候又 bool(...) 包一层，两处都在假装这是个布尔。
         --   换成真 BOOLEAN 后 psycopg 直接给 Python bool，两处转换都可以删。
         out_of_routine BOOLEAN NOT NULL DEFAULT FALSE,
-        note          TEXT NOT NULL DEFAULT ''
+        note          TEXT NOT NULL DEFAULT '',
+        -- ★ Phase 4：这一行属于**哪一次执行**。
+        --   run_id = 「一天的执行」的身份（day_run_id），它同时是反馈链的
+        --   thread_id 与落库行的幂等键的一半。分叉出来的 thread 不同，
+        --   run_id 自然不同 —— 分叉不会撞上真实历史（方案 §5.5）。
+        run_id        TEXT NOT NULL DEFAULT '',
+        -- source: parent（家长点的）/ bridge（从补充描述里桥接补记的）。
+        --   为什么要分：同一天同一条活动**本来就可以有两行** ——
+        --   家长点了一次"部分做到"，而他的补充描述里又说"后来又不肯了"，
+        --   那是两件事（log_session 的 docstring 记着这个场景）。
+        --   合并成一行就丢了"又一次抗拒"，而抗拒计数是冷却期的依据。
+        source        TEXT NOT NULL DEFAULT 'parent',
+        -- seq: 同 (孩子, 日期, 活动, run_id, source) 里的第几条。
+        --   家长点的那条恒为 0；桥接补记的按当天第几次排（1, 2…）。
+        --   幂等键的一部分 —— 没有它，同一次运行里两条桥接记录会撞。
+        seq           INTEGER NOT NULL DEFAULT 0,
+        -- ★ 提示阶梯用到了第几级、做到第几步。
+        --   以前它们只以中文形式塞在 note 里（"家长选「部分做到」，做到第 2 步"），
+        --   于是结构化数据取不回来 —— 谁想按"用了第几级提示"统计都得去解析中文。
+        prompt_level  INTEGER NOT NULL DEFAULT 0,
+        steps_done    INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_session_child ON sessions(child_id, session_date);
     CREATE INDEX IF NOT EXISTS idx_session_act   ON sessions(child_id, activity_id);
@@ -282,7 +327,11 @@ def _init(c: psycopg.Connection) -> None:
         id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         child_id    TEXT NOT NULL REFERENCES children(child_id),
         on_date     TEXT NOT NULL,
-        payload     TEXT NOT NULL      -- DailySummary 的 JSON
+        payload     TEXT NOT NULL,     -- DailySummary 的 JSON
+        -- ★ Phase 4：这份日结属于哪一次执行。幂等键带 run_id，
+        --   于是"同一天收尾两次"不会插两行（以前靠 /api/close 的
+        --   "已收尾就返回"那一道，那是**调用方**的自觉，不是数据的性质）。
+        run_id      TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_dsum_child ON daily_summary(child_id, on_date DESC);
 
@@ -366,12 +415,68 @@ def _migrate(c: psycopg.Connection) -> None:
         # 而状态机拿 sessions 去算状态转移时根本不知道该按哪版的目标难度。
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS plan_id BIGINT",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS plan_version INTEGER NOT NULL DEFAULT 0",
+        # ── Phase 4：run_id 与它的两个帮手 ──────────────────────────────
+        #   详见下面 _backfill_run_ids 的注释：唯一索引要建在这几列上，
+        #   而**索引必须跟着补列走**（Phase 3 踩过：建表块里引用新列的
+        #   CREATE INDEX 会在老库上先炸一次）。
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'parent'",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS seq INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS prompt_level INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS steps_done INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE skill_state ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
     ):
         c.execute(ddl)
     c.execute("CREATE INDEX IF NOT EXISTS idx_plan_active "
               "ON plans(child_id, status, plan_date DESC, version DESC)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_session_plan "
               "ON sessions(child_id, plan_id)")
+    _backfill_run_ids(c)
+    # ★ 幂等键。三个唯一索引对应 Phase 4 的三条承诺：
+    #   「同一次执行重跑一次不多写」「分叉出来的不撞真实历史」。
+    #   键里**都有 run_id**，因为 run_id 就是"哪一次执行"的身份。
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_session_run "
+              "ON sessions(child_id, session_date, activity_id, run_id, seq)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_state_run "
+              "ON skill_state(child_id, skill_item, run_id, from_state, to_state)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_summary_run "
+              "ON daily_summary(child_id, on_date, run_id)")
+
+
+def _backfill_run_ids(c: psycopg.Connection) -> None:
+    """★ 给**迁移前**的行编出互不冲突的 run_id / seq。
+
+    为什么必须做这一步（而不是"老行不管"）：
+    唯一索引是**建在整张表上**的，而老库里已经有重复的行 ——
+    同一个孩子同一天同一条活动攒了两条 refused（那是合法的：
+    家长点了一次"不配合"，补充描述里又说"后来又不肯了"），
+    同一天也可能有两条日结（重跑留下的）。
+    不先把这些行错开，`CREATE UNIQUE INDEX` 直接失败 ——
+    而它失败的地方是**迁移函数**，于是整个库连不上，
+    症状是"服务起不来"，真正的原因（重复行）却一个字都没提。
+
+    怎么错开，两张表两种做法：
+      · sessions：按 (孩子, 日期, 活动) 分组编号 seq，run_id 留空。
+        新写入的行 run_id 恒非空（day_run_id），所以与老行天然不撞。
+      · skill_state / daily_summary：run_id 直接编成 'legacy-<id>'。
+        这两张表的幂等键**不含 seq**，所以只能靠 run_id 错开。
+        而"同一天同一条日结有多行"在老库里是常态（重跑留下的），
+        编成带 id 的 run_id 就各自唯一了。
+
+    ★ 幂等：只动 run_id 为空的行，改完就不是空的了，
+      所以第二次迁移不会再碰它们。
+    """
+    c.execute("""
+        UPDATE sessions s SET seq = t.rn
+        FROM (SELECT id, row_number() OVER (
+                    PARTITION BY child_id, session_date, activity_id ORDER BY id
+                  ) AS rn
+              FROM sessions WHERE run_id = '') t
+        WHERE s.id = t.id
+    """)
+    c.execute("UPDATE skill_state SET run_id = 'legacy-' || id WHERE run_id = ''")
+    c.execute("UPDATE daily_summary SET run_id = 'legacy-' || id WHERE run_id = ''")
 
 
 # ================================================================== 写入
@@ -404,17 +509,37 @@ def save_profile(conn: psycopg.Connection, profile) -> int:
     return int(row["id"])
 
 
-def append_state(conn: psycopg.Connection, child_id: str, transition) -> int:
-    """追加一条状态转移。**没有对应的 update/delete 接口，这是故意的。**"""
+def append_state(conn: psycopg.Connection, child_id: str, transition, *,
+                 run_id: str | None = None) -> int:
+    """追加一条状态转移。**没有对应的 update/delete 接口，这是故意的。**
+
+    ★ Phase 4：**幂等**。键是 `(child_id, skill_item, run_id, from_state, to_state)`。
+      为什么要 run_id：状态转移是 append-only 的，而 `apply_transitions`
+      **不幂等** —— 它读 `current_states` 算一遍再追加，跑第二次会因为
+      `since` 已推进而**再转移一次**（PROGRESS.md 那个"状态抖动"）。
+      以前靠 `/api/close` 里"已收尾就返回"那一道挡着，
+      而那是**调用方的自觉**，不是数据的性质：换个入口（CLI、图、脚本）
+      就没有那一道了。
+      → 现在由唯一索引保证：同一次执行（run_id 相同）重跑一次，
+        这一行已经在那儿了，`ON CONFLICT DO NOTHING` 跳过。
+      而 run_id 不同的两次执行（分叉、不同的天）各写各的。
+
+    ★ 返回 0 表示"这次没写"（已存在）。调用方拿它判断要不要提示，
+      拿它当 id 用是错的。
+    """
+    if run_id is None:
+        run_id = day_run_id(child_id, transition.at_date)
     row = conn.execute(
         "INSERT INTO skill_state(child_id,skill_item,domain,from_state,to_state,"
-        "at_date,reason,evidence) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "at_date,reason,evidence,run_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (child_id, skill_item, run_id, from_state, to_state) "
+        "DO NOTHING RETURNING id",
         (child_id, transition.skill_item, transition.domain,
          transition.from_state, transition.to_state,
          transition.at_date, transition.reason,
-         json.dumps(transition.evidence, ensure_ascii=False))).fetchone()
+         json.dumps(transition.evidence, ensure_ascii=False), run_id)).fetchone()
     conn.commit()
-    return int(row["id"])
+    return int(row["id"]) if row else 0
 
 
 def save_plan(conn: psycopg.Connection, child_id: str, plan_date: str, payload,
@@ -595,13 +720,33 @@ def latest_plan(conn: psycopg.Connection, child_id: str, plan_date: str) -> dict
 
 
 def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "",
-                plan_id: int | None = None, plan_version: int | None = None) -> int:
+                plan_id: int | None = None, plan_version: int | None = None, *,
+                run_id: str | None = None, source: str = "parent", seq: int = 0,
+                prompt_level: int = 0, steps_done: int = 0) -> int:
     """记一次练习。rec 是 statemachine.SessionRecord。
 
     note 之前没被写进 INSERT（表里有列，语句里没有）。接上闭环之后这成了一个
     真问题：同一天两条 refused session 里，第二条来自"同一次练习里的又一次抗拒"，
     而第一条是家长明确报告的那次 —— 两者 outcome/quality 完全一样，
     没有 note 就没法在 DB 里回答"为什么今天有两条"。
+
+    ★ Phase 4：**幂等**。键是 `(child_id, session_date, activity_id, run_id, seq)`。
+      重复提交同一天的同一份反馈 → 键相同 → `DO UPDATE` 覆盖成同样的值，
+      **行数不变**。这修掉的是一条真 bug：`/api/feedbacks` 以前没有幂等保护，
+      家长（或前端的重复点击）提交两次，sessions 里就有两条 refused，
+      `refusal_counts` 翻倍到 2，**当天误触冷却阈值** ——
+      而冷却会把那条活动踢出明天的候选，且界面上看不出为什么。
+
+      键里为什么有 `seq`：同一天同一条活动**本来就可以有两行**
+      （家长点了一次"部分做到"，补充描述里又说"后来又不肯了"）。
+      `source` 区分"家长点的"与"从补充描述桥接补记的"，
+      `seq` 区分同一次执行里的第几条 —— 两者合起来才是这一行的身份。
+
+    ★ 为什么是 DO UPDATE 而不是 DO NOTHING：
+      家长会**更正**（"我昨天记错了，其实他做了"）。
+      DO NOTHING 会让更正静默失效 —— 界面上看不出，数据是错的。
+      DO UPDATE 改的是"家长对当天事实的陈述"，而**审计线**
+      （skill_state：状态变更的历史）仍然是纯追加、绝不重写。
     """
     # plan_id / plan_version 不传就**自己查**那一天生效的那一版。
     # 刻意不要求调用方传 —— 一旦靠调用方传，就总会有一处漏传，
@@ -613,14 +758,24 @@ def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "",
         _cur = active_plan(conn, child_id, on=rec.date)
         plan_id = int(_cur["id"]) if _cur else None
         plan_version = int(_cur["version"]) if _cur else 0
+    if run_id is None:
+        run_id = day_run_id(child_id, rec.date)
     # out_of_routine 直接传 bool：列已经是 BOOLEAN，迁移前的 int(...) 是
     # 在假装它是整数。
     row = conn.execute(
         "INSERT INTO sessions(child_id,session_date,activity_id,outcome,quality,"
-        "out_of_routine,note,plan_id,plan_version) "
-        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "out_of_routine,note,plan_id,plan_version,run_id,source,seq,"
+        "prompt_level,steps_done) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT (child_id, session_date, activity_id, run_id, seq) DO UPDATE SET "
+        "outcome=EXCLUDED.outcome, quality=EXCLUDED.quality, "
+        "out_of_routine=EXCLUDED.out_of_routine, note=EXCLUDED.note, "
+        "plan_id=EXCLUDED.plan_id, plan_version=EXCLUDED.plan_version, "
+        "source=EXCLUDED.source, prompt_level=EXCLUDED.prompt_level, "
+        "steps_done=EXCLUDED.steps_done RETURNING id",
         (child_id, rec.date, rec.activity_id, rec.outcome, rec.quality,
-         bool(rec.out_of_routine), note, plan_id, plan_version)).fetchone()
+         bool(rec.out_of_routine), note, plan_id, plan_version,
+         run_id, source, seq, prompt_level, steps_done)).fetchone()
     conn.commit()
     return int(row["id"])
 
@@ -641,6 +796,32 @@ def log_observation(conn: psycopg.Connection, child_id: str, observed_at: str,
          else json.dumps(obs, ensure_ascii=False), source)).fetchone()
     conn.commit()
     return int(row["id"])
+
+
+def source_published(conn: psycopg.Connection, child_id: str, on_date: str,
+                      source: str) -> bool:
+    """这段语料这一天是否已经落过库。`source` 就是 `observations.source` 那一列。
+
+    ★ 为什么它住在 store 而不是留在调用方：
+      观察链的 publish 与反馈链的写库节点**都要**问这一句，
+      而两处各写一遍 `SELECT 1 FROM observations WHERE ...` 必然漂移 ——
+      漂移的后果很隐蔽：照样落库，只是幂等键算的是另一段话的哈希。
+      判据只有一个口径，就放在数据层。
+
+    刻意不做 `sha(source)`：PG 上 `text` 比较走的是等值索引路径，
+    而这张表按 child_id 过滤后一天也就几行，实测不构成瓶颈。
+    """
+    if not source:
+        # 没有语料可比 —— 空 source 的行是老数据（它们只到 observed_at 为止）。
+        # 按「已落库」处理，与旧行为一致：宁可不多写，不凭空造。
+        return bool(conn.execute(
+            "SELECT 1 FROM observations "
+            "WHERE child_id=%s AND observed_at=%s AND (source IS NULL OR source='') LIMIT 1",
+            (child_id, on_date)).fetchone())
+    return bool(conn.execute(
+        "SELECT 1 FROM observations "
+        "WHERE child_id=%s AND observed_at=%s AND source=%s LIMIT 1",
+        (child_id, on_date, source)).fetchone())
 
 
 def log_materials(conn: psycopg.Connection, child_id: str, items: list[str]) -> int:
@@ -940,18 +1121,30 @@ def successes_outside_routine(conn: psycopg.Connection, child_id: str) -> dict[s
 
 
 # ================================================================== 日结
-def save_summary(conn: psycopg.Connection, child_id: str, summary) -> int:
+def save_summary(conn: psycopg.Connection, child_id: str, summary, *,
+                 run_id: str | None = None) -> int:
     """存一天的日结。summary 是 summary.DailySummary。
 
     同一天可以有多条（重跑），取用时按 on_date 取 id 最大的一条 ——
     与 ability_profile 同样的口径，不做 UPDATE。
+
+    ★ Phase 4：**同一次执行**重跑一次不多写一行。
+      键是 `(child_id, on_date, run_id)`。以前"一天只有一条日结"是靠
+      `/api/close` 里"已收尾就返回"那一道挡着的 —— 那是**调用方的自觉**，
+      不是数据的性质：换个入口（CLI、图、脚本）就没有那一道，
+      而日结重复行会让 `latest_summary` 按 id 取到哪条变得不确定。
+      → 现在由唯一索引保证。
     """
+    if run_id is None:
+        run_id = day_run_id(child_id, summary.date)
     row = conn.execute(
-        "INSERT INTO daily_summary(child_id,on_date,payload) VALUES(%s,%s,%s) "
+        "INSERT INTO daily_summary(child_id,on_date,payload,run_id) "
+        "VALUES(%s,%s,%s,%s) "
+        "ON CONFLICT (child_id, on_date, run_id) DO UPDATE SET payload=EXCLUDED.payload "
         "RETURNING id",
         (child_id, summary.date,
          summary.model_dump_json() if hasattr(summary, "model_dump_json")
-         else json.dumps(summary, ensure_ascii=False))).fetchone()
+         else json.dumps(summary, ensure_ascii=False), run_id)).fetchone()
     conn.commit()
     return int(row["id"])
 

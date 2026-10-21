@@ -105,6 +105,53 @@ class DayFeedbackResult:
         return "\n".join(L)
 
 
+@dataclass
+class FeedbackPlan:
+    """★ 一次提交的**纯计算**产物。**一个字节都不写。**
+
+    为什么要有这一层（Phase 4）
+    --------------------------
+    反馈链是第三张图，而图的结构有一条硬约束：
+    **写库只能发生在最后一个节点**（`interrupt()` 恢复会重跑所在节点，
+    写在 interrupt 之前的副作用会被做两遍）。
+
+    以前的 `apply_feedbacks` 是"算 + 写"混在一起的：
+    写 sessions → 抽事件 → 写 observations → 桥接 → 再写 sessions。
+    图没法用它 —— 中间那些写就落在"算"的位置上了。
+
+    拆成两半之后：
+      · `plan_feedbacks` —— 算（可能调 LLM，但不碰业务表）
+      · `write_feedbacks` —— 写
+    而 `apply_feedbacks` = 两半接起来，**给 CLI（loop.py）保留**。
+
+    ★ 拆分的边界按"能不能重算"划，不按"函数多长"划：
+      算的部分重算一遍只是浪费 token，写的那部分重算一遍是数据错乱。
+    """
+
+    date: str
+    #: 家长点的那些条（SessionRecord，quality 由 quality_for 算）。
+    sessions: list = field(default_factory=list)
+    #: 与 sessions 一一对应的元信息：note / prompt_level / steps_done /
+    #: source / seq。**seq 是这一行在幂等键里的位置**（见 store.log_session）。
+    rows: list[dict] = field(default_factory=list)
+    #: 从每条 note 里抽出来的事件（ObservationOutcome）。
+    outcomes: list = field(default_factory=list)
+    #: 从 note 里桥接出来的抗拒（RefusalHit）—— 它们也要落成 sessions 行。
+    refusal_hits: list = field(default_factory=list)
+    degraded: bool = False
+
+
+@dataclass
+class FeedbackWriteResult:
+    """写库的结果。`session_ids` 与 `observation_ids` 给出**这次真正落下的行**。"""
+
+    session_ids: list[int] = field(default_factory=list)
+    observation_ids: list[int] = field(default_factory=list)
+    bridge_session_ids: list[int] = field(default_factory=list)
+    written_sessions: int = 0
+    written_observations: int = 0
+
+
 # ================================================================== quality
 def quality_for(fb: ActivityFeedback) -> float:
     """outcome + 提示层级 → quality。**纯函数、确定性、可重放。**
@@ -126,29 +173,40 @@ def quality_for(fb: ActivityFeedback) -> float:
 
 
 # ================================================================== 主入口
-def apply_feedbacks(conn: psycopg.Connection, child_id: str, date: str,
-                    feedbacks: list[ActivityFeedback], *,
-                    other_notes: str = "", no_llm: bool = False,
-                    on_step=None) -> DayFeedbackResult:
-    """逐条反馈 → sessions + observations。**每天最多 1 次 LLM 调用每条反馈。**
+def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
+                   other_notes: str = "", no_llm: bool = False,
+                   on_step=None) -> FeedbackPlan:
+    """逐条反馈 → **纯计算**的落库计划。**一个字节都不写。**
 
     流程（顺序有讲究）：
-      1. 先写 sessions —— 它是状态机的唯一输入，不依赖任何 LLM，
-         所以即使后面抽取全降级，今天的成败记录也已经进去了。
+      1. 先算 sessions —— 它是状态机的唯一输入，不依赖任何 LLM，
+         所以即使后面抽取全降级，今天的成败记录也算得出来。
       2. 再抽事件 —— 每条有 note 的反馈各调一次 LLM。
       3. 最后跑抗拒桥接 —— 只对 outcome != refused 的反馈跑。
+
+    ★ `other_notes`（「其他观察」框）在这里**仍然处理**，
+      但调用方（HTTP 层）传空 —— Phase 1 起「其他观察」改走
+      `POST /api/observe/run` 的图，两处都做 = 抽两次、写两行、付两次 LLM。
+      `loop.py` 的 CLI 还在用它那条路径。
     """
     from activity_data import get as get_act
 
-    res = DayFeedbackResult(date=date)
+    plan = FeedbackPlan(date=date)
 
-    # ---- ① sessions：纯映射，先写 ----
+    # ---- ① sessions：纯映射 ----
     for fb in feedbacks:
         rec = SessionRecord(date=date, activity_id=fb.activity_id,
                             outcome=fb.outcome, quality=quality_for(fb))
-        note = _session_note(fb)
-        res.sessions.append(rec)
-        res.session_ids.append(store.log_session(conn, child_id, rec, note))
+        plan.sessions.append(rec)
+        plan.rows.append({
+            "note": _session_note(fb),
+            "prompt_level": fb.prompt_level,
+            "steps_done": fb.steps_done,
+            "source": "parent",
+            # ★ 家长点的这一条恒为 0：幂等键的 seq 从 1 起是留给
+            #   "从补充描述桥接补记的抗拒"的（那才是第二行、第三行）。
+            "seq": 0,
+        })
 
     # ---- ② 逐条抽事件 ----
     # 记下 (feedback, outcome) 的对应关系，第 ④ 步要用。
@@ -176,14 +234,12 @@ def apply_feedbacks(conn: psycopg.Connection, child_id: str, date: str,
             no_llm=no_llm, on_step=on_step)
 
     for _, out in per_activity:
-        res.outcomes.append(out)
-        res.observation_ids.extend(observe.persist(conn, child_id, out))
-        res.degraded = res.degraded or out.degraded
+        plan.outcomes.append(out)
+        plan.degraded = plan.degraded or out.degraded
 
     if other_out is not None:
-        res.outcomes.append(other_out)
-        res.observation_ids.extend(observe.persist(conn, child_id, other_out))
-        res.degraded = res.degraded or other_out.degraded
+        plan.outcomes.append(other_out)
+        plan.degraded = plan.degraded or other_out.degraded
 
     # ---- ④ 抗拒桥接 ----
     # ★ 家长已经点了 refused 时**跳过**：那条 refused session 上面已经写了，
@@ -192,16 +248,79 @@ def apply_feedbacks(conn: psycopg.Connection, child_id: str, date: str,
     for fb, out in per_activity:
         if fb.outcome == "refused":
             continue
-        res.refusal_hits.extend(
-            observe.refusal_sessions(out, fb.activity_id))
+        # ★ seq 在 `observe.refusal_sessions` 里定好了（当天第几次抗拒），
+        #   这里不重新编号 —— 两个地方编号就会有一处漏，
+        #   而漏的表现是"两条抗拒撞成一条"，抗拒计数随之少一次。
+        plan.refusal_hits.extend(observe.refusal_sessions(out, fb.activity_id))
 
     # 「其他观察」框：activity_id=None → refusal_sessions 直接返回 []。
     # 这行调用是为了让"它不计入"在代码里是显式的一次调用，
     # 而不是靠"我们没调用它"这种沉默来表达。
     if other_out is not None:
-        res.refusal_hits.extend(observe.refusal_sessions(other_out, None))
+        plan.refusal_hits.extend(observe.refusal_sessions(other_out, None))
+    return plan
 
-    observe.log_refusals(conn, child_id, res.refusal_hits)
+
+def write_feedbacks(conn: psycopg.Connection, child_id: str, plan: FeedbackPlan, *,
+                    run_id: str | None = None) -> FeedbackWriteResult:
+    """把 `FeedbackPlan` 落库。**幂等**（键见 store.log_session 的 docstring）。
+
+    写四样东西，顺序有讲究：
+      1. sessions（家长点的那些条）—— 状态机的唯一输入。
+      2. observations（从 note 抽出来的事件）—— 检索器的硬过滤输入。
+      3. 桥接补记的 refused sessions —— 它们也是状态机的输入。
+    """
+    res = FeedbackWriteResult()
+    if run_id is None:
+        run_id = store.day_run_id(child_id, plan.date)
+
+    # ---- ① sessions ----
+    for rec, meta in zip(plan.sessions, plan.rows):
+        res.session_ids.append(store.log_session(
+            conn, child_id, rec, meta["note"], run_id=run_id,
+            source=meta["source"], seq=meta["seq"],
+            prompt_level=meta["prompt_level"], steps_done=meta["steps_done"]))
+    res.written_sessions = len(res.session_ids)
+
+    # ---- ② observations ----
+    # ★ 幂等判据是「这段语料今天落过没有」（store.source_published）。
+    #   重复提交同一天同一段 note 时它已经在那儿了 → 跳过，
+    #   否则 observations 会多出一行，而 `recent_scenes` 与教练诊断
+    #   会把同一件事算两遍。
+    for out in plan.outcomes:
+        if store.source_published(conn, child_id, plan.date, out.source_text):
+            continue
+        res.observation_ids.extend(observe.persist(conn, child_id, out))
+    res.written_observations = len(res.observation_ids)
+
+    # ---- ③ 桥接补记的 refused sessions ----
+    for h in plan.refusal_hits:
+        res.bridge_session_ids.append(store.log_session(
+            conn, child_id, h.session, h.note, run_id=run_id,
+            source="bridge", seq=getattr(h, "seq", 1)))
+    return res
+
+
+def apply_feedbacks(conn: psycopg.Connection, child_id: str, date: str,
+                    feedbacks: list[ActivityFeedback], *,
+                    other_notes: str = "", no_llm: bool = False,
+                    on_step=None) -> DayFeedbackResult:
+    """逐条反馈 → sessions + observations。**每天最多 1 次 LLM 调用每条反馈。**
+
+    ★ Phase 4：这是 `plan_feedbacks` + `write_feedbacks` 的接法，
+      **给 CLI（loop.py）保留**。HTTP 那条路走反馈链（图），
+      由图的两个节点分别调 plan / write。
+    """
+    plan = plan_feedbacks(feedbacks, date=date, other_notes=other_notes,
+                          no_llm=no_llm, on_step=on_step)
+    w = write_feedbacks(conn, child_id, plan)
+    res = DayFeedbackResult(date=date)
+    res.sessions = list(plan.sessions)
+    res.session_ids = list(w.session_ids)
+    res.refusal_hits = list(plan.refusal_hits)
+    res.outcomes = list(plan.outcomes)
+    res.observation_ids = list(w.observation_ids)
+    res.degraded = plan.degraded
     return res
 
 

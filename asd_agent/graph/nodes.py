@@ -419,22 +419,13 @@ def _publish_redflags(state, conn, child_id: str) -> list[int]:
 
 
 def _source_published(conn, child_id: str, date: str, source: str) -> bool:
-    """这段语料今天是否已经落过库。`source` 就是 `observations.source` 那一列。
+    """这段语料今天是否已经落过库。
 
-    刻意不做 `sha(source)`：PG 上 `text` 比较走的是等值索引路径，
-    而这张表按 child_id 过滤后一天也就几行，实测不构成瓶颈。
+    ★ Phase 4：判据搬到 `store.source_published` 了 ——
+      反馈链的写库节点也要问同一句，而两处各写一遍 SQL 必然漂移。
+      留这个函数只是为了本文件里读着顺，**它不再有判据**。
     """
-    if not source:
-        # 没有语料可比 —— 空 source 的行是老数据（它们只到 observed_at 为止）。
-        # 按「已落库」处理，与旧行为一致：宁可不多写，不凭空造。
-        return bool(conn.execute(
-            "SELECT 1 FROM observations "
-            "WHERE child_id=%s AND observed_at=%s AND (source IS NULL OR source='') LIMIT 1",
-            (child_id, date)).fetchone())
-    return bool(conn.execute(
-        "SELECT 1 FROM observations "
-        "WHERE child_id=%s AND observed_at=%s AND source=%s LIMIT 1",
-        (child_id, date, source)).fetchone())
+    return store.source_published(conn, child_id, date, source)
 
 
 def _delete_source(conn, child_id: str, date: str, source: str) -> None:
