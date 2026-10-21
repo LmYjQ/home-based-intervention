@@ -447,7 +447,17 @@ def run_day(conn, child_id: str, prof: AbilityProfile, day: DayInput, *,
     print(f"\n{'=' * 70}\n第 {n} 天 · {day.date}\n{'=' * 70}")
     # 教练诊断读的是**之前**攒下的观察，不是今天刚说的那段 ——
     # 今天的话是今天情况的报告，它驱动的是**明天**的调整。
-    out_prev = []
+    #
+    # ★ Phase 4 修：这里原来是一句 `out_prev = []`，把调用方传进来的
+    #   历史**直接扔掉**了 —— 于是教练诊断永远看不到昨天的观察，
+    #   而下一行 `observe.to_coach_inputs(out_prev)` 还会因为
+    #   `out_prev` 是 list 而不是 ObservationOutcome 直接抛
+    #   `AttributeError: 'list' object has no attribute 'events'`。
+    #   也就是说：**live 路径（`python loop.py`）在第一次出卡片时就崩**，
+    #   而 12 个离线回归一个都不碰它，所以没人发现。
+    #   正确形状：`out_prev` 已经是 `list[ObservationInput]`
+    #   （调用方 `prev_inputs` 就是这么攒的），直接传给 coach 即可。
+    out_prev = list(out_prev or [])
 
     # ---------- 1. 今天的卡片（先用当前记忆生成）----------
     # ★ 顺序很重要：先生成今天的卡片，再收今天的反馈。
@@ -486,7 +496,11 @@ def run_day(conn, child_id: str, prof: AbilityProfile, day: DayInput, *,
             adjustment="（--no-llm / hardcoded：使用活动定义直接生成的兜底卡片）")
     else:
         cout = coach_today(cands, today_id=pick.activity.activity_id,
-                           observations=observe.to_coach_inputs(out_prev),
+                           # ★ Phase 4 修：`out_prev` 已经是 list[ObservationInput]，
+                           #   不该再过一遍 `to_coach_inputs`（它吃的是
+                           #   ObservationOutcome，返回的是 list[ObservationInput]）——
+                           #   传错类型会在第一次出卡片时就抛 AttributeError。
+                           observations=out_prev,
                            req=req, recent_summary=req.recent_summary)
     if cout.analysis:
         for sg in cout.analysis.signals:

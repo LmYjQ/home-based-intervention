@@ -4,22 +4,74 @@
 > 完整设计在 `~/.claude/plans/python-llm-langgraph-hitl-time-travel-i-gleaming-octopus.md`
 > （新 session 不会自动读，需手动打开或让我重述）。
 >
-> **进度：Phase 0 / 1 / 2 / 3 均已完成（2026-10-21 复核全绿）。下一步 = Phase 4（反馈链）。**
+> **进度：Phase 0 / 1 / 2 / 3 / 4 均已完成（2026-10-21 复核全绿）。下一步 = Phase 5（time travel）。**
 
 ---
 
 ## 🔖 换 session 先看这一屏
 
-**当前阶段：Phase 3 ✅ 已完成并已提交（计划链 + 审批 interrupt + 计划版本化）。**
-**下一步 = Phase 4（反馈链）。**
+**当前阶段：Phase 4 ✅ 已完成并已提交（反馈链 + 幂等键 + 「接下来怎么办」）。**
+**下一步 = Phase 5（time travel：checkpoint 历史 / 分叉视图 / 审计事件）。**
 
-### Phase 3 做完什么
+### Phase 4 做完什么
+
+**家长重复点一次「提交」，系统不会把今天记两遍。** 四条具体后果被修掉：
+
+1. **重复提交不再让 `refusal_counts` 翻倍。** 以前 `/api/feedbacks` 没有幂等保护，
+   提交两次 → sessions 里两条 refused → 计数到 2 → **当天误触冷却阈值** ——
+   那条活动被踢出明天的候选，而界面上看不出为什么。
+   现在**两层**保证：落库那半有唯一键（数据的性质），
+   checkpoint 那半按输入指纹直接返回上次结果（不重跑图、不重付 LLM）。
+2. **「接下来怎么办」第一次有了可判定的答案**：`next_action` =
+   `continue` / `adjust` / `pause` / `escalate`，**纯 Python 判**，
+   随 `/api/feedbacks` 的响应一起给前端。
+3. **家长的原话有两个入口，现在两个都被红旗扫过。** 以前只有「其他观察」框
+   （走观察链）被扫，逐条活动的补充描述**从来没被扫过** ——
+   "他玩着玩着就去咬自己的袖子"这句话压根没进过 `redflag.scan`。
+4. **`/api/card` 读已生效的那一版计划**，不再自己再排一次。
+   以前两条路径各自 `pack_day`，结果**当前恰好一致** —— 那是巧合，不是保证。
+
+图级验收 **23 → 29 组**，HTTP 层 **10 → 12 组**，两个自检 2026-10-21 实跑全绿。
+细节见第四节之五。
+
+### 🎯 Phase 5 开工前必须知道的四件事
+
+1. **`run_id` = 「一天的执行」的身份**，它同时是 checkpoint 的命名空间
+   （thread_id）与落库行的幂等键的一半。反馈链的 thread 是
+   `run:{child}:{date}`；分叉出来的 thread 是 `run:{child}:{date}#fork@{ckpt}`，
+   run_id 跟着变，**分叉的行不会撞上真实历史**。
+   → Phase 5 做分叉时，**run_id 必须跟着 thread_id 走**，
+   别用 `store.day_run_id()`（那永远是那一天的正牌身份）。
+2. **三条唯一索引就是 Phase 4 的幂等承诺**，Phase 5 的分叉必须尊重它们：
+   `sessions(child,date,activity,run_id,seq)` /
+   `skill_state(child,skill,run_id,from,to)` / `daily_summary(child,date,run_id)`。
+   ★ 迁移时老库里**合法存在重复行**（同一天两条 refused、同一天两条日结），
+   所以先回填再建索引 —— 见第四节之五「本轮踩到的坑」第 1 条。
+3. **分叉必须重新过安全闸门与必要审批**（技术方案 §5.5 明确要求）。
+   现在的三条链各自有各自的 thread，分叉时**每一条都要分叉**，
+   别只分叉观察链 —— 反馈链的 run 是**要落库**的。
+4. **`workflow_audit_events` 表还没有**（Phase 5 的活）。
+   现成的来源是 `StateSnapshot.metadata`（`step` / `source`），实测见第二节 ⑧。
+   三条链的 thread 前缀不同，审计事件的 `thread_id` 应当原样存（不要截断前缀）——
+   否则三张图的事件会混在一起，而它们本来就是三件不同的事。
+
+### ⚠️ Phase 5 开工前要知道的两件环境事
+
+1. **`server.py` 在仓库根目录，不在 `asd_agent/`。**
+   `cd asd_agent && ../.venv/bin/python -m uvicorn server:app` 会
+   `Could not import module "server"`。PROGRESS.md 入口那节的
+   `-c "import uvicorn,server"` 写法（带 `PYTHONPATH=.:./asd_agent`）才是对的。
+2. **PG 容器是 `--rm` 的，跑完就没了。**
+   每次开工第一步先 `docker ps -a --filter name=ganyu_pg`，没有就按
+   PROGRESS.md 那条 `docker run` 重起（**端口绑 127.0.0.1**）。
+
+Phase 3 做完什么（回顾）：
 
 **"系统排的计划"第一次要家长点头。** 三条具体后果被修掉：
 
 1. **`plans` 表从 4 列变成 8 列**（`status` / `version` / `approved_by` /
    `approved_at`）。改之前它只有 `id / child_id / plan_date / created_at / payload`，
-   也就是说"最后写入的那条就是当前生效的计划"——而"生效"这件事没有任何记录。
+   也就是说"最后写入的那条就是当前生效的计划" —— 而"生效"这件事没有任何记录。
 2. **新增 ⚡ 审批 interrupt**（`approve` / `edit` / `reject`），
    挂在**实质性变更**上：连续两天输入相同 → 第二天**不打断家长**。
 3. **`/api/card` 的卡片缓存搬到了新表 `day_cards`**。它原来写的是 `plans` 表，
@@ -28,52 +80,26 @@
 图级验收 **14 → 23 组**，HTTP 层 **9 → 10 组**，两个自检 2026-10-21 实跑全绿。
 细节见第四节之四。
 
-### 🎯 Phase 4 开工前必须知道的四件事
+### 🎯 Phase 4 开工前必须知道的四件事（已全部兑现，存档备查）
 
-1. **`store.plan_paused(child_id)` 仍是「暂停计划生成」的唯一口径。**
+1. **`store.plan_paused(child_id)` 是「暂停计划生成」的唯一口径。**
    Phase 3 的 `generate_plan` **不自己判断暂停**，它读 `state["paused"]`，
    而那个值由图入口 `plan_graph.plan_inputs()` 调 `store.plan_paused()` 算好注入。
+   Phase 4 的 `next_action` 同样只读注入值（`run_inputs` 里算一次）。
    **别在节点体里再写一遍 `exists urgent ...`** —— 那就是第二处定义。
-2. **计划链是独立的一张图**（`graph/plan_graph.py`），thread 前缀 `plan:`。
-   它与观察图**不共用 thread**（`{child}:{date}` vs `plan:{child}:{date}`）：
-   同 thread 的 invoke 会接着上一次跑（第二节 ③ 的实测），
-   两条链共用一个 thread 的话，家长写一段话就会把计划链的 run 续下去。
-   → 反馈链同理：**第三张独立的图**，前缀自己定（`feedback:` / `run:` / `session:`），
-   别图省事挂到观察链的 thread 上。
-3. **计划链的 `publish_plan` 是它唯一写业务表的节点**，排在 ⚡ 之后。
-   `freeze_plan` **不许自己写 `plans` 表** —— 第二个写库节点意味着
-   interrupt 恢复重跑时会双写（第二节 ⑤）。
-   → 反馈链的 `apply_transitions` 同理，它必须是反馈链**唯一**的写库节点。
+2. **反馈链是第三张独立的图**（`graph/run_graph.py`），thread 前缀 `run:`。
+   它与观察图、计划图**都不共用 thread**：同 thread 的 invoke 会接着上一次跑
+   （第二节 ③ 的实测），而反馈链的 run 是**要落库**的。
+3. **反馈链的 `apply_transitions` 是它唯一写业务表的节点**，排在全部计算之后。
+   `record_execution` / `analyze_outcome` / `next_action` 一个字节都不写 ——
+   这条用「跑一遍去掉写库节点的图」验（selfcheck [28]），
+   而不是用 trace 顺序糊弄过去。
 4. **实质性变更判据在 `planner.is_substantive_change()`**（纯函数，零 token）。
    它比的是**指纹**（`planner.plan_fingerprint`），不是逐字段 diff ——
    逐字段比会把每次重新生成都变成一次打断，于是"只在真变化时审批"
    这条判据被它自己吃掉了。
 
-★ Phase 4 有一条 Phase 3 刚铺好的路：
-  `sessions` 现在有 `plan_id` / `plan_version` 两列，
-  `store.log_session` 会**自动**把练习挂到那一天生效的那一版计划下
-  （查不到就存 NULL，不乱挂）。
-  反馈链的"这次执行属于哪一版安排"因此有了落点，
-  而 `apply_transitions` 的幂等键也可以用
-  `(child_id, skill_item, run_id, from_state, to_state)` —— 其中 `run_id`
-  由 thread_id + checkpoint_id 派生，分叉天然不撞。
-
-### ⚠️ Phase 4 开工前要知道的两件环境事（本轮实测踩到）
-
-1. **`server.py` 在仓库根目录，不在 `asd_agent/`。**
-   `cd asd_agent && ../.venv/bin/python -m uvicorn server:app` 会
-   `Could not import module "server"`。PROGRESS.md 入口那节的
-   `-c "import uvicorn,server"` 写法（带 `PYTHONPATH=.:./asd_agent`）才是对的。
-2. **PG 容器是 `--rm` 的，跑完就没了。**
-   2026-10-21 复核时 `ganyu_pg` 已不存在，连接直接 `Connection refused`。
-   每次开工第一步先 `docker ps -a --filter name=ganyu_pg`，没有就按
-   PROGRESS.md 那条 `docker run` 重起（**端口绑 127.0.0.1**）。
-
 Phase 2 做完什么（回顾）：
-
-**红旗从"响应里飘一次"变成长期记录。**
-
-### Phase 2 做完什么
 
 **红旗从"响应里飘一次"变成长期记录。** 三条具体后果被修掉：
 
@@ -85,7 +111,7 @@ Phase 2 做完什么（回顾）：
 
 图级验收 **14 组**，HTTP 层 **9 组**。细节见第四节之三。
 
-### 🎯 Phase 3 开工前必须知道的四件事
+### 🎯 Phase 3 开工前必须知道的四件事（存档备查）
 
 1. **`generate_plan` 必须调 `store.plan_paused(child_id)`，不许自己再发明一个。**
    那是「能不能生成计划」的**唯一口径**（存在 `severity='urgent'` 且
@@ -118,7 +144,7 @@ Phase 1 做完四件事，全部有断言或浏览器实测守着：
 4. **草稿存 checkpoint**：前端此前零持久化，填一半刷新即丢。
    现在存 `draft:{child_id}:{date}` 独立 thread（`graph/draft.py`）。
 
-新增两处**以前没人守**的东西：`asd_agent/http_selfcheck.py`（**9 组**，
+新增两处**以前没人守**的东西：`asd_agent/http_selfcheck.py`（**现在 12 组**，
 因为 `server.py` 不在任何回归集里）与 `graph/selfcheck.py` 的 [9]-[14] 组。
 
 Phase 0 之前的三件事也仍然成立：
@@ -147,6 +173,8 @@ docker run -d --rm --name ganyu_pg -e POSTGRES_PASSWORD=postgres \
 ⚠️ **Phase 2 加了新表 `red_flags` —— 改了 `store.py` 的表之后必须重启后端**：
 `store._init` 只在某个 schema 的连接**首次创建**时跑，跑着的服务不会凭空多出这张表，
 新路由会 500 `relation "red_flags" does not exist`。
+**Phase 4 改了 `sessions` / `skill_state` / `daily_summary` 三张表（加列 + 加唯一索引），
+同样必须重启后端。**
 
 ---
 
@@ -829,29 +857,169 @@ START → select_goal → retrieve_activities → generate_plan → validate_pla
 6. **自检里 `o4` 可能未绑定**：`for` 循环第一次就 break 时变量不存在。
    写断言前先想清楚循环体可能跑几次（PROGRESS.md 阶段 4 坑 2 的同款）。
 
+## 四之五、Phase 4 ✅ 已完成（2026-10-21 提交）：反馈链 + 幂等键
+
+### 图长什么样（接完之后，三条链各一张图）
+
+```
+观察链  {child}:{date}          record_intake → extract → validate → ⚡ clarify
+                               → safety_gate → escalate? → publish → END
+计划链  plan:{child}:{date}     select_goal → retrieve → generate → validate
+                               → ⚡ approve_plan → freeze_plan → publish_plan → END
+反馈链  run:{child}:{date}      record_execution → analyze_outcome → next_action
+                               → apply_transitions → END
+```
+
+★ 反馈链**没有 interrupt**，也没有分支 —— 它是一条直线。
+  看着不像 LangGraph，但它的价值在别处：
+  · 四个节点各自可单测（三个纯函数 + 一次 LLM）
+  · checkpoint 落在「一次执行」这个粒度上（run_id）
+  · 落库集中在最后一个节点，幂等键于是**只有一处**
+
+### ★★ 幂等的两层，缺一不可
+
+| 层 | 保证什么 | 靠什么 |
+|---|---|---|
+| 落库那半 | 同一次执行重跑一次**不多写一行**；家长更正**覆盖**当天那一条 | 三个唯一索引 + `DO UPDATE` |
+| checkpoint 那半 | 同一天提交**一模一样**的内容 → **不重跑图、不重付 LLM** | `feedback.feedback_digest`（sha256） |
+
+★ 只做第 1 层的话，**数据是对的，但家长要为一次重复提交再等 20-60 秒**
+  （图里那一次 LLM 是日结）。只做第 2 层的话，一次「换个入口」就绕过去了。
+  → 两层都要。
+
+★ 指纹**不含**时间戳之类会变的东西，也不受**提交顺序**影响 ——
+  否则这个守卫形同虚设，而它失效的方式是「静默地多付一次 LLM」。
+
+### `run_id` 是什么
+
+`run_id = day_run_id(child, date) = "run:{child}:{date}"` ——
+它**同时是** checkpoint 的命名空间（thread_id）与落库行的幂等键的一半。
+让这两者是同一个字符串，于是"重跑一次同一天"在两处都是同一个身份：
+checkpoint 里认得出这是同一次执行，落库时也认得出，于是幂等键自然成立。
+
+分叉出来的 thread 是 `run:{child}:{date}#fork@{checkpoint_id}`，
+run_id 跟着变 → **分叉的行不会撞上真实历史**（方案 §5.5）。
+
+### 三条唯一索引
+
+| 表 | 键 | 为什么键里有 `seq` / `from_state` |
+|---|---|---|
+| `sessions` | `(child_id, session_date, activity_id, run_id, seq)` | 同一天同一条活动**本来就可以有两行**（家长点了一次"部分做到"，补充描述里又说"后来又不肯了"）。`source` 区分"家长点的"与"桥接补记的"，`seq` 区分同一次执行里的第几条 |
+| `skill_state` | `(child_id, skill_item, run_id, from_state, to_state)` | 一天最多一条同向转移（`apply_transitions` 每次只算一条） |
+| `daily_summary` | `(child_id, on_date, run_id)` | 一天一份日结 |
+
+★ `sessions` 写用 **DO UPDATE 而不是 DO NOTHING**：
+  家长会**更正**（"我昨天记错了，其实他做了"）。
+  DO NOTHING 会让更正静默失效 —— 界面上看不出，数据是错的。
+  改的是「家长对当天事实的陈述」，而**审计线**（`skill_state`）仍然纯追加、绝不重写。
+
+### `next_action`：四个取值，判据全在 Python
+
+| 取值 | 判据 | 来源 |
+|---|---|---|
+| `escalate` | **今天新出的** urgent 红旗 | `redflag.scan`（逐条 note 扫出来的） |
+| `pause` | 有**未关闭的** urgent | **只调 `store.plan_paused`** —— 全项目唯一口径 |
+| `adjust` | 有**回退型**状态转移 | `statemachine.propose_transition` |
+| `continue` | 其余 | — |
+
+★ 为什么 `escalate` 排在 `pause` 前面：两者都来自红旗，但家长要做的**动作**不同 ——
+  escalate 是"今天刚出的事，现在就处理"（转诊指引），
+  pause 是"之前那件事还没处理完，先别排新计划"。合成一个动作，家长就不知道该做什么。
+
+★ **抗拒不判成 `adjust`**：一条没配合是常态，
+  而它造成的后果（那条活动进冷却、明天不再推）由检索器负责 ——
+  那是"候选变了"，不是"难度要调"。两件事混成一个标签的话，
+  `adjust` 就会天天响，而它响的时候反而没人当回事。
+
+### 顺带修掉的三个洞
+
+1. **家长的原话有两个入口，以前只扫了一个。**
+   「其他观察」框（走观察链）被 `redflag.scan` 扫过，
+   而**逐条活动的补充描述从来没被扫过** ——
+   "他玩着玩着就去咬自己的袖子"这句话压根没进过 `redflag.scan`。
+   不是扫了没命中，是**压根没扫**。现在两个入口都扫（`source_kind='note'`），
+   命中 urgent 时 `next_action=escalate` 且计划生成被暂停。
+2. **`ActivityFeedback.outcome` 现在在构造时就拒非法值。**
+   它以前是裸 str，非法值能一路走到 INSERT —— 于是库里躺着一行
+   `outcome='succeess'`，而统计只认四个词，那行**安静地不存在**。
+3. **`loop.py` 的 live 路径在第一次出卡片时就崩。**
+   `run_day` 里有一句 `out_prev = []` 把调用方传进来的历史**直接扔掉**，
+   下一行又把它当 `ObservationOutcome` 用 → `AttributeError`。
+   12 个离线回归一个都不碰 live 路径，所以没人发现。
+   （live 路径本轮**未实跑** —— 没有 replay fixture；改的是类型，不是行为。）
+
+### 卡片读已生效的那一版计划（遗留项 3）
+
+以前 `/api/card` 与计划链是两条独立路径，各自 `pack_day`，
+结果**当前恰好一致** —— 那是巧合，不是结构上保证一致。
+将来任何一个改了装箱规则，两条路就会分叉，
+而**家长看到的卡片与被批准的计划不是同一份**。
+
+现在：有生效的计划时，卡片就是那几条（一个不多一个不少）；
+没有生效的计划时回落到原来的装箱。
+
+★ 教练 Agent 的 `ease`/`swap`/`drop` **不生效**（`coach_today(keep_focus=True)`）：
+  诊断照跑（家长看得见"为什么"），但不许换掉家长批准的那条 ——
+  家长点了批准，系统就再替他改一次，那批准就没有意义了。
+
+★ **缓存的键现在包含计划版本**：以前只看 `profile_id`，
+  于是"家长批准了第 2 版"不会让旧卡片作废 —— 界面上还是第 1 版那几条，
+  而家长批的是第 2 版。**批准就白批了。**
+
+### 本轮踩到的坑（已修，勿回退）
+
+1. **★ 老库里合法存在的重复行会让 `CREATE UNIQUE INDEX` 直接失败。**
+   同一天两条 refused（家长点的 + 桥接补记的）、同一天两条日结（重跑留下的）、
+   同一对 `from→to` 两次（回退→升级→再回退）—— **全都是合法的**。
+   不先错开就建索引 → 索引创建失败 → **失败在迁移函数里** →
+   整个库连不上，症状是"服务起不来"，而真正的原因一个字都没提。
+   → 先回填：`sessions` 按 `(child,date,activity)` 分组编号 `seq`；
+   `skill_state` / `daily_summary` 编成 `legacy-<id>`。
+   **已用模拟老库实测**（把新列 drop 掉、插重复行、再连一次）。
+2. **`seq` 必须在 `observe.refusal_sessions` 里定，不能在调用方定。**
+   初版在 `plan_feedbacks` 里重新编号 —— 两个地方编号就会有一处漏，
+   而漏的表现是"两条抗拒撞成一条"（DO UPDATE 覆盖掉一条），
+   **抗拒计数随之少一次** —— 而抗拒计数是冷却期的依据。
+3. **`sessions` 的 `source`/`seq` 传不到 `observe.log_refusals` 那个老函数里。**
+   那个函数只收 `(conn, child_id, hits)`，而幂等键需要 `seq` 与 `run_id`。
+   → 删掉它，写库搬进 `feedback.write_feedbacks`。
+4. **`plan_from_state` 还原出来的 `refusal_hits` 是 dict，不是对象。**
+   `write_feedbacks` 里 `getattr(h, "seq", 1)` 对 dict 恒取默认值 1 →
+   两条桥接记录撞成一行。→ 两种形态都认（`isinstance(h, dict)`）。
+5. **`llm_calls` 必须在跑完之后算。**
+   以前在跑之前算，于是命中 checkpoint 守卫时（实际一次 LLM 都没付）
+   前端仍显示"刚才那几秒在抽事件"。
+6. **断言写反了：** 「重复提交不多写一行」这条判据**正确时界面上看不出任何东西**
+   （数字一样）。所以必须有断言守着，否则有人把唯一索引去掉，
+   只会表现为"家长偶尔会发现抗拒次数不对" —— 而那个现象太容易被当成"记错了"。
+
 ## 五、待确认 / 遗留
 
-**Phase 4 开工时该优先解决的三条**（按建议顺序，均在下面有详述）：
+**Phase 4 的三条遗留已全部解决**（2026-10-21）：
+
+| # | 问题 | 怎么解决的 |
+|---|---|---|
+| 1 | `/api/feedbacks` **无幂等保护**，重复提交让 `refusal_counts` 翻倍误触冷却阈值 2 | 落库那半有唯一键（数据的性质）+ checkpoint 那半按输入指纹直接返回（不重跑不重付 LLM）。见第四节之五 |
+| 2 | `apply_transitions` 幂等键要加 `run_id` 隔离，否则**重跑一次多一行转移**（静默的状态抖动） | `run_id` = 「一天的执行」的身份（= thread_id），进 `skill_state` / `daily_summary` / `sessions` 三条唯一键 |
+| 3 | `/api/card` 与计划链两条独立路径，Phase 4 合并（让卡片**读**已生效计划） | 卡片按生效计划的 activity_ids 出；教练的 `ease`/`swap` 不再生效；缓存的键加上计划版本 |
+
+**Phase 5 开工时该优先解决的三条**（按建议顺序）：
 
 | # | 问题 | 位置 |
 |---|---|---|
-| 1 | `/api/feedbacks` **无幂等保护**，重复提交让 `refusal_counts` 翻倍误触冷却阈值 2 | 下面「Phase 1 之前就有的」 |
-| 2 | `apply_transitions` 幂等键要加 `run_id` 隔离，否则**重跑一次多一行转移**（静默的状态抖动） | 顶部「Phase 4 铺好的路」 |
-| 3 | `/api/card` 与计划链两条独立路径，Phase 4 合并（让卡片**读**已生效计划） | 下面「Phase 3 期间新发现的」 |
+| 1 | `workflow_audit_events` 表还没有 —— 红旗状态变更只有 `status_changed_at` 记时点，没有"谁在什么时候从什么改成了什么" | 下面「Phase 2 期间新发现的」 |
+| 2 | 分叉视图还没有 —— 「昨天那条其实做了」→ 改掉再看今天怎么变，现在只能手工换 thread_id 跑 | 第四节之五「Phase 5 开工前必须知道的四件事」 |
+| 3 | 身份鉴权还是没有 —— 13 条路由零用户概念，`child_id` 硬编码，`allow_origins=["*"]` | 技术方案 §9（Phase 6） |
 
 **Phase 3 期间新发现的：**
 
-- **计划链与 `/api/card` 是两条独立的路径，虽然现在结果一致。**
-  两者都走 `pack_day` + 同一个 `PlanRequest`，实测选出的活动完全相同
-  （`['gro-007', 'gro-006', 'fin-008']`）—— 但那是**当前恰好一致**，
-  不是结构上保证一致。将来任何一个改了装箱规则（比如 `/api/card` 加了
-  教练诊断的焦点优先），两条路就会分叉，
-  而家长看到的卡片与被批准的计划不是同一份。
-  → Phase 4 应当让 `/api/card` **读**已生效的计划，而不是自己再排一次。
-- **计划链目前不产生卡片。** 它排的是"今天做哪几条"，
-  卡片（步骤 / 提示阶梯 / 退路）仍然只有 `/api/card` 那条 LLM 路径能出。
-  家长批准的是"做哪几条"，看不到"具体怎么做" ——
-  这在 Phase 4 合并两条路径时一并解决。
+- ~~**计划链与 `/api/card` 是两条独立的路径。**~~ **Phase 4 已合并**：
+  卡片按生效计划的 activity_ids 出（一个不多一个不少），
+  教练的 `ease`/`swap` 不再生效（家长批准过的那一版不许被换掉），
+  缓存的键加上了计划版本（批了第 2 版 → 旧卡片自动作废）。
+- ~~**计划链目前不产生卡片。**~~ **Phase 4 已解决**：
+  卡片仍然由 `/api/card` 那条 LLM 路径出，但它**读**已生效的计划 ——
+  于是"家长批准的是哪几条"与"家长看到的是哪几条"是同一份。
 - **暂停仍然没有过期策略。** urgent 没人关就永远停着计划生成。
   Phase 3 **没有**重新审视它 —— 结论是**维持现状**：
   这是正确的临床默认（fail-closed），横幅让它可见可操作，

@@ -13,13 +13,14 @@
 > - 已装依赖与 PG 启动（`langgraph` **本来就在 1.2.16**；新装 `langgraph-checkpoint-postgres` 3.2.0）
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
-> - **Phase 0 / 1 / 2 / 3 均已完成**（2026-10-21 复核全绿）。图级验收 9 → **14 → 23 组**断言，
->   `http_selfcheck.py` **9 → 10 组**。Phase 1 的接线约束见第四节之二；
->   **Phase 3 开工必读 = 第四节之三末尾的「给 Phase 3 的合同」+ 整个第四节之四**
->   （图长什么样、实质性变更判据、要补的迁移、验收断言；带 ⚠️ 的没重新验证过）。
-> - **★ 下一步 = Phase 4（反馈链）**。**开工前必读 LANGGRAPH.md 顶部的
->   「🎯 Phase 4 开工前必须知道的四件事」**（暂停的唯一口径、计划链是独立的图、
->   唯一写库节点、以及 Phase 3 刚为反馈链铺好的路）。
+> - **Phase 0 / 1 / 2 / 3 / 4 均已完成**（2026-10-21 复核全绿）。图级验收 9 → **14 → 23 → 29 组**断言，
+>   `http_selfcheck.py` **9 → 10 → 12 组**。Phase 1 的接线约束见第四节之二；
+>   **Phase 4 开工必读 = 第四节之五**（图长什么样、幂等的两层、run_id 是什么、
+>   next_action 的判据、六个坑；带 ⚠️ 的没重新验证过）。
+> - **★ 下一步 = Phase 5（time travel）**。**开工前必读 LANGGRAPH.md 顶部的
+>   「🎯 Phase 5 开工前必须知道的四件事」**（run_id 必须跟着 thread_id 走、
+>   三条唯一索引是 Phase 4 的幂等承诺、分叉必须重新过安全闸门与审批、
+>   `workflow_audit_events` 还没有）。
 >
 > **★ 一条会静默咬人的实测结果**：`interrupt()` 恢复会重跑所在节点这件事
 > **只在 `PostgresSaver` 下可观测**，用 `InMemorySaver` 写单测会看到"只跑了一次"，
@@ -98,14 +99,14 @@
 > - **`planner.plan_week` 的去留已定**：保留作 CLI demo 的周计划，HTTP 走 `pack_day`。
 >   接进 `generate_plan` 是错的（一个是周、一个是天，会每天都判成有变更）。
 >
-> **下一步 = Phase 4（反馈链）**：`sessions` → `outcomes` 语义拆分；
-> `apply_transitions` 幂等键 + `run_id` 隔离；`next_action`
-> （`continue`/`adjust`/`pause`/`escalate`，主体调 `statemachine.propose_transition`）；
-> `/api/feedbacks` 的幂等保护（现在只有 `/api/close` 有）。
-> **开工顺序**：先读 `LANGGRAPH.md` 的「🎯 Phase 4 开工前必须知道的四件事」
-> 与「四之四、Phase 3 ✅ 已完成」那一节 —— 里面有本轮踩到的六个坑。
-> **别只读这一屏就开工**：Phase 4 会碰 `apply_transitions` 的幂等，
-> 那处踩坏了是**静默的状态抖动**（重跑一次多一行转移）。
+> **下一步 = Phase 5（time travel）**：`GET /api/threads/{id}/history` →
+> `graph.get_state_history(config)`；分叉视图 + 前后 diff；
+> `workflow_audit_events` 表落库。
+> **开工顺序**：先读 `LANGGRAPH.md` 的「🎯 Phase 5 开工前必须知道的四件事」
+> 与「四之五、Phase 4 ✅ 已完成」那一节 —— 里面有本轮踩到的六个坑。
+> **别只读这一屏就开工**：Phase 5 要做分叉，而分叉必须尊重 Phase 4 的
+> 三条唯一索引（键里都有 `run_id`）—— 踩坏了是**静默的状态抖动**
+> （重跑一次多一行转移）。
 >
 > **★ Phase 3 已为反馈链铺好路**（LANGGRAPH.md 顶部第 4 条）：
 > `sessions` 有 `plan_id`/`plan_version`，`store.log_session` 会**自动**把练习
@@ -114,6 +115,44 @@
 > 而 `apply_transitions` 的幂等键可以用
 > `(child_id, skill_item, run_id, from_state, to_state)`，
 > 其中 `run_id` 由 thread_id + checkpoint_id 派生，分叉天然不撞。
+
+> **Phase 4 ✅（2026-10-21，反馈链：幂等键 + 「接下来怎么办」）**。
+> 细节见 LANGGRAPH.md 第四节之五，**Phase 5 必读那一节**：
+> - **第三张图**（`graph/run_graph.py`，thread 前缀 `run:`）：
+>   `record_execution → analyze_outcome → next_action → apply_transitions`，
+>   直线，没有 interrupt。**写库只在最后一个节点** ——
+>   这条用「跑一遍去掉写库节点的图」验（selfcheck [28]），
+>   而不是用 trace 顺序糊弄过去。
+> - **★ 修掉一条真 bug**：`/api/feedbacks` 以前没有幂等保护，
+>   重复提交 → sessions 里两条 refused → `refusal_counts` 翻倍到 2
+>   → **当天误触冷却阈值** → 那条活动被踢出明天的候选，
+>   而界面上看不出为什么。现在**两层**保证：
+>   落库那半（三个唯一索引 + upsert）+ checkpoint 那半（输入指纹 →
+>   直接返回上次结果，**不重跑图、不重付 LLM**）。
+> - **`run_id` = 「一天的执行」的身份**（= thread_id = `run:{child}:{date}`），
+>   进 `sessions` / `skill_state` / `daily_summary` 三条唯一键。
+>   分叉出来的 thread 不同 → run_id 不同 → **分叉不撞真实历史**。
+> - **`next_action`：`continue` / `adjust` / `pause` / `escalate`**，
+>   **纯 Python 判**（红旗 / `store.plan_paused` / 回退型转移），
+>   随响应给前端。
+> - **★ 顺带修掉一个安全洞**：家长的原话有**两个入口** ——
+>   「其他观察」框（走观察链）与逐条活动的补充描述（走反馈链）。
+>   以前只有前者被红旗扫过，于是"他玩着玩着就去咬自己的袖子"
+>   **从来没被扫过** —— 不是扫了没命中，是压根没扫。
+> - **`/api/card` 读已生效的那一版计划**（遗留项 3）：
+>   教练的 `ease`/`swap` 不再生效（批准过的那一版不许被换掉），
+>   缓存的键加上计划版本（批了第 2 版 → 旧卡片自动作废）。
+> - `sessions` 补 `prompt_level` / `steps_done` 两列 ——
+>   它们以前只以中文形式塞在 `note` 里，结构化数据取不回来。
+>
+> **★ 本轮踩到的两个坑**（细节见 LANGGRAPH.md 第四节之五）：
+> - **老库里合法存在的重复行会让 `CREATE UNIQUE INDEX` 直接失败**，
+>   而它失败在迁移函数里 → 整个库连不上，症状是"服务起不来"，
+>   真正的原因一个字都没提。→ 先回填再建索引（已用模拟老库实测）。
+> - **`loop.py` 的 live 路径在第一次出卡片时就崩**
+>   （`out_prev = []` 把历史扔掉 + 类型传错）。
+>   12 个离线回归一个都不碰 live 路径，所以没人发现。
+>   **已修，但 live 路径本轮未实跑**（没有 replay fixture）。
 
 **✅ 工作区已提交**（2026-10-21，分支 `pg-langgraph-baseline`）：
 ```
@@ -131,6 +170,10 @@ ba68932 Phase 3 步 2：计划链图 + 审批 interrupt
 d082899 Phase 3 步 3：图级验收 14 → 23 组
 78362f4 Phase 3 步 4：审批 interrupt 接进 HTTP（HTTP 自检 9 → 10 组）
 8bf40ec Phase 3 步 5：前端接上计划审批面板
+8a9008f Phase 4 步 1：run_id 与幂等键（存储层底座）
+ad0edba Phase 4 步 2-3：反馈链图（第三张图）+ 图级验收 23 → 29 组
+abc5521 Phase 4 步 4：反馈链接进 HTTP（HTTP 自检 10 → 11 组）
+49bca92 Phase 4 步 5：/api/card 读已生效的那一版计划（遗留项 3）
 ```
 每一步都是可 revert 的独立 commit，改既有行为的那步单独成步。
 
@@ -185,9 +228,9 @@ cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
 **三个自检入口**（改图 / 改 server.py 之后必须跑，全绿才算数）：
 ```bash
 cd asd_agent
-ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 23 组
+ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 29 组
 ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
-ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 10 组
+ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 12 组
 ```
 
 **⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用
