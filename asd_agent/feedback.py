@@ -107,16 +107,35 @@ class DayFeedbackResult:
     degraded: bool = False
 
     def render(self) -> str:
-        L = [f"【{self.date} 的家长反馈】"]
-        for s in self.sessions:
-            L.append(f"  {s.activity_id} → {s.outcome}（质量 {s.quality:.2f}）")
-        if self.refusal_hits:
-            L.append(f"  观察桥接补记 {len(self.refusal_hits)} 条 refused session：")
-            for h in self.refusal_hits:
-                L.append(f"    {h.activity_id}  {h.note}")
-        if self.degraded:
-            L.append("  （--no-llm：补充描述未抽取事件，一条都不编）")
-        return "\n".join(L)
+        return render_day(self.date, self.sessions, self.refusal_hits,
+                          self.degraded)
+
+
+def render_day(date: str, sessions: list, refusal_hits: list,
+               degraded: bool = False) -> str:
+    """一天的反馈那段人话。**函数形式** —— 反馈链的 state 里没有对象，
+    只有 dump，所以渲染得能吃 dump。
+
+    ★ 为什么把它从 `DayFeedbackResult.render` 里拆出来：
+      以前它是方法，而方法的宿主是个 dataclass；
+      反馈链走完图之后手里只有**纯 dict**（checkpoint 的形状），
+      于是渲染也得能吃 dict —— 两处各写一遍文案必然漂移。
+    """
+    L = [f"【{date} 的家长反馈】"]
+    for s in sessions:
+        q = s.quality if hasattr(s, "quality") else (s.get("quality") or 0.0)
+        aid = s.activity_id if hasattr(s, "activity_id") else s.get("activity_id")
+        out = s.outcome if hasattr(s, "outcome") else s.get("outcome")
+        L.append(f"  {aid} → {out}（质量 {q:.2f}）")
+    if refusal_hits:
+        L.append(f"  观察桥接补记 {len(refusal_hits)} 条 refused session：")
+        for h in refusal_hits:
+            aid = h["activity_id"] if isinstance(h, dict) else h.activity_id
+            note = h["note"] if isinstance(h, dict) else h.note
+            L.append(f"    {aid}  {note}")
+    if degraded:
+        L.append("  （--no-llm：补充描述未抽取事件，一条都不编）")
+    return "\n".join(L)
 
 
 @dataclass

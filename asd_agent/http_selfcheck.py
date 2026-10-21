@@ -202,8 +202,114 @@ def main() -> int:
     print("\n[10] 计划链：审批 interrupt 的 HTTP 往返")
     check_plans(c, check)
 
+    # =============================================== 11. 反馈链（Phase 4）
+    print("\n[11] 反馈链：重复提交不多写一行 + 「接下来怎么办」")
+    check_feedback_chain(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_feedback_chain(c, check) -> None:
+    """★ Phase 4 的 HTTP 面。守四件事，缺一不可：
+
+    1. **重复提交不多写一行。** 这是 Phase 4 要修的真 bug：
+       以前 `/api/feedbacks` 没有幂等保护，家长（或前端的重复点击）
+       提交两次 → sessions 里两条 refused → `refusal_counts` 翻倍到 2
+       → **当天误触冷却阈值** → 那条活动被踢出明天的候选，
+       而界面上看不出为什么。
+    2. **重复提交不重付 LLM。** checkpoint 那道守卫的意义就在这：
+       只保证"不多写"的话，家长还是得为一个重复提交再等 20-60 秒。
+    3. **家长更正 → 覆盖当天那一条**，而不是多出一行。
+    4. **响应里有「接下来怎么办」**（continue/adjust/pause/escalate）——
+       这是反馈链比原来那条 HTTP 路径多出来的东西。
+
+    用另一个孩子：红旗与暂停都是**按孩子**判的，混用会互相污染。
+    """
+    import store as store_mod
+    from capabilities import ParentConstraints
+    from profile import _fallback_profile
+
+    cid = "http-check-run"
+    conn = store_mod.connect(DB)
+    store_mod.ensure_child(conn, cid, name="反馈链自检娃", age_months=34)
+    store_mod.save_profile(conn, _fallback_profile(cid, 34, ParentConstraints()))
+
+    d = "2026-11-20"
+    body = {"child_id": cid, "date": d, "no_llm": True,
+            "feedbacks": [{"activity_id": "gro-007", "outcome": "refused",
+                           "prompt_level": 3, "steps_done": 0, "note": ""}]}
+
+    # ---- 第一次 ----
+    r = c.post("/api/feedbacks", json=body)
+    check("/api/feedbacks 200", r.status_code == 200, r.text[:200])
+    b1 = r.json() if r.status_code == 200 else {}
+    check("★ refusal_counts = {'gro-007': 1}（核心断言）",
+          b1.get("refusal_counts") == {"gro-007": 1}, b1.get("refusal_counts"))
+    check("★ 响应里有「接下来怎么办」",
+          b1.get("next_action") in ("continue", "adjust", "pause", "escalate"),
+          b1.get("next_action"))
+    check("★ 理由是人话，不是空串", bool(b1.get("action_reason")),
+          b1.get("action_reason"))
+    check("★ 响应里还带着 close（老前端读它）",
+          bool(b1.get("close", {}).get("transition_text")) is not None
+          and "summary_text" in (b1.get("close") or {}), list((b1.get("close") or {}).keys()))
+    n1 = conn.execute("SELECT count(*) AS n FROM sessions WHERE child_id=%s",
+                      (cid,)).fetchone()["n"]
+
+    # ---- 第二次：一模一样 ----
+    r2 = c.post("/api/feedbacks", json=body)
+    b2 = r2.json() if r2.status_code == 200 else {}
+    n2 = conn.execute("SELECT count(*) AS n FROM sessions WHERE child_id=%s",
+                      (cid,)).fetchone()["n"]
+    check("★★ 重复提交：sessions 行数不变",
+          n2 == n1, f"{n1} → {n2}")
+    check("★★ 重复提交：refusal_counts 没有翻倍（这条就是 Phase 4 修的 bug）",
+          b2.get("refusal_counts") == {"gro-007": 1}, b2.get("refusal_counts"))
+    check("★ 重复提交命中了 checkpoint 守卫（没重跑图）",
+          b2.get("idempotent") is True, b2.get("idempotent"))
+    check("★ 重复提交没重付 LLM",
+          b2.get("llm_calls") == 0, b2.get("llm_calls"))
+    check("★ 日结也只有一行",
+          conn.execute("SELECT count(*) AS n FROM daily_summary WHERE child_id=%s",
+                       (cid,)).fetchone()["n"] == 1)
+
+    # ---- 第三次：家长更正 ----
+    fix = dict(body)
+    fix["feedbacks"] = [{"activity_id": "gro-007", "outcome": "success",
+                          "prompt_level": 0, "steps_done": 0, "note": ""}]
+    r3 = c.post("/api/feedbacks", json=fix)
+    b3 = r3.json() if r3.status_code == 200 else {}
+    n3 = conn.execute("SELECT count(*) AS n FROM sessions WHERE child_id=%s",
+                      (cid,)).fetchone()["n"]
+    check("★ 家长更正 → 行数不变", n3 == n1, f"{n1} → {n3}")
+    check("★ 家长更正 → 抗拒计数归零（覆盖，不是多出一行）",
+          b3.get("refusal_counts") == {}, b3.get("refusal_counts"))
+    check("★ 家长更正 → 命中的是**新**指纹（所以重跑了）",
+          b3.get("idempotent") is False, b3.get("idempotent"))
+
+    # ---- /api/close 走同一条链 ----
+    r4 = c.post(f"/api/close/{cid}", params={"on": d})
+    b4 = r4.json() if r4.status_code == 200 else {}
+    check("/api/close 200", r4.status_code == 200, r4.status_code)
+    check("★ /api/close 也给出「接下来怎么办」",
+          b4.get("next_action") in ("continue", "adjust", "pause", "escalate"),
+          b4.get("next_action"))
+    check("★ /api/close 没有让 sessions 多行",
+          conn.execute("SELECT count(*) AS n FROM sessions WHERE child_id=%s",
+                       (cid,)).fetchone()["n"] == n1)
+
+    # ---- 没有画像 → 400 ----
+    r5 = c.post("/api/feedbacks", json={"child_id": "no-such-child", "date": d,
+                                         "feedbacks": [], "no_llm": True})
+    check("没有画像 → 400", r5.status_code == 400, r5.status_code)
+
+    # ---- 非法 outcome → 422（构造时就拒，不该流到库里）----
+    r6 = c.post("/api/feedbacks", json={"child_id": cid, "date": d, "no_llm": True,
+                                         "feedbacks": [{"activity_id": "gro-007",
+                                                        "outcome": "succeess"}]})
+    check("★ 非法 outcome → 422（ActivityFeedback 构造时就拒）",
+          r6.status_code == 422, r6.status_code)
 
 
 def check_plans(c, check) -> None:
