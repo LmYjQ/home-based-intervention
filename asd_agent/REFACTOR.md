@@ -134,37 +134,98 @@
 4. 生成项能出卡片、能被家长反馈、能被状态机归属到正确的技能细项。
 5. 老 `plans.payload` / 老 checkpoint / 老 session 行**仍能读**。
 
-### 1.1 本阶段专属的坑（先看，再写代码）
+### 1.1 本阶段的图结构：**不变**
 
-1. **★ 指纹会被 ID 污染。** 现在的指纹是
+阶段 1 **不加图、不改边、不动 interrupt 位置**（第四张 `case:` 图是阶段 2 的事）。计划链保持：
+
+```
+START → select_goal → retrieve_activities → generate_plan → validate_plan
+      → substantive_change? ──是──→ ⚡ approve_plan ─┐ approve ─┤
+                                              reject ──┤→ freeze_plan
+                                                      │
+                                否 ───────────────────┘ → publish_plan → END
+```
+
+**为什么不用改图**（两条签名决定的）：
+
+- `activities.retrieve(req, *, pool=None)`（`activities.py:449`）本来就接受外部 `pool`，
+  默认才 `load_activities()` —— 生成项塞进 `pool` 就自动走同一条 `_hard_filter` + `_score`。
+- `planner.pack_day(cands, budget)`（`planner.py:420`）吃的是 `ScoredActivity`（里面包着一个 `Activity`），
+  **不是 activity_id 字符串** —— 生成项只要是同形状的 `Activity`，装箱逻辑一行不用改。
+
+**真正要改的只有四处**（其余是数据搬运）：
+
+| 位置 | 改什么 |
+|---|---|
+| `graph/plan_graph.py::plan_inputs()` | 照 `paused` 的先例，把 `extra_items` 算好注入 `PlanRequest`（**唯一口径在入口，节点体不查库**） |
+| `graph/plan_nodes.py:152` `retrieve_activities` | `retrieve(req)` → `retrieve(req, pool=load_activities() + req.extra_items)`；state 里 `candidate_ids` → `items`（带 `kind`，**纯 dict**） |
+| `graph/plan_nodes.py:190` `generate_plan` | `_cands(req, top_k=12)` **也要带 pool** —— 它现在又检索了一遍；两处都注入，否则 `excluded` 里显示了、装箱时却不见了 |
+| `planner.py:479` `plan_fingerprint` | 改成**语义签名**（见 1.3.4） |
+
+`validate_plan` 与 `pack_day` **不用动** —— 它们只看 Activity 的字段，生成项字段齐全就自动受约束。
+
+### 1.2 "方案要满足什么"流水线 = 九层，全是 0 token
+
+生成项要过的是**同一套**，区别只有三处（见 1.5）。
+
+| 层 | 逻辑 | 位置 |
+|---|---|---|
+| ① 装配 | `PlanRequest` 15 个字段（等级 / 目标状态 / 优先能区 / 时间预算 / 材料 / 抗拒 / 冷却 / 前置 / 最近 3 天 / 喜好…）+ `pool` | `activities.py:235` |
+| ② **硬过滤 6 条** | 超时间预算 / 必需材料不在家 / 抗拒 ≥2 次进冷却 / 前置未完成 / **难度闸门**（画像 level<2 而难度>1）/ 最近 3 天重复 —— 每条不通过都带**给家长看的中文原因** | `activities.py:275-304` |
+| ③ **打分 8 项** | `state_match .30`（状态机目标难度，最高项）`skill_gap .15` `prereq_ready .14` `preference .10` `diversity .10` `material_fit .08` `method_fit .08` `parent_pref .05` | `activities.py:324-334` |
+| ④ 负分 | 家长标不喜欢的**扣分不硬剔除**（活动 -1.0 / 材料 -0.6 / 场景 -0.4）→ 界面上能解释"因为您说…" | `activities.py:425-446` |
+| ⑤ **装箱** | 贪心占满预算；两条硬保证：活动不重复、**一天不重复练同一个技能细项**；成本 = `total_min + prep_min`（备料也是家长的时间） | `planner.py:420-475` |
+| ⑥ 计划级校验 3 条 + 指纹 | 草稿内重复活动 / 一天重复同一细项 / 超预算 + `is_substantive_change` 指纹比对；**校验不过也必须让人看见** | `plan_nodes.py:232-246` |
+| ⑦ 审批 interrupt | 只在**实质变更**时打断；`edit` 回检索重生成，最多 2 轮，且不再弹第二次 | `plan_nodes.py:252-294` |
+| ⑧ 发布 | **唯一写库节点**；`status` / `version` / `active` | `plan_nodes.py:324` |
+| ⑨ 执行侧 + 安全层 | 归属过滤（`evaluator.py:90`）→ 状态机（`statemachine.py:175`，含 `upgrade_min_confidence=0.5` 闸门）；红旗 → `store.plan_paused` → **不生成草稿** | — |
+
+> ★ 第 ③ 层里的 `state_match` 权重最高，是"喜好不能推翻教学判断"的成文处。
+> 生成项**同样按状态机目标难度打分** —— 它不是活动库里的东西，就更不该绕过难度。
+
+### 1.3 本阶段专属的坑（先看，再写代码）
+
+1. **★ 生成项会被静默丢出指纹。**
+   `generate_plan:193` 是这样的：
+   ```python
+   acts = _acts_by_id({"plan_activity_ids": [p.activity.activity_id for p in picks]})
+   "draft_fingerprint": plan_fingerprint([acts[i] for i in [...ids...] if i in acts])
+   ```
+   `_acts_by_id` 是**从活动库按 id 反查 Activity 对象**；生成项查不到 → 那个 `if i in acts`
+   **把它静默丢掉**。后果：**生成项的指纹永远不参与审批判据，换什么生成方案都不会打断家长**，
+   而且**不报错**。→ 指纹的输入必须改成"从 `items` 直接拿对象"，不能走活动库反查。
+2. **★ 指纹会被 ID 污染。** 现在的指纹是
    `(activity_id, materials集合, difficulty, prompt_hierarchy[0], duration*sessions)`（`planner.py:495-505`）。
    生成项的 ID 每次重新生成都不同 → **指纹必然变** → 每次都打断家长 →
    "只在真变化时审批"这条判据被它自己吃掉（`LANGGRAPH.md` 第四节之四记着这个坑的成因）。
-   → **指纹必须改成语义签名**（见 1.3.4）。
-2. **★ 技能归属会查不到人。** `evaluator.apply_transitions` 用
+   → **指纹必须改成语义签名**（见 1.4.4）。
+3. **★ 技能归属会查不到人。** `evaluator.apply_transitions` 用
    `activity.target_skill_items` 做归属过滤（`evaluator.py:90`），
    而 `store.sessions_for_skill` 靠**进程内活动库**反查 `activity_id → target_skill_items`
    （`PROGRESS.md` 第五节记着"技能/场景归属靠进程内活动库反查"这个老问题）。
    生成项不在活动库里 → 反查不到 → **它的 session 归属不到任何技能细项** → 状态机永远收不到这条证据。
-   → 执行记录必须**自带** `target_skill_items`（见 1.3.5）。
-3. **`Activity.activity_id` 有正则约束** `^[a-z]{2,4}-\d{3}$`（`activities.py:73-113`），
-   `gen:xxx` 过不了 → 要么放宽正则，要么把"项"和"活动"分成两层（见 1.3.2）。
-4. **`PlannedActivity.activity_id` 的字段说明写着"必须逐字取自候选表里的 activity_id"**
+   → 执行记录必须**自带** `target_skill_items`（见 1.4.5）。
+4. **★ `generate_plan` 会再检索一遍。** `retrieve_activities` 已经全量检索过一次，
+   `generate_plan` 又调 `activities.candidates(req, top_k=12)`（`plan_nodes.py:190`）。
+   生成项注入**两处都要加**，只加一处就会出现"`excluded` 里说明了、装箱时却不见了"的不一致。
+5. **`Activity.activity_id` 有正则约束** `^[a-z]{2,4}-\d{3}$`（`activities.py:73-113`），
+   `gen:xxx` 过不了 → 要么放宽正则，要么把"项"和"活动"分成两层（见 1.4.2）。
+6. **`PlannedActivity.activity_id` 的字段说明写着"必须逐字取自候选表里的 activity_id"**
    （`planner.py:55`）—— 这句话就是"方案 = 活动 ID 列表"这条约束的成文处，放宽时要一起改。
-5. **`coach._pick_adjustment` 的 `ease`/`swap` 依赖候选池**（`coach.py:426-444` 拿库里活动换），
+7. **`coach._pick_adjustment` 的 `ease`/`swap` 依赖候选池**（`coach.py:426-444` 拿库里活动换），
    生成项**换不动**（只能 keep / drop）→ 本阶段先记为已知限制，不为了它把活动库再拉回来。
-6. **`Activity.target_skill_items` 现在是自由文本**（不校验词表），但 `activities.retrieve` 用
+8. **`Activity.target_skill_items` 现在是自由文本**（不校验词表），但 `activities.retrieve` 用
    `SKILL_ITEM_DOMAIN` 反查能区（`vocab.py`）→ 生成项若带**词表外**的技能细项，反查会失败 →
    要么生成项只用词表内细项，要么能区反查要能兜底（阶段 3 才需要，本阶段先只允许词表内）。
 
-### 1.2 改动清单
+### 1.4 改动清单
 
 **新增**
 
 | 文件 | 职责 |
 |---|---|
 | `asd_agent/plan_item.py` | 方案项的**统一形状** + 库内项↔生成项的互转 + 语义签名（指纹用） |
-| `asd_agent/plan_item_selfcheck.py` 或并入 `activities.py --validate` | 本阶段自检（见 1.5） |
+| `asd_agent/plan_item_selfcheck.py` 或并入 `activities.py --validate` | 本阶段自检（见 1.7） |
 
 **修改**
 
@@ -179,16 +240,16 @@
 | `asd_agent/server.py` | `/api/card`、`/api/plan/{child}` 的 payload 兼容新 `items` 字段；`/api/feedbacks` 接受生成项的 `activity_id` |
 | `frontend/src/components/CoachCard.vue` / `FeedbackItem.vue` | 显示生成项时用 `origin` 说明出处 |
 
-### 1.3 详细设计
+### 1.5 详细设计
 
-#### 1.3.1 统一抽象：方案项（PlanItem）
+#### 1.5.1 统一抽象：方案项（PlanItem）
 
 **核心决定：放宽的是「ID 必须来自活动库」这条约束，不是「Activity 这个形状」。**
 
 理由：下游（planner / coach / evaluator / 卡片 / 反馈）读的都是 `Activity` 的**字段**，
 不是它的**来源**。改形状 = 改六个下游；改来源 = 只改一处 + 加一个转换函数。
 
-#### 1.3.2 `Activity` 的两处放宽
+#### 1.5.2 `Activity` 的两处放宽
 
 ```python
 class Activity(BaseModel):
@@ -203,7 +264,7 @@ class Activity(BaseModel):
   建议 `gen:{candidate_id}:{item_index}`，其中 `candidate_id` 是 `plan_candidates.id`（落库后即稳定）。
 - `origin` 是给人看的：家长在卡片上看到"这不是活动库里的现成做法"。
 
-#### 1.3.3 生成项怎么进计划：与库内项**同一条流水线**
+#### 1.5.3 生成项怎么进计划：与库内项**同一条流水线**
 
 **关键约束：生成项不享有任何豁免。** 它必须：
 
@@ -219,7 +280,7 @@ class Activity(BaseModel):
 
 > 这是本阶段最重要的一条：**放宽的是"方案从哪来"，不是"方案要满足什么"。**
 
-#### 1.3.4 指纹改成语义签名（本阶段的头号坑）
+#### 1.5.4 指纹改成语义签名（本阶段的头号坑）
 
 ```
 现在的指纹（planner.py:495-505）
@@ -245,7 +306,7 @@ class Activity(BaseModel):
   → 比较时两个格式都要能读（老格式按 `(activity_id, ...)` 比，新格式按语义签名比）；
   **老行不重写**（append-only，边界 #2）。
 
-#### 1.3.5 执行记录自带归属（第二个坑）
+#### 1.5.5 执行记录自带归属（第二个坑）
 
 `sessions` 表加一列 `target_skills JSON`，写 `sessions` 时**同时落**该行的 `target_skill_items`。
 
@@ -255,7 +316,7 @@ class Activity(BaseModel):
 - 顺带修掉 `PROGRESS.md` 第五节记的老问题：「技能/场景归属靠进程内活动库反查，
   全库没有指向 `activity_id` 的外键」—— 现在归属信息**跟着执行记录一起落库**了。
 
-#### 1.3.6 向后兼容
+#### 1.5.6 向后兼容
 
 | 老数据 | 怎么读 |
 |---|---|
@@ -266,7 +327,7 @@ class Activity(BaseModel):
 
 **不重写任何老行**（边界 #2）。
 
-### 1.4 本阶段的已知限制（明确写出来，别到时候当成 bug）
+### 1.6 本阶段的已知限制（明确写出来，别到时候当成 bug）
 
 1. 生成项**换不动**：教练的 `ease`/`swap` 只在库内候选池里挑，生成项只能 `keep` / `drop`。
 2. 生成项**不参与检索排序**：它是被"装配"进来的，不是被"检索"出来的（检索仍只查活动库）。
@@ -274,18 +335,20 @@ class Activity(BaseModel):
 4. 本阶段**不接 LLM**：生成项用**固定 fixture** 造（自检里手写一个），
    真正的 LLM 生成在阶段 3 —— 这样阶段 1 的每一条断言都不依赖网络。
 
-### 1.5 自检断言（建议 8 组）
+### 1.7 自检断言（建议 9 组）
 
 1. 库内项与生成项能被 `pack_day` 一起装箱；**生成项超预算时同样被砍掉**。
 2. 生成项同样过难度闸门（level<2 且 difficulty>1 → 被挡）与材料检查（essential 缺失 → 被挡）。
 3. 生成项能被打分，且 `state_match` 权重不因 `kind` 改变（喜好不能推翻教学判断这条不破）。
-4. **指纹**：同一生成项换 ID 但语义相同 → 指纹不变（不打断家长）；改步骤/材料/难度/起点提示级别 → 指纹变（打断）。
-5. 生成项能出卡片（`/api/card` 返回它，且带 `origin`）。
-6. 生成项的执行反馈**能落到正确的技能细项**（`sessions_for_skill` 不再依赖活动库反查）。
-7. 生成项能进状态机统计（`skill_state` 归属正确、`sessions` 唯一键不撞）。
-8. **老 payload / 老 checkpoint / 老 session 行仍能读**（各造一条老格式 fixture 验证）。
+4. **指纹不被静默丢弃**：生成项必须出现在 `plan_fingerprint` 的输入里
+   （现在 `_acts_by_id` 查不到就 `if i in acts` 丢掉 —— 这是坑 1，必须有断言守着）。
+5. **指纹**：同一生成项换 ID 但语义相同 → 指纹不变（不打断家长）；改步骤/材料/难度/起点提示级别 → 指纹变（打断）。
+6. 生成项能出卡片（`/api/card` 返回它，且带 `origin`）。
+7. 生成项的执行反馈**能落到正确的技能细项**（`sessions_for_skill` 不再依赖活动库反查）。
+8. 生成项能进状态机统计（`skill_state` 归属正确、`sessions` 唯一键不撞）。
+9. **老 payload / 老 checkpoint / 老 session 行仍能读**（各造一条老格式 fixture 验证）。
 
-### 1.6 验证命令
+### 1.8 验证命令
 
 ```bash
 cd asd_agent
@@ -299,12 +362,12 @@ cd ../frontend && npx vite build
 **真起服务打接口**：`/api/plan/run` → 看返回的 `items` 里有没有生成项；
 `/api/card` → 卡片能渲染它；`/api/feedbacks` → 提交它的反馈 → `GET /api/state` 能看到归属。
 
-### 1.7 提交要求
+### 1.9 提交要求
 
 一个可 revert 的 commit，message 写"为什么"（例：`放宽 activity_id：方案项统一抽象 + 指纹改语义签名 + 执行记录自带归属`）。
 提交前更新 `asd_agent/PROGRESS.md`（自检组数、验证结果、踩坑）与本文（勾状态 + 记录实际决策）。
 
-### 1.8 交接
+### 1.10 交接
 
 在本文阶段 1 末尾追加 `### 1.9 本阶段实际发生的事`：哪些设计被推翻、最终改了哪些文件、
 自检组数从多少到多少、遗留项、**下一阶段的第一件事**。
