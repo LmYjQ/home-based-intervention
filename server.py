@@ -72,10 +72,13 @@ from activities import explain_retrieval, retrieve
 from capabilities import AbilityProfile, ParentConstraints
 from coach import (CoachOutcome, ObservationInput, card_from_activity,
                    coach_today, render_feedback_form)
-from evaluator import TransitionsInput, apply_transitions
-from feedback import ActivityFeedback, apply_feedbacks, quality_for
+# ★ Phase 4：`apply_transitions` / `summarize_day` / `apply_feedbacks`
+#   **不再由本文件直接调用** —— 它们现在住在反馈链的节点里
+#   （`graph/run_nodes.py`），而 HTTP 这一层只负责把图跑起来。
+#   留着的 import 会让人以为"这里还有第二条落库路径"，
+#   而那正是 Phase 4 要消掉的东西。
+from feedback import ActivityFeedback, quality_for
 from planner import pack_day
-from summary import summarize_day
 import loop as loop_mod
 from schema import Observation
 
@@ -457,13 +460,20 @@ def api_card(inp: CardIn):
     def work(step):
         # ---- 已生成过就直接读（换页面/刷新都不重算）----
         prof_id = store.latest_profile_id(conn, inp.child_id)
+        # ★ Phase 4：**当天生效的那一版计划**也是缓存的键的一部分。
+        #   以前只看 profile_id，于是"家长批准了第 2 版计划"这件事
+        #   不会让旧卡片作废 —— 界面上还是第 1 版的那几条，
+        #   而家长批的是第 2 版。批准就白批了。
+        cur = store.active_plan(conn, inp.child_id, on=inp.date)
+        cur_plan = (int(cur["id"]), int(cur["version"])) if cur else (None, 0)
         if not inp.force:
             saved = store.latest_card(conn, inp.child_id, inp.date)
-            if saved and saved.get("profile_id") == prof_id:
+            if (saved and saved.get("profile_id") == prof_id
+                    and (saved.get("plan_id"), saved.get("plan_version")) == cur_plan):
                 step(f"{inp.date} 已经生成过（{len(saved.get('activities') or [])} 条），直接读")
                 return saved | {"cached": True}
             if saved:
-                step("画像已更新，之前排的那份作废 → 重新排")
+                step("画像或已批准的计划变了，之前排的那份作废 → 重新排")
 
         req = _build_request(conn, inp.child_id, prof, before=inp.date)
         step(f"检索候选（纯 Python，{len(req.refusal_counts)} 条抗拒记录参与）")
@@ -472,33 +482,57 @@ def api_card(inp: CardIn):
             step("候选表为空")
             return {"error": "候选表为空，今天不出卡片"}
 
+        # ★ Phase 4：卡片**读**当天生效的那一版计划，而不是自己再排一次。
+        #   以前两条路径各自 pack_day，结果**当前恰好一致**——
+        #   但那是巧合，不是结构上保证一致：将来任何一个改了装箱规则，
+        #   两条路就会分叉，而家长看到的卡片与被批准的计划不是同一份。
+        plan_ids = list(((cur or {}).get("payload") or {}).get("activity_ids") or [])
+        by_id = {s.activity.activity_id: s for s in cands}
+        planned = [by_id[i] for i in plan_ids if i in by_id]
+        if planned:
+            step(f"当天有一份已批准的计划（{len(planned)} 条）→ 卡片按它出")
+        else:
+            step("当天没有已批准的计划 → 按今天的候选自己装箱")
+
         prev = _recent_obs_inputs(conn, inp.child_id, before=inp.date)
         step(f"喂给诊断的观察 {len(prev)} 条（都是 {inp.date} 之前的）")
 
         prefs = prof.parent_constraints.preferences
+        focus_id = (planned[0].activity.activity_id if planned
+                    else cands[0].activity.activity_id)
         if no_llm:
             step("离线模式：用活动定义直接生成兜底卡片")
             out = CoachOutcome(
-                card=card_from_activity(cands[0].activity, prefs),
-                activity=cands[0].activity, degraded=True,
+                card=card_from_activity(by_id[focus_id].activity, prefs),
+                activity=by_id[focus_id].activity, degraded=True,
                 adjustment="（离线：使用活动定义直接生成的兜底卡片）")
         else:
             step("教练 Agent 调模型（2 次）")
             out = coach_today(
-                cands, today_id=cands[0].activity.activity_id,
+                cands, today_id=focus_id,
                 observations=prev, req=req, recent_summary=req.recent_summary,
+                # ★ 家长批准过的那一版不许被诊断换掉
+                keep_focus=bool(planned),
                 on_step=step)
         if out.adjustment:
             step(f"调整：{out.adjustment}")
 
-        # ---- 装箱：诊断选定的焦点先入箱，剩下的分钟数分给其余候选 ----
-        # 焦点可能已经被 _pick_adjustment 换过（ease/swap），所以要按换过之后的那条装箱，
-        # 不然会出现"诊断说换成 fin-004，装箱里却还是原来那条"的错位。
-        focus = next((x for x in cands
-                      if x.activity.activity_id ==
-                      (out.activity.activity_id if out.activity else cands[0].activity.activity_id)),
-                     None) or cands[0]
-        picks = pack_day(cands, req.daily_minutes, first=focus)
+        # ---- 装箱 ----
+        if planned:
+            # ★ 家长批准的就是要做的那几条：一个不多一个不少。
+            #   不再按预算重新装箱 —— 重新装箱就可能排出一份**不一样**的安排，
+            #   而那正是这一段要消灭的事。
+            picks = planned
+            focus = planned[0]
+        else:
+            # 诊断选定的焦点先入箱，剩下的分钟数分给其余候选。
+            # 焦点可能已经被 _pick_adjustment 换过（ease/swap），所以要按换过之后的那条装箱，
+            # 不然会出现"诊断说换成 fin-004，装箱里却还是原来那条"的错位。
+            focus = next((x for x in cands
+                          if x.activity.activity_id ==
+                          (out.activity.activity_id if out.activity else cands[0].activity.activity_id)),
+                         None) or cands[0]
+            picks = pack_day(cands, req.daily_minutes, first=focus)
         spent = sum(x.activity.total_min + x.activity.prep_min for x in picks)
         step(f"装箱：{len(picks)} 条，共 {spent} 分钟（预算 {req.daily_minutes}）")
 
@@ -527,6 +561,11 @@ def api_card(inp: CardIn):
         payload = {
             "date": inp.date,
             "profile_id": prof_id,
+            # ★ Phase 4：这份卡片是**照着哪一版计划**出的。
+            #   它是缓存的键的一部分（家长批准第 2 版 → 旧卡片作废），
+            #   也是"看到的与批准的同一份"这条承诺的凭据。
+            "plan_id": cur_plan[0],
+            "plan_version": cur_plan[1],
             "budget_minutes": req.daily_minutes,
             "total_minutes": spent,
             "activities": acts,
@@ -1033,53 +1072,161 @@ def api_draft_delete(child_id: str, date: str):
 
 @app.post("/api/feedbacks")
 def api_feedbacks(inp: FeedbackIn):
-    """★ 逐条反馈 → sessions + observations。**唯一有业务语义的新增路由。**
+    """★ 逐条反馈 → 走**反馈链**（Phase 4）。**唯一有业务语义的新增路由。**
 
     **不调 LLM 就能秒回**（outcome/quality 全是纯 Python 映射）；
-    只有 note 非空的条目才各触发一次抽取（可到 60s）。
+    只有 note 非空的条目才各触发一次抽取，另加一次日结（可到 60s）。
     响应里的 `llm_calls` 告诉前端"刚才那几秒是在抽事件"，
     否则家长会以为界面卡死了。
 
     ★ Phase 1：`other_notes` **不再**拿��去抽事件 ——「其他观察」改由
       `POST /api/observe/run` 的图接管。这里传空字符串，抽取只走逐条 note。
       `llm_calls` 的计数同步不再把它算进去。
+
+    ★ Phase 4：这条路由**不再自己落库**，改走反馈链
+      （`record_execution → analyze_outcome → next_action → apply_transitions`）。
+      路由形状、响应字段**一个没变** —— 前端不用改。
+      换来的是两件以前做不到的事：
+        1. **重复提交不多写一行**（以前 refusal_counts 会翻倍，
+           当天误触冷却阈值 —— 而界面上看不出为什么）。
+        2. **「接下来怎么办」有了一个可判定的答案**
+           （continue / adjust / pause / escalate），随响应一起给前端。
     """
     no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
     conn = _conn()
     _profile_or_400(conn, inp.child_id)
 
-    # ★ Phase 1：`other_notes` **不再**传给 apply_feedbacks。
-    #   它以前会在这里被抽一遍事件、落一遍库；而「其他观察」现在由
-    #   `POST /api/observe/run` 的图 publish 落库。两处都做 = 抽两次、
-    #   写两行、付两次 LLM，而且 refusal/recent_scenes 会被同一段话算两遍。
-    #   `apply_feedbacks` 本身**没有改** —— `loop.py` 的 CLI 还在用它那条路径。
     n_notes = sum(1 for f in inp.feedbacks if f.note.strip())
-    llm_calls = 0 if no_llm else n_notes
 
     t0 = time.time()
-    res = apply_feedbacks(conn, inp.child_id, inp.date, inp.feedbacks,
-                          other_notes="", no_llm=no_llm)
-    # ★ 家长提交当天最后一条反馈 → 自动收尾（状态转移 + 日结）。
-    #   不做成前端点第二个按钮：那条顺序不变量（记录先落库、再转移再日结）
-    #   是后端的性质，不该由前端记着。收尾本身幂等，重复提交不会重复转移。
-    close = api_close(inp.child_id, inp.date)
+    out = _run_feedback_chain(conn, inp.child_id, inp.date, inp.feedbacks,
+                               no_llm=no_llm)
+    # ★ llm_calls 在**跑完之后**才算 —— 因为命中 checkpoint 守卫时
+    #   一次 LLM 都没付（那正是这道守卫的意义：重复提交不该让家长再等 20-60 秒）。
+    #   以前它在跑之前算，于是前端会显示"刚才那几秒是在抽事件"，
+    #   而实际上什么都没发生。
+    # 日结那一次 LLM 也算进去（以前它藏在 /api/close 里，
+    # 父路由的 llm_calls 没算它 —— 前端于是以为"没有慢调用"）。
+    llm_calls = 0 if (out.get("_idempotent") or no_llm) else n_notes + 1
+
+    return _feedback_response(conn, inp.child_id, inp.date, out,
+                               llm_calls=llm_calls,
+                               elapsed_ms=int((time.time() - t0) * 1000))
+
+
+def _run_feedback_chain(conn, child_id: str, date: str, feedbacks, *,
+                         no_llm: bool, force: bool = False) -> dict:
+    """跑反馈链，返回它的最终 state。
+
+    ★ ★ 两层幂等，缺一不可
+    ----------------------
+    1. **checkpoint 那层**（这里）：同一天提交**一模一样**的内容 →
+       指纹（`feedback.feedback_digest`）相同 → **不重跑图**，
+       直接返回上次存下来的结果。
+       为什么需要它：图里有一次 LLM（日结），
+       只做第 2 层的话数据是对的，但家长要为一次重复提交再等 20-60 秒。
+
+    2. **落库那层**（唯一索引 + upsert）：同一次执行重跑一次不多写一行；
+       家长更正了某一条会**覆盖**当天那一条。
+
+    ★ 指纹变了（家长更正了）就该重跑 —— 这时第 2 层接手，
+       于是"更正"表现为覆盖而不是多出一行。
+    """
+    from graph.run_graph import run_inputs
+    from graph.runtime import get_run_graph
+    from graph.state import run_config
+
+    g = get_run_graph()
+    cfg = run_config(child_id, date)
+    inp = run_inputs(conn, child_id, date, feedbacks, no_llm=no_llm)
+
+    if not force:
+        prev = (g.get_state(cfg).values or {})
+        if (prev.get("input_digest") and prev["input_digest"] == inp["input_digest"]
+                and (prev.get("trace") or [])[-1:] == ["apply_transitions"]):
+            prev = dict(prev)
+            prev["_idempotent"] = True
+            return prev
+
+    out = dict(g.invoke(inp, cfg))
+    out["_idempotent"] = False
+    return out
+
+
+def _feedback_response(conn, child_id: str, date: str, out: dict, *,
+                       llm_calls: int, elapsed_ms: int) -> dict:
+    """把反馈链的最终 state 拼成 HTTP 响应。**字段与 Phase 3 一致**，
+    外加 Phase 4 新增的三样：`next_action` / `action_reason` / `red_flag_ids`。"""
+    from feedback import render_day
+
+    sessions = out.get("sessions") or []
+    hits = out.get("refusal_hits") or []
+    summary = out.get("daily_summary") or {}
+    transitions = out.get("transitions") or []
+    degraded = _degraded(out)
+
     # ★ 响应里带上 refusal_counts：手动测试清单里那条核心断言
     #   （Day1 只填 gro-007，fin-001/gro-006 点「跳过」→ 必须是 {'gro-007': 1}）
     #   就在这个字段上核对。
-    return {
-        "date": res.date,
-        "sessions": _jsonable(res.sessions),
-        "session_ids": res.session_ids,
-        "refusal_hits": _jsonable(res.refusal_hits),
-        "refusal_counts": store.refusal_counts(conn, inp.child_id),
-        "observations": _jsonable(res.outcomes),
-        "n_observations": len(res.observation_ids),
-        "degraded": res.degraded,
-        "llm_calls": llm_calls,
-        "elapsed_ms": int((time.time() - t0) * 1000),
-        "render": res.render(),
-        "close": close,
+    close = {
+        "date": date,
+        "transitions": _jsonable(transitions),
+        "transition_text": "\n".join(_transition_line(t) for t in transitions)
+                          or "今天没有转移 —— 升级闸门要求画像可信度 ≥ 0.5",
+        "summary": _jsonable(summary),
+        "summary_text": _render_summary(summary) if summary else "",
+        "states": store.current_states(conn, child_id),
+        "already_closed": False,
     }
+    return {
+        "date": date,
+        "sessions": _jsonable(sessions),
+        "session_ids": out.get("session_ids") or [],
+        "refusal_hits": _jsonable(hits),
+        "refusal_counts": store.refusal_counts(conn, child_id),
+        "observations": _jsonable(out.get("outcomes") or []),
+        "n_observations": len(out.get("observation_ids") or []),
+        "degraded": degraded,
+        "llm_calls": llm_calls,
+        "elapsed_ms": elapsed_ms,
+        "render": render_day(date, sessions, hits, degraded),
+        "close": close,
+        # ★ Phase 4 新增
+        "next_action": out.get("next_action") or "continue",
+        "action_reason": out.get("action_reason") or "",
+        "transitions": _jsonable(transitions),
+        "red_flag_ids": out.get("red_flag_ids") or [],
+        "outcome_stats": out.get("outcome_stats") or {},
+        "idempotent": bool(out.get("_idempotent")),
+        "trace": out.get("trace") or [],
+    }
+
+
+def _degraded(out: dict) -> bool:
+    """这一天有没有降级（模型不可用）。"""
+    for o in (out.get("outcomes") or []):
+        if isinstance(o, dict) and o.get("degraded"):
+            return True
+    return bool((out.get("daily_summary") or {}).get("degraded"))
+
+
+def _transition_line(t: dict) -> str:
+    """一条转移的人话。
+
+    ★ 刻意**还原成 `statemachine.StateTransition` 再调它的 `render`**，
+      而不是在这里另写一遍箭头与措辞 ——
+      两处各写一遍文案必然漂移，而漂移的后果是
+      "前端显示的转移"与"库里那条转移"长得不一样。
+    """
+    from statemachine import StateTransition
+    try:
+        return StateTransition(
+            skill_item=t.get("skill_item", ""), domain=t.get("domain", ""),
+            from_state=t.get("from_state", ""), to_state=t.get("to_state", ""),
+            reason=t.get("reason", ""), evidence=dict(t.get("evidence") or {}),
+            at_date=t.get("at_date", "")).render()
+    except Exception:
+        return str(t)
 
 
 @app.post("/api/close/{child_id}")
@@ -1091,16 +1238,18 @@ def api_close(child_id: str, on: str, force: bool = False):
       不该由前端负责维持：转移规则全是时间窗统计、要求当天记录已落库，
       拆成两个端点就等于把这个约束交给调用方记着。
 
-    ★ 幂等。自动触发意味着可能被重复调用（家长重复提交、网络重试），
-      而 `apply_transitions` **不幂等**：它 append_state 只追加，
-      跑第二次会读到第一次刚写入的状态（`since` 已推进），可能再转移一次
-      —— 就是 PROGRESS 坑 4 那个"状态抖动"。
-      `save_summary` 同理会插重复行。
-      → 已收尾过就直接返回落库的那份，不重跑。`force=true` 强制重算。
+    ★ Phase 4：这条路也**走反馈链**了（不提交新的反馈 = 重算模式）。
+      以前它自己调 `apply_transitions` + `summarize_day`，
+      于是"同一天收尾两次"要靠这一层自己判断（"已收尾就返回"）——
+      那是**调用方的自觉**，换个入口就没有了。
+      现在幂等是数据层的性质（唯一键），这一层只是**快**一点。
+
+    ★ 仍然保留"已收尾过就直接返回"这一道：它省掉一次 LLM 调用，
+      而家长不会因为点两下"收尾"就等两遍日结。
     """
     no_llm = _NO_LLM
     conn = _conn()
-    prof = _profile_or_400(conn, child_id)
+    _profile_or_400(conn, child_id)
 
     # ---- 幂等：当天已经收尾过就不重跑 ----
     # 判据是"这天有没有日结行"，不是 session 数。理由：`daily_summary` 是
@@ -1109,34 +1258,56 @@ def api_close(child_id: str, on: str, force: bool = False):
     if not force:
         done = store.latest_summary(conn, child_id, days=1, before=_plus1(on))
         if done and done[-1].get("date") == on:
+            # ★ 「接下来怎么办」从 checkpoint 里读 —— 反馈链跑完时算过一遍，
+            #   存在那儿了。读它不用再跑一次图，也不用付那次 LLM。
+            #   读不到（这一天是别处收尾的，比如 CLI）就退回"continue"，
+            #   而不是假装算过。
+            act, why = _stored_next_action(child_id, on)
             return {"date": on, "transitions": [], "transition_text": "（今天已经收尾过了）",
                     "summary": done[-1], "summary_text": _render_summary(done[-1]),
-                    "states": store.current_states(conn, child_id), "already_closed": True}
+                    "states": store.current_states(conn, child_id), "already_closed": True,
+                    "next_action": act, "action_reason": why}
 
-    sessions = summary_mod._sessions_on(conn, child_id, on)
-    # 顺序不变量：转移全部算完再逐条追加 —— apply_transitions 读的是
-    # append_state 之前的 current_states，边算边写会让同一天的后一条
-    # 转移看到前一条的结果。迁移前靠 _IO_LOCK 保证这段不被别的请求插进来。
-    ts = apply_transitions(TransitionsInput(date=on, sessions=sessions),
-                          store.current_states(conn, child_id), prof,
-                          conn=conn, child_id=child_id)
-    for t in ts:
-        store.append_state(conn, child_id, t)
-    summ = summarize_day(conn, child_id, on, sessions=sessions, no_llm=no_llm)
+    # ★ 走反馈链，**不提交新的反馈** → 图的 `record_execution` 从库里读
+    #   那天已经落了什么（重算模式）。于是这里算出来的与
+    #   `/api/feedbacks` 那次算的是**同一套口径**。
+    out = _run_feedback_chain(conn, child_id, on, [], no_llm=no_llm, force=True)
+    transitions = out.get("transitions") or []
+    summary = out.get("daily_summary") or {}
     return {
         "date": on,
-        "transitions": [_jsonable(t) for t in ts],
-        "transition_text": "\n".join(t.render() for t in ts) or
+        "transitions": _jsonable(transitions),
+        "transition_text": "\n".join(_transition_line(t) for t in transitions) or
                           "今天没有转移 —— 升级闸门要求画像可信度 ≥ 0.5",
-        "summary": _jsonable(summ),
-        "summary_text": summ.render(),
+        "summary": _jsonable(summary),
+        "summary_text": _render_summary(summary) if summary else "",
         "states": store.current_states(conn, child_id),
         "already_closed": False,
+        # ★ Phase 4 新增
+        "next_action": out.get("next_action") or "continue",
+        "action_reason": out.get("action_reason") or "",
     }
 
 
 def _plus1(d: str) -> str:
     return (date.fromisoformat(d) + timedelta(days=1)).isoformat()
+
+
+def _stored_next_action(child_id: str, date: str) -> tuple[str, str]:
+    """从反馈链的 checkpoint 里读上次算出来的「接下来怎么办」。**纯读。**
+
+    读不到就退回 ("continue", "") —— 读不到意味着这一天是别处收尾的
+    （比如 CLI 跑的），那就没有"接下来怎么办"可读。
+    宁可说"照常"，也不要编一个。
+    """
+    from graph.runtime import get_run_graph
+    from graph.state import run_config
+    try:
+        vals = (get_run_graph().get_state(run_config(child_id, date)).values or {})
+    except Exception:
+        return "continue", ""
+    return (vals.get("next_action") or "continue",
+            vals.get("action_reason") or "")
 
 
 def _render_summary(row: dict) -> str:
