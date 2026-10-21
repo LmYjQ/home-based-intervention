@@ -89,7 +89,7 @@ async def check_all() -> dict[str, Any]:
         result["fulltext"] = {"ok": False, "error": msg}
 
     # LLM 自检要发网络请求，replay 模式下跳过
-    result["llm"] = llm.health()
+    result["llm"] = await llm.health()
 
     if not all(
         result[k].get("ok")

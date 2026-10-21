@@ -1,4 +1,4 @@
-.PHONY: install db-up db-down migrate test dev ingest search eval health clean
+.PHONY: install db-up db-down migrate test dev demo feedback ingest search eval health clean
 
 PY := .venv/bin/python
 PIP := .venv/bin/pip
@@ -22,6 +22,18 @@ test:
 
 dev:
 	.venv/bin/uvicorn rdi_agent.api.main:app --reload
+
+# 固定演示输入，走完 追问 → 方案 → 选择 → 反馈
+demo:
+	$(PY) -m rdi_agent.cli --demo
+
+# 交互式 CLI
+cli:
+	$(PY) -m rdi_agent.cli
+
+# 录入一次尝试的反馈
+feedback:
+	$(PY) -m rdi_agent.cli --feedback
 
 ingest:
 	$(PY) -m rdi_agent.rag.ingest.pipeline --pdf data/documents/the_rdi_book.pdf

@@ -31,17 +31,17 @@ def _write_replay(tmp_path, stage: str, payload: dict) -> None:
 
 
 class TestReplay:
-    def test_replay_missing_file_raises(self, tmp_path, monkeypatch):
+    async def test_replay_missing_file_raises(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DEMO_MODE", "replay")
         monkeypatch.setenv("REPLAY_DIR", str(tmp_path))
         reset_settings()
         llm.configure(replay_dir=tmp_path)
         with pytest.raises(llm.LLMError, match="回放缺失"):
-            llm.chat_json(
+            await llm.chat_json(
                 system="s", user="u", model_cls=_Mini, name="mini", stage="mini"
             )
 
-    def test_replay_reads_file_without_network(self, tmp_path, monkeypatch):
+    async def test_replay_reads_file_without_network(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DEMO_MODE", "replay")
         reset_settings()
         llm.configure(replay_dir=tmp_path)
@@ -49,7 +49,7 @@ class TestReplay:
         key = llm._replay_key("mini", "s", "u")
         _write_replay(tmp_path, f"mini.{key}", {"content": '{"ok": false, "note": "x"}'})
 
-        result, trace = llm.chat_json(
+        result, trace = await llm.chat_json(
             system="s", user="u", model_cls=_Mini, name="mini", stage="mini"
         )
         assert result.ok is False
@@ -57,10 +57,10 @@ class TestReplay:
         assert trace.source == "replay"
         assert trace.latency_ms == 0
 
-    def test_health_in_replay_does_not_call_network(self, tmp_path, monkeypatch):
+    async def test_health_in_replay_does_not_call_network(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DEMO_MODE", "replay")
         reset_settings()
-        info = llm.health()
+        info = await llm.health()
         assert info["mode"] == "replay"
         assert info["llm_ok"] is True
         assert "不依赖网络" in info["note"]
@@ -70,18 +70,18 @@ class TestConfig:
     def test_keyword_backend_default(self):
         assert get_settings().keyword_backend == "postgres_fts"
 
-    def test_no_key_means_llm_unavailable(self, monkeypatch):
+    async def test_no_key_means_llm_unavailable(self, monkeypatch):
         monkeypatch.setenv("LLM_API_KEY", "")
         monkeypatch.setenv("DEMO_MODE", "live")
         reset_settings()
-        info = llm.health()
+        info = await llm.health()
         assert info["has_key"] is False
         assert info["llm_ok"] is False
         assert "LLM_API_KEY" in info["error"]
 
 
 class TestJsonSchemaWiring:
-    def test_uses_json_schema_not_json_object(self, monkeypatch, tmp_path):
+    async def test_uses_json_schema_not_json_object(self, monkeypatch, tmp_path):
         """捕获真正发出去的 request，确认 response_format 是 json_schema。"""
         captured: dict = {}
 
@@ -94,7 +94,8 @@ class TestJsonSchemaWiring:
             usage = None
 
         class _FakeCompletions:
-            def create(self, **kwargs):
+            # 必须是 async：真实客户端是 AsyncOpenAI，这里要被 await
+            async def create(self, **kwargs):
                 captured.update(kwargs)
                 return _FakeResp()
 
@@ -109,7 +110,7 @@ class TestJsonSchemaWiring:
         reset_settings()
         llm.configure(mode="live")
 
-        result, trace = llm.chat_json(
+        result, trace = await llm.chat_json(
             system="s", user="u", model_cls=_Mini, name="mini", stage="mini"
         )
         assert result.ok is True
@@ -119,7 +120,7 @@ class TestJsonSchemaWiring:
         assert "properties" in rf["json_schema"]["schema"]
         assert trace.source == "live"
 
-    def test_schema_violation_is_retried_with_error_feedback(self, monkeypatch):
+    async def test_schema_violation_is_retried_with_error_feedback(self, monkeypatch):
         """第一次返回缺字段，第二次修复成功。"""
         responses = ['{"note": "缺 ok 字段"}', '{"ok": true, "note": "修好了"}']
         calls: list[dict] = []
@@ -135,7 +136,7 @@ class TestJsonSchemaWiring:
                 self.usage = None
 
         class _FakeCompletions:
-            def create(self, **kwargs):
+            async def create(self, **kwargs):
                 calls.append(kwargs)
                 return _FakeResp(responses[len(calls) - 1])
 
@@ -150,7 +151,7 @@ class TestJsonSchemaWiring:
         reset_settings()
         llm.configure(mode="live")
 
-        result, trace = llm.chat_json(
+        result, trace = await llm.chat_json(
             system="s", user="u", model_cls=_Mini, name="mini", stage="mini"
         )
         assert result.ok is True

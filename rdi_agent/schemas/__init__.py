@@ -1,6 +1,13 @@
 """Pydantic 契约集合。所有节点输出都必须先过这里的校验。"""
 
 from rdi_agent.schemas.case import CaseSummary
+from rdi_agent.schemas.conversation import (
+    MAX_FOLLOWUP_QUESTIONS,
+    FollowupQuestions,
+    NextStep,
+    RecommendationSet,
+    SufficiencyDecision,
+)
 from rdi_agent.schemas.evidence import (
     EvidenceBundle,
     EvidenceDecision,
@@ -24,6 +31,7 @@ from rdi_agent.schemas.recommendation import (
 )
 
 __all__ = [
+    "MAX_FOLLOWUP_QUESTIONS",
     "ApplicationLabel",
     "CaseSummary",
     "ChildResponse",
@@ -32,10 +40,14 @@ __all__ = [
     "EvidenceItem",
     "FeedbackAnalysis",
     "FeedbackSubmission",
+    "FollowupQuestions",
     "MemoryCandidate",
     "MemoryType",
     "MemoryUpdateResult",
+    "NextStep",
     "ParentAction",
     "RecommendationCard",
+    "RecommendationSet",
     "SourceCitation",
+    "SufficiencyDecision",
 ]

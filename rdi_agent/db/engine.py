@@ -22,12 +22,24 @@ from rdi_agent.config import get_settings
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_engine_url: str | None = None
 
 
 def get_engine() -> AsyncEngine:
-    global _engine
+    """取全局连接池。
+
+    ``_engine_url`` 记录当前池是按哪个 URL 建的：改了 ``DATABASE_URL``
+    之后必须重建，否则会拿着旧连接去连新地址 —— 这在测试里尤其致命，
+    "数据库连不上要降级"那条用例会因为上一个用例留下的连接池而假通过。
+    """
+    global _engine, _engine_url, _sessionmaker
+    settings = get_settings()
+    if _engine is not None and _engine_url != settings.database_url:
+        # URL 变了，旧池直接丢弃。不 await 它的 close：这里不能阻塞，
+        # 旧连接会在空闲后由 pool 自己回收。
+        _engine = None
+        _sessionmaker = None
     if _engine is None:
-        settings = get_settings()
         _engine = create_async_engine(
             settings.database_url,
             pool_pre_ping=True,
@@ -36,6 +48,7 @@ def get_engine() -> AsyncEngine:
             echo=False,
             future=True,
         )
+        _engine_url = settings.database_url
     return _engine
 
 
@@ -64,8 +77,9 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
 
 async def dispose_engine() -> None:
     """关掉连接池。测试和优雅退出时调用。"""
-    global _engine, _sessionmaker
+    global _engine, _sessionmaker, _engine_url
     if _engine is not None:
         await _engine.dispose()
     _engine = None
     _sessionmaker = None
+    _engine_url = None

@@ -204,8 +204,8 @@ class Interaction(Base):
     child_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("children.id")
     )
-    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False)
     turn_id: Mapped[str] = mapped_column(String(64), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -223,7 +223,7 @@ class EvidenceBundleRecord(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=_uuid
     )
-    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     turn_id: Mapped[str] = mapped_column(String(64), nullable=False)
     bundle_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     retrieval_version: Mapped[str] = mapped_column(String(64), default="v1")
@@ -244,7 +244,7 @@ class Plan(Base):
     child_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("children.id")
     )
-    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     plan_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     plan_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     evidence_bundle_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -273,7 +273,7 @@ class Trial(Base):
     child_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("children.id"), nullable=False
     )
-    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     target: Mapped[str] = mapped_column(Text, nullable=False)
     planned_context_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="accepted")
@@ -322,7 +322,7 @@ class Observation(Base):
     child_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("children.id"), nullable=False
     )
-    conversation_id: Mapped[str | None] = mapped_column(String(64))
+    conversation_id: Mapped[str | None] = mapped_column(String(128))
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -381,7 +381,7 @@ class MemoryEvent(Base):
     event_type: Mapped[str] = mapped_column(String(32), nullable=False)
     before_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     after_json: Mapped[dict] = mapped_column(JSONB, default=dict)
-    source_conversation_id: Mapped[str | None] = mapped_column(String(64))
+    source_conversation_id: Mapped[str | None] = mapped_column(String(128))
     source_turn_id: Mapped[str | None] = mapped_column(String(64))
     confirmed_by_parent: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -21,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
 from rdi_agent.config import get_settings
@@ -75,11 +76,14 @@ class LLMUnavailable(LLMError):
 
 
 # ------------------------------------------------------------------ client
-_CLIENT: OpenAI | None = None
-_CLIENTS: dict[float, OpenAI] = {}
+# 全链路是 async（async SQLAlchemy / async FastAPI / async LangGraph），
+# 所以 LLM 出口也必须是 async：同步客户端会把事件循环堵住 5–20 秒，
+# 整个服务在那段时间里连健康检查都答不了。
+_CLIENT: AsyncOpenAI | None = None
+_CLIENTS: dict[float, AsyncOpenAI] = {}
 
 
-def client(timeout_s: float | None = None) -> OpenAI:
+def client(timeout_s: float | None = None) -> AsyncOpenAI:
     """按超时取 client，同一超时复用同一个连接池。
 
     不同 stage 的合理耗时差一个数量级：日常链路必须 20s 内返回，
@@ -98,9 +102,9 @@ def client(timeout_s: float | None = None) -> OpenAI:
     return _CLIENTS[t]
 
 
-def _make(timeout_s: float) -> OpenAI:
+def _make(timeout_s: float) -> AsyncOpenAI:
     settings = get_settings()
-    return OpenAI(
+    return AsyncOpenAI(
         api_key=settings.llm_api_key,
         base_url=settings.llm_base_url,
         timeout=timeout_s,
@@ -186,7 +190,7 @@ def _replay_save(stage: str, key: str, content: str) -> None:
 
 
 # ------------------------------------------------------------------ 主入口
-def chat_json(
+async def chat_json(
     *,
     system: str,
     user: str,
@@ -253,7 +257,7 @@ def chat_json(
             on_step(f"{stage} · 第{attempt}次尝试")
         t0 = time.time()
         try:
-            resp = client(timeout_s).chat.completions.create(
+            resp = await client(timeout_s).chat.completions.create(
                 model=model,
                 messages=messages,
                 response_format=rf,
@@ -266,7 +270,7 @@ def chat_json(
             trace.retries.append(msg[:120])
             if "api_key" in msg.lower() or "connection" in msg.lower() or attempt >= max_attempts:
                 raise LLMUnavailable(f"{stage} 连不上模型：{msg}") from e
-            time.sleep(min(2**attempt, 8))
+            await asyncio.sleep(min(2**attempt, 8))
             continue
 
         ch = resp.choices[0]
@@ -337,7 +341,7 @@ def _brief_errors(e: ValidationError, verbose: bool = False) -> str:
 
 
 # ------------------------------------------------------------------ 健康检查
-def health() -> dict[str, Any]:
+async def health() -> dict[str, Any]:
     """启动自检。demo 现场最怕的就是"以为在用真模型，其实 key 是空的"。"""
     settings = get_settings()
     mode = settings.demo_mode
@@ -357,7 +361,7 @@ def health() -> dict[str, Any]:
         info["error"] = "LLM_API_KEY 未配置"
         return info
     try:
-        client().chat.completions.create(
+        await client().chat.completions.create(
             model=settings.llm_model,
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
@@ -368,10 +372,10 @@ def health() -> dict[str, Any]:
     return info
 
 
-def warmup() -> None:
+async def warmup() -> None:
     """启动时打一发极短的请求预热连接，把 TLS 握手的延迟挡在第一次业务调用之前。"""
     try:
-        client().chat.completions.create(
+        await client().chat.completions.create(
             model=get_settings().llm_model,
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=1,
@@ -382,7 +386,9 @@ def warmup() -> None:
 
 
 if __name__ == "__main__":
+    import asyncio
     import sys
 
-    print(json.dumps(health(), ensure_ascii=False, indent=2))
-    sys.exit(0 if health()["llm_ok"] else 1)
+    info = asyncio.run(health())
+    print(json.dumps(info, ensure_ascii=False, indent=2))
+    sys.exit(0 if info["llm_ok"] else 1)

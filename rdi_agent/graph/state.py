@@ -28,6 +28,10 @@ class CoachState(TypedDict, total=False):
     case_summary: dict[str, Any]
     sufficiency_decision: dict[str, Any]
     followup_questions: list[str]
+    # 已经追问几轮。到 MAX_FOLLOWUP_ROUNDS 就强制收手，否则会无限追问下去
+    followup_rounds: int
+    # generate_followup 发现没东西可问时，直接跳去出方案，省掉一次空中断
+    route_override: str
 
     # 检索与证据
     retrieval_queries: dict[str, Any]
@@ -43,6 +47,13 @@ class CoachState(TypedDict, total=False):
 
     # 反馈与记忆
     feedback: dict[str, Any]
+    feedback_analysis: dict[str, Any]
+    next_step: dict[str, Any]
+    trial_id: str
+    plan_title: str
+    selected_plan_db_id: str
+    plan_db_ids: dict[str, str]
+    feedback_created: bool
     memory_candidates: list[dict[str, Any]]
     memory_update_result: dict[str, Any]
 

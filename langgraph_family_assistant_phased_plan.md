@@ -913,17 +913,17 @@ def await_plan_selection(state: CoachState) -> dict:
 
 ### 8.4 任务
 
-- [ ] 建最小业务表：`children`、`interactions`、`plans`、`trials`、`feedbacks`。
-- [ ] 写 `parse_parent_input` prompt，输出 `CaseSummary`。
-- [ ] 写 `check_sufficiency` prompt，输出 `{requires_followup, reasons, priority_questions}`。
-- [ ] 写 `generate_followup`，最多 3 个问题。
-- [ ] 写 `build_recommendation`，生成 2–3 张 `RecommendationCard`，其中一张 `recommended=True`。
-- [ ] 阶段 1 的建议卡必须包含观察指标、停止条件、不确定性说明；citation 为空。
-- [ ] 实现 `await_user_answer` / `await_plan_selection` 两个 pure interrupt 节点。
-- [ ] FastAPI：开始会话、发消息、查询会话、选择方案、提交反馈。
-- [ ] 先做 CLI 或单页 HTML，不投入复杂前端。
-- [ ] 准备固定演示输入：“孩子 4 岁，最近不愿意去幼儿园，早上出门就哭”。
-- [ ] 写一条端到端测试：3 轮内完成追问 -> 方案 -> 选择 -> 反馈。
+- [x] 建最小业务表：`children`、`interactions`、`plans`、`trials`、`feedbacks`（阶段 0 迁移已建，本阶段接 repository 层）。
+- [x] 写 `parse_parent_input` prompt，输出 `CaseSummary`。
+- [x] 写 `check_sufficiency` prompt，输出 `{requires_followup, reasons, priority_questions}`。
+- [x] 写 `generate_followup`，最多 3 个问题（`FollowupQuestions` 校验器强制）。
+- [x] 写 `build_recommendation`，生成 2–3 张 `RecommendationCard`，恰好一张 `recommended=True`。
+- [x] 阶段 1 的建议卡必须包含观察指标、停止条件、不确定性说明；citation 为空。
+- [x] 实现 `await_user_answer` / `present_plans` 两个 pure interrupt 节点。
+- [x] FastAPI：开始会话、发消息、查询会话、选择方案、提交反馈。
+- [x] 先做 CLI，不投入复杂前端（`rdi_agent/cli.py`，`make cli` / `make demo`）。
+- [x] 准备固定演示输入：“孩子 4 岁，最近不愿意去幼儿园，早上出门就哭”（`make demo`）。
+- [x] 写端到端测试：追问 → 恢复 → 方案 → 选择 → 反馈（`tests/test_graph_flow.py`）。
 
 ### 8.5 验收
 
@@ -935,6 +935,10 @@ def await_plan_selection(state: CoachState) -> dict:
 - 服务重启后，未完成会话能通过 Checkpointer 恢复。
 - 重试同一 `turn_id` 的请求不会重复创建方案或尝试。
 
+**待人工验证**（按你的要求，阶段 1 只做了语法和导入检查，没有跑测试）：
+`make demo` 和 `make test`。代码已通过 `compileall` + 全模块 import + 图编译，
+但流程行为、`followup_rounds` 兜底、幂等写入都要真跑一遍才算数。
+
 ### 8.6 刻意不做
 
 RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演示。
@@ -942,6 +946,68 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
 ### 8.7 交付物
 
 一个可实际运行的端到端 Demo，以及后续阶段复用的 State、契约和中断模式。
+
+#### 已落地的文件
+
+| 路径 | 内容 |
+|---|---|
+| `rdi_agent/schemas/conversation.py` | 流程契约：`SufficiencyDecision` / `FollowupQuestions`（硬上限 3 个）/ `RecommendationSet`（恰好一张推荐）/ `NextStep` |
+| `rdi_agent/prompts/chat.py` | 六个节点的 prompt，都带 `_COMMON_RULES`（禁诊断、只写观察、必须有停止条件） |
+| `rdi_agent/graph/nodes/chat_nodes.py` | `load_context` / `parse_parent_input` / `check_sufficiency` / `generate_followup` / `await_user_answer` / `build_recommendation` / `present_plans` |
+| `rdi_agent/graph/nodes/write_nodes.py` | `persist_candidate_plans` / `commit_plan_selection` —— **唯一允许写库的地方** |
+| `rdi_agent/graph/nodes/feedback_nodes.py` | `capture_feedback` / `analyze_feedback` / `next_step` |
+| `rdi_agent/graph/builder.py` | 两入口图，条件边分流；阶段 0 的 `echo` 占位节点已删 |
+| `rdi_agent/graph/runtime.py` | `AsyncPostgresSaver` 生命周期 + 图单例，`thread_id = conversation_id` |
+| `rdi_agent/db/repositories/case.py` | 幂等写：ON CONFLICT DO NOTHING 靠唯一约束挡重放 |
+| `rdi_agent/api/conversations.py` | 附录 A 的 5 个业务接口；把 LangGraph 的 `__interrupt__` 翻译成显式 `status` |
+| `rdi_agent/cli.py` | 交互式 CLI + `--demo` 固定输入 + `--feedback` 反馈录入 |
+| `tests/test_graph_flow.py` | 7 条：追问触发 / 跳过追问 / 中断恢复 / 追问上限 / 选方案提交 / 中断节点无副作用 / 反馈不中断 |
+| `tests/test_repository.py` | 4 条幂等性用例（连 Postgres，不可用时跳过） |
+| `rdi_agent/llm.py` | 唯一 LLM 出口，**async**（`AsyncOpenAI`）；`chat_json` / `health` / `warmup` 全是协程 |
+| `alembic/versions/002_widen_conversation_id.py` | `conversation_id` / `thread_id` 加宽到 VARCHAR(128)（阶段 0 定的 64 不够 86 字符的 id） |
+
+#### 落地时的五个决定
+
+1. **中断节点和写库节点分文件**。`chat_nodes` 里没有 session，
+   `write_nodes` 里没有 `interrupt`。这样"中断节点必须是纯函数"就不是靠自觉，
+   而是 import 边界本身就做不到。
+2. **追问那圈回到 `parse_parent_input`**，不是接一个新节点。家长的回答要重新并进
+   `CaseSummary` —— 事实是累积的，问一轮丢一轮就退化成单轮问答了。
+   收敛靠 `followup_rounds`，到 3 轮强制出方案（`MAX_FOLLOWUP_ROUNDS`），
+   且 `check_sufficiency` 会**覆盖模型"还要问"的判断**并记下理由。
+3. **候选卡在中断之前落库**（`status='proposed'`）。家长可能看到卡就关掉浏览器，
+   这一轮的分析不该丢掉。真正的 `selected` 由 `commit_plan_selection` 改。
+4. **`conversation_id` 直接编码 `family_id.child_id.uuid`**。省一张会话表。
+   阶段 5 上持久化调试时会换成真正的 conversation 表 —— 到那时 conversation_id
+   已经在外键里了，迁移是加列不是改主键。
+5. **LLM 出口是 async 的**（`AsyncOpenAI`）。整条链路都是 async —— async
+   SQLAlchemy、async FastAPI、async LangGraph —— 唯独 LLM 出口是同步的话，
+   一次 5~20 秒的模型调用会把事件循环整个堵住。**踩过的坑**：节点写
+   `await llm.chat_json(...)`，而 `chat_json` 当时是同步函数，
+   `await` 一个 tuple 直接 TypeError；单元测试却因为把 `llm.chat_json`
+   换成了 **async 替身**而全绿 —— 测的根本不是线上那个函数。
+   结论：替身必须和真身同签名（同步的别写成 async，async 的别写成同步）。
+
+#### 怎么手动测
+
+```bash
+# 第一次跑：先把阶段 1 的迁移应用上（002 把 conversation_id 加宽到 128）
+make migrate
+
+# 固定演示输入，走完 追问 → 方案 → 选择 → 反馈
+make demo
+
+# 真人对话
+make cli
+
+# API 直接调
+curl -s -XPOST localhost:8000/api/conversations \
+  -H 'content-type: application/json' \
+  -d '{"display_label":"4 岁男孩","age_band":"3-4"}'
+```
+
+**注意**：首次启动时 `lifespan` 会建 `langgraph` schema 并跑 Checkpointer 的
+DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_graph()` 的注释。
 
 ---
 
