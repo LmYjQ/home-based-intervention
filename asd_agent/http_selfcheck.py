@@ -206,8 +206,82 @@ def main() -> int:
     print("\n[11] 反馈链：重复提交不多写一行 + 「接下来怎么办」")
     check_feedback_chain(c, check)
 
+    # =============================================== 12. 卡片读已生效计划
+    print("\n[12] 卡片读已生效的那一版计划")
+    check_card_follows_plan(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_card_follows_plan(c, check) -> None:
+    """★ Phase 4 遗留项 3：`/api/card` 与计划链是两条独立路径。
+
+    以前两条路各自 `pack_day`，结果**当前恰好一致** ——
+    但那是巧合，不是结构上保证一致。将来任何一个改了装箱规则，
+    两条路就会分叉，而**家长看到的卡片与被批准的计划不是同一份**。
+
+    这一组守三件事：
+      1. 有生效的计划时，卡片就是**那几条**（一个不多一个不少）
+      2. 家长批了第 2 版 → 旧卡片作废（缓存的键要含计划版本）
+      3. 没有生效的计划时，回落到"按今天的候选自己装箱"（不 500、不空）
+
+    用另一个孩子：计划与暂停都是按孩子判的。
+    """
+    import store as store_mod
+    from capabilities import ParentConstraints
+    from profile import _fallback_profile
+
+    cid = "http-check-card"
+    conn = store_mod.connect(DB)
+    store_mod.ensure_child(conn, cid, name="卡片自检娃", age_months=34)
+    store_mod.save_profile(conn, _fallback_profile(cid, 34, ParentConstraints()))
+
+    d = "2026-12-01"
+
+    # ---- 没有计划时：回落 ----
+    r = c.post("/api/card", json={"child_id": cid, "date": d, "no_llm": True})
+    check("/api/card 200", r.status_code == 200, r.status_code)
+    job = r.json()["job_id"]
+    res = _await(c, job)
+    card0 = (res or {}).get("result") or {}
+    check("★ 没有生效计划时也出得来卡片（回落，不是空）",
+          bool(card0.get("activities")), card0.get("error"))
+    check("★ 回落时记着「没有计划」",
+          card0.get("plan_id") is None, card0.get("plan_id"))
+
+    # ---- 批一版计划 ----
+    r = c.post("/api/plan/run", json={"child_id": cid, "date": d})
+    check("/api/plan/run 200", r.status_code == 200, r.status_code)
+    check("★ 第一版必审批", r.json().get("phase") == "review", r.json().get("phase"))
+    r = c.post("/api/plan/review", json={"child_id": cid, "date": d,
+                                          "action": "approve"})
+    check("★ 批准成功", r.status_code == 200, r.status_code)
+    plan_ids = r.json().get("activities") or []
+    check("★ 计划里有活动", bool(plan_ids), plan_ids)
+
+    # ---- 卡片按计划出 ----
+    r = c.post("/api/card", json={"child_id": cid, "date": d, "no_llm": True,
+                                  "force": True})
+    res = _await(c, r.json()["job_id"])
+    card1 = (res or {}).get("result") or {}
+    got = [a["activity"]["activity_id"] for a in (card1.get("activities") or [])]
+    check("★★ 卡片就是被批准的那几条（顺序也一致）",
+          got == plan_ids, f"卡片={got} 计划={plan_ids}")
+    check("★ 卡片记着它是照哪一版计划出的",
+          card1.get("plan_id") is not None and card1.get("plan_version") == 1,
+          (card1.get("plan_id"), card1.get("plan_version")))
+
+    # ---- 批第 2 版 → 旧卡片作废 ----
+    conn.execute("UPDATE plans SET version = 2 WHERE child_id=%s", (cid,))
+    conn.commit()
+    r = c.post("/api/card", json={"child_id": cid, "date": d, "no_llm": True})
+    res = _await(c, r.json()["job_id"])
+    card2 = (res or {}).get("result") or {}
+    check("★ 计划版本变了 → 缓存作废，重新出（不是直接读旧的）",
+          card2.get("cached") is not True
+          and card2.get("plan_version") == 2,
+          (card2.get("cached"), card2.get("plan_version")))
 
 
 def check_feedback_chain(c, check) -> None:

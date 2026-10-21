@@ -591,6 +591,7 @@ def coach_today(
     preferences: PreferenceSet | None = None,
     req: PlanRequest | None = None,
     recent_summary: list[dict] | None = None,
+    keep_focus: bool = False,
     on_step=None,
 ) -> CoachOutcome:
     """今天的家长卡片。**两步 LLM 调用；任一步失败都返回一张完整可用的卡片。**
@@ -599,6 +600,15 @@ def coach_today(
     ★ 它只喂给 Step 1 诊断，不喂给 Step 2 出卡片 —— 出卡片要的是
       "这条活动怎么做"，方向判断与它无关，混进去只会让 7B 写出
       "因为他社交在进步所以今天做这个"这种倒因为果的话。
+
+    keep_focus
+        ★ Phase 4：**这一版是家长批准过的**，不许换。
+        诊断照跑（它给的是"为什么"与证据，家长看得见），
+        但 `ease` / `swap` / `drop` **不生效** ——
+        家长点了批准，系统就再替他改一次，那批准就没有意义了。
+        没有这一层时，卡片会按教练的建议换掉家长批准的那条，
+        于是"批准的和看到的是同一份"这件事不成立
+        （而前端那句「批完之后卡片要跟着重出」就是在等这个）。
     """
     observations = observations or []
     prefs = preferences or (req.preferences if req else PreferenceSet())
@@ -642,7 +652,12 @@ def coach_today(
             analysis = None      # 诊断失败不阻断，直接按 keep 走
 
     # ---- impact 落地（Python 决定换哪条，返回的就是选好的那一条）----
-    chosen, adjustment = _pick_adjustment(analysis, cands, today_id)
+    # ★ `keep_focus`：这一版是家长批准的，不许换（见 docstring）。
+    if keep_focus:
+        chosen = next((s for s in cands if s.activity.activity_id == today_id), None)
+        adjustment = ""
+    else:
+        chosen, adjustment = _pick_adjustment(analysis, cands, today_id)
     if chosen is None:      # drop
         return CoachOutcome(card=card_from_activity(cands[0].activity, prefs),
                             analysis=analysis, degraded=True, adjustment=adjustment,
