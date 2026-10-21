@@ -53,10 +53,13 @@ for f in vocab activities capabilities statemachine store redflag coach evaluato
 ganyu/
 ├── README.md                  ← 你在这
 ├── demand.md                  需求原文（面试自述的素材）
-├── plan.md                    实现计划（设计决策的出处）
+├── refract.md                 案例级重构的需求输入（2026-10-21，最新版）
+├── 孤独症家庭支持智能体_技术方案.md  产品/编排层技术方案（代码注释按章节号引用它，别删）
+├── docs/legacy/               已归档的旧设计稿（别照着实现）
 ├── c3bcca26-*.png             干预模式分类参考图（活动库方法标签的依据）
 └── asd_agent/
     ├── PROGRESS.md            ← 进度交接、实测结果、踩过的坑（换 session 动手前先读）
+    ├── REFACTOR.md            ← 案例级重构的分阶段执行文档（本次重构的唯一权威计划）
     ├── LANGGRAPH.md           ← LangGraph 编排层：实测结论（别抄文档，1.x 与网上示例有出入）
     ├── sources.md             方法级溯源（文献出处 / 国内指南锚点 / 证据边界）
     ├── results/2026-10-16/    verify_schema 的 A/B 实验产物
@@ -367,7 +370,8 @@ Phase 0 的图作为「下一步已经在做」的增量单独讲。
 | 文件 | 内容 |
 |---|---|
 | [`asd_agent/PROGRESS.md`](asd_agent/PROGRESS.md) | 进度交接：实际做到哪、验证结果、**踩过的坑（勿回退）** |
+| [`asd_agent/REFACTOR.md`](asd_agent/REFACTOR.md) | **案例级重构的分阶段执行文档**（本次重构的唯一权威计划） |
 | [`asd_agent/LANGGRAPH.md`](asd_agent/LANGGRAPH.md) | LangGraph 编排层：实测结论与 Phase 0-6 路线 |
 | [`asd_agent/sources.md`](asd_agent/sources.md) | 方法级溯源 + 证据边界 |
-| [`plan.md`](plan.md) | 实现计划（设计决策的出处） |
+| [`refract.md`](refract.md) | 案例级重构的需求输入 |
 | [`demand.md`](demand.md) | 需求原文 |
