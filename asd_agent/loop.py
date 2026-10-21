@@ -228,6 +228,15 @@ def build_request(conn, child_id: str, prof: AbilityProfile, *,
     前者读到的是"含今天反馈前"的记忆，后者读到"含今天反馈后"的。
     不加这个参数，今天刚写的日结会回过头来解释今天要做什么，方向反了。
     """
+    # ★ ★ 生成项（活动库之外的那些方案项）也**在这里**装配。
+    #   全项目**唯一**一处装配点 ——
+    #   候选表（/api/plan/{child}）、计划链（plan_inputs → 图入口）、
+    #   卡片（/api/card）三条路径全都经过 `build_request`，
+    #   在这里装一次就够了。
+    #   （REFACTOR.md §1.3.4 记的"双注入"坑：
+    #     在 `plan_inputs` 与 `retrieve_activities` 各装一次的话，
+    #     `excluded` 里说明了、装箱时却不见了，两处必然漂。）
+    import generated
     pc = prof.parent_constraints
     states = store.current_states(conn, child_id)
     by_domain: dict[str, str] = {}
@@ -250,6 +259,7 @@ def build_request(conn, child_id: str, prof: AbilityProfile, *,
         successes_outside_home=store.successes_outside_routine(conn, child_id),
         preferences=pc.preferences,
         recent_summary=store.latest_summary(conn, child_id, days=7, before=before),
+        extra_items=generated.items_for(conn, child_id, before or ""),
     )
 
 

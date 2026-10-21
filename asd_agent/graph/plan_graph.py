@@ -160,10 +160,11 @@ def build_plan_graph(saver=None, *, name: str = "ganyu_plan"):
 
 
 # ================================================================== 图入口
-def plan_inputs(conn, child_id: str, day: str) -> dict:
+def plan_inputs(conn, child_id: str, day: str, *,
+                extra_items: list | None = None) -> dict:
     """★ 计划链的入参装配。**图入口，节点体之外**。
 
-    两件事，顺序不能换：
+    三件事，顺序不能换：
 
     1. **`store.plan_paused(conn, child_id)`** —— 全项目「暂停计划生成」的
        **唯一口径**（LANGGRAPH.md 第四节之三定的那条 SQL）。
@@ -176,6 +177,13 @@ def plan_inputs(conn, child_id: str, day: str) -> dict:
        （`server.py:_build_request` 是它的薄封装）。
        `before=day` 让教练/日结读的是**这一天之前**的记忆：
        今天刚写下的反馈不该回过头来解释今天做什么。
+
+    3. **`extra_items`** —— 装配进来的生成项（不在活动库里的那些方案项）。
+       **唯一口径在入口**：节点体不查库、也不自己再拼一次池
+       （REFACTOR.md §1.1 / §1.3.4）。
+       它们跟着 `plan_request` 一起序列化进 checkpoint，
+       节点还原 request 时一并拿到 —— 于是"生成项在不在池里"
+       这件事在整条链上只有一处说了算。
 
     没有画像时抛异常而不是造一份降级画像：
     降级画像 `overall_confidence=0.1`，会让状态机的升级闸门全部关死
@@ -199,6 +207,15 @@ def plan_inputs(conn, child_id: str, day: str) -> dict:
     #   （实测：漏了这一步时，第二天输入完全相同也会弹审批，
     #     理由还写着"第一次生成计划"。）
     cur = store_mod.active_plan(conn, child_id)
+    req = loop_mod.build_request(conn, child_id, prof, before=day)
+    # ★ 生成项进 request。**唯一口径在入口** ——
+    #   节点体是纯计算层，一旦两个节点各加一次，池就会不一致
+    #   （`excluded` 里说明了、装箱时却不见了）。
+    #   `build_request` 已经装配过一次（候选表/卡片/计划链共用它），
+    #   这里只有调用方**显式**给了生成项时才覆盖 ——
+    #   否则会把它刚装好的那批冲掉（自检里就是这么注入 fixture 的）。
+    if extra_items is not None:
+        req.extra_items = list(extra_items)
     return {
         "child_id": child_id,
         "date": day,
@@ -208,6 +225,5 @@ def plan_inputs(conn, child_id: str, day: str) -> dict:
         "paused": store_mod.plan_paused(conn, child_id),
         # ★ 检索请求口径：只此一处。存的是**纯 dict**
         #   （request_to_dict），理由见 plan_nodes._req 的注释。
-        "plan_request": request_to_dict(
-            loop_mod.build_request(conn, child_id, prof, before=day)),
+        "plan_request": request_to_dict(req),
     }

@@ -33,6 +33,7 @@ from datetime import date, timedelta
 from pydantic import BaseModel, ConfigDict, Field
 
 import llm
+import plan_item
 from activities import (
     Activity,
     PlanRequest,
@@ -52,7 +53,9 @@ Slot = str  # morning / afternoon / evening / anytime
 class PlannedActivity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    activity_id: str = Field(description="必须逐字取自候选表里的 activity_id")
+    activity_id: str = Field(
+        description="必须逐字取自候选表里的 activity_id"
+                    "（候选表里的项可能是活动库里的，也可能是模型生成的）")
     slot: Slot = Field(description="morning / afternoon / evening / anytime")
     minutes: int = Field(ge=2, le=20, description="预计用时（分钟）")
     why_this: str = Field(
@@ -476,6 +479,17 @@ def pack_day(cands: list[ScoredActivity], budget_minutes: int, *,
 
 
 # ================================================================== 实质性变更判据
+def _item_signature(a: Activity) -> tuple:
+    """**一个方案项的语义签名** —— 指纹的比较单位。
+
+    ★ 实现放在 `plan_item.signature`（方案项的统一抽象那一处），
+      这里只做一次转发 —— 指纹与"方案项"是同一件事的两个视角，
+      两处各写一遍必然漂移，而漂移的后果是"指纹漏算了一项"，
+      那种错**不报错**。
+    """
+    return plan_item.signature(a)
+
+
 def plan_fingerprint(acts: list[Activity]) -> dict:
     """一份计划的可比较"指纹"。**纯函数、零 token、可重放。**
 
@@ -491,23 +505,28 @@ def plan_fingerprint(acts: list[Activity]) -> dict:
       `prompt_hierarchy` 同理 —— 提示阶梯**从轻到重**排，
       "起点提示级别"取的是 `[0]`（最轻的那一级），
       也就是"从哪一级开始提示"，那才是执行上的区别。
+
+    ★ `v` 字段：指纹格式的版本号。
+      老行（`plans.payload.fingerprint`）里存的是 v1 格式 ——
+      它的 `activities` 里带 `activity_id`，而 v2 不带。
+      两种格式都能读，但**不能混着比**：v1 的条目按 id 比，
+      v2 的按语义签名比。见 `is_substantive_change` 的注释。
     """
     return {
+        "v": 2,
         "skills": sorted({it for a in acts for it in a.target_skill_items}),
-        "activities": sorted(
-            (a.activity_id,
-             sorted({m.name for m in a.materials}),
-             a.difficulty,
-             # 起点提示级别 = 提示阶梯最轻的那一级
-             (a.prompt_hierarchy[0] if a.prompt_hierarchy else ""),
-             a.duration_min * a.sessions_per_day)
-            for a in acts),
+        "items": sorted(_item_signature(a) for a in acts),
     }
 
 
 #: 指纹里哪些字段变了算"实质性变更"。**一张表，不是一个 if 链** ——
 #: 因为半年后有人加一条判据时，要改的地方必须一眼看得见。
-SUBSTANTIVE_FIELDS = ("skills", "activities")
+SUBSTANTIVE_FIELDS = ("skills", "items")
+
+
+def _is_v2(fp: dict) -> bool:
+    """这份指纹是不是 v2（语义签名）格式。"""
+    return int(fp.get("v") or 1) >= 2
 
 
 def is_substantive_change(new_fp: dict, old_fp: dict | None) -> tuple[bool, list[str]]:
@@ -518,44 +537,153 @@ def is_substantive_change(new_fp: dict, old_fp: dict | None) -> tuple[bool, list
     而"要不要现在就做这三条"恰恰是最该由人拍板的一次。
     把它判成"无变更"等于让系统替家长做了第一次决定。
 
+    ★ ★ 老指纹怎么比（v1 vs v2）
+    ---------------------------
+    指纹是**存进 `plans.payload`** 的，而老行里存的是 v1 格式
+    （`activities` 里带 `activity_id`）。边界 #2 是 append-only，
+    **老行不重写** —— 所以这里必须两种格式都能读。
+
+    判据：**同一版本比同一版本**。
+      · v2 vs v2 → 比语义签名（不看 ID：换 ID 不算变，见 `_item_signature`）
+      · v1 vs v1 → 按老的口径比（带 ID），保证升级前的行为一字不变
+      · v1 vs v2 → **保守判成有变更**。
+        理由：两套口径的单位不同（一条 v1 记录带 ID，一条 v2 记录不带），
+        硬凑一个比较口径出来的"没变化"是**假阴性** ——
+        而"假阴性"的后果是家长在方案真的变了的时候没被打断。
+        这条只发生在升级当天（第一次跑新代码时对比老行），之后两侧都是 v2。
+
     返回 `(是否实质性变更, 理由列表)`。理由是**给人看的中文**，
     前端直接渲染 —— 让家长知道"到底哪里变了"，
     否则一个"同意/不同意"的按钮就是在让人盲签。
     """
     if old_fp is None:
         return True, ["第一次生成计划，之前没有生效的版本可比"]
+
     reasons: list[str] = []
-    for field in SUBSTANTIVE_FIELDS:
-        if new_fp.get(field) == old_fp.get(field):
-            continue
-        if field == "skills":
-            a, b = set(old_fp.get("skills") or []), set(new_fp.get("skills") or [])
-            add, drop = sorted(b - a), sorted(a - b)
-            if add:
-                reasons.append("新增练习目标：" + "、".join(add))
-            if drop:
-                reasons.append("不再练：" + "、".join(drop))
-        else:
-            old_map = {x[0]: x for x in (old_fp.get("activities") or [])}
-            new_map = {x[0]: x for x in (new_fp.get("activities") or [])}
-            added = sorted(set(new_map) - set(old_map))
-            removed = sorted(set(old_map) - set(new_map))
-            if added:
-                reasons.append(f"新增活动：{'、'.join(added)}")
-            if removed:
-                reasons.append(f"去掉活动：{'、'.join(removed)}")
-            for aid in sorted(set(new_map) & set(old_map)):
-                o, n = old_map[aid], new_map[aid]
-                if o[1] != n[1]:
-                    reasons.append(f"{aid} 材料变了：" + "→".join(
-                        ["、".join(o[1]) or "无", "、".join(n[1]) or "无"]))
-                if o[2] != n[2]:
-                    reasons.append(f"{aid} 难度 {o[2]}→{n[2]}")
-                if o[3] != n[3]:
-                    reasons.append(f"{aid} 起点提示级别变了")
-                if o[4] != n[4]:
-                    reasons.append(f"{aid} 时长 {o[4]}→{n[4]} 分钟")
+    # ---- 练习目标：两个版本都有这个字段，口径一致 ----
+    a_skills = set(old_fp.get("skills") or [])
+    b_skills = set(new_fp.get("skills") or [])
+    add, drop = sorted(b_skills - a_skills), sorted(a_skills - b_skills)
+    if add:
+        reasons.append("新增练习目标：" + "、".join(add))
+    if drop:
+        reasons.append("不再练：" + "、".join(drop))
+
+    # ---- 逐项比较 ----
+    if _is_v2(new_fp) and _is_v2(old_fp):
+        reasons += _diff_items_v2(new_fp, old_fp)
+    elif not _is_v2(new_fp) and not _is_v2(old_fp):
+        reasons += _diff_items_v1(new_fp, old_fp)
+    else:
+        # 跨版本：口径不同，保守判成有变更（理由里说清楚，不装作比过）
+        reasons.append("计划记录的格式升级了，本次按新的方式重新校对了一遍")
     return bool(reasons), reasons
+
+
+def _norm_sig(sig) -> tuple:
+    """把一条语义签名**归一成可哈希的 tuple**。
+
+    ★ 为什么需要这一步：指纹要落进 `plans.payload`（JSON），
+      JSON 里没有 tuple —— 存进去再读出来就是 list of list。
+      而语义签名的比较单位是集合（`set(...)`），list 不可哈希，
+      于是"读回来的老指纹"一比就炸 `TypeError: unhashable type: 'list'`。
+      更糟的是不归一时**新指纹（tuple）与老指纹（list）永远不相等**，
+      第二天明明什么都没变也会被判成"有变更" → 天天打扰家长。
+
+      所以归一必须发生在**读侧**，而不是改写老行（老行是 append-only 的）。
+    """
+    if isinstance(sig, (list, tuple)):
+        return tuple(_norm_sig(x) for x in sig)
+    if isinstance(sig, dict):
+        return tuple(sorted((k, _norm_sig(v)) for k, v in sig.items()))
+    return sig
+
+
+def _diff_items_v2(new_fp: dict, old_fp: dict) -> list[str]:
+    """v2 vs v2：按**语义签名**比，不看 activity_id。
+
+    ★ 为什么理由里仍然出现 id：那只是**给人看的说明**，
+      判据本身与 id 无关 —— 一个换了 id 但语义完全一样的项，
+      不会出现在"新增/去掉"里。
+      （它会出现在"同 id 的项内容变了"里 —— 那才是真变化。）
+
+    ★ 怎么把"变了"说成人话：
+      v2 的条目没有 id 可作 key（那正是要点），所以按**同一练习目标**
+      分组比对：目标 + 难度 + 起点提示 + 时长相同的那几条，
+      就是"同一件事的两种做法" —— 说"材料/步骤变了"；
+      目标本身不同的那几条，就是"换了一项" —— 说"新增/去掉"。
+    """
+    reasons: list[str] = []
+    old_sigs = [_norm_sig(s) for s in (old_fp.get("items") or [])]
+    new_sigs = [_norm_sig(s) for s in (new_fp.get("items") or [])]
+    old_set, new_set = set(old_sigs), set(new_sigs)
+    if old_set == new_set:
+        return reasons      # 语义完全一样（哪怕 id 全变了）→ 不打断
+
+    def group(sig: tuple) -> tuple:
+        """同一"件事"的分组键：目标 + 难度 + 起点提示 + 时长。
+        步骤与材料不进分组键 —— 它们正是同组内会变的部分。"""
+        return (sig[0], sig[2], sig[3], sig[4])
+
+    old_groups: dict[tuple, list[tuple]] = {}
+    new_groups: dict[tuple, list[tuple]] = {}
+    for s in old_sigs:
+        old_groups.setdefault(group(s), []).append(s)
+    for s in new_sigs:
+        new_groups.setdefault(group(s), []).append(s)
+
+    changed = added = removed = 0
+    for key, olds in old_groups.items():
+        news = new_groups.get(key) or []
+        if set(olds) == set(news):
+            continue
+        # 同组内内容变了 —— 措辞里带上"练什么"
+        label = "、".join(key[0]) or "有一项"
+        changed += 1
+        reasons.append(f"{label} 的做法变了（材料或步骤与上次不同）")
+    for key, olds in old_groups.items():
+        if key not in new_groups:
+            removed += len(olds)
+            label = "、".join(key[0]) or "有一项"
+            reasons.append(f"不再练：{label}")
+    for key, news in new_groups.items():
+        if key not in old_groups:
+            added += len(news)
+            label = "、".join(key[0]) or "有一项"
+            reasons.append(f"新增：{label}")
+    if not reasons:
+        reasons.append("有一项的做法变了")
+    return reasons
+
+
+def _diff_items_v1(new_fp: dict, old_fp: dict) -> list[str]:
+    """v1 vs v1：**照搬升级前的口径**，一个字都不改。
+
+    ★ 为什么留着这一份：老行（`plans.payload`）里存的是 v1 指纹，
+      它要与另一份 v1 指纹比较 —— 这条路径的行为必须与升级前**逐字一致**，
+      否则"升级后第一天就莫名其妙打断家长"。
+    """
+    reasons: list[str] = []
+    old_map = {x[0]: x for x in (old_fp.get("activities") or [])}
+    new_map = {x[0]: x for x in (new_fp.get("activities") or [])}
+    added = sorted(set(new_map) - set(old_map))
+    removed = sorted(set(old_map) - set(new_map))
+    if added:
+        reasons.append(f"新增活动：{'、'.join(added)}")
+    if removed:
+        reasons.append(f"去掉活动：{'、'.join(removed)}")
+    for aid in sorted(set(new_map) & set(old_map)):
+        o, n = old_map[aid], new_map[aid]
+        if o[1] != n[1]:
+            reasons.append(f"{aid} 材料变了：" + "→".join(
+                ["、".join(o[1]) or "无", "、".join(n[1]) or "无"]))
+        if o[2] != n[2]:
+            reasons.append(f"{aid} 难度 {o[2]}→{n[2]}")
+        if o[3] != n[3]:
+            reasons.append(f"{aid} 起点提示级别变了")
+        if o[4] != n[4]:
+            reasons.append(f"{aid} 时长 {o[4]}→{n[4]} 分钟")
+    return reasons
 
 
 # ================================================================== CLI

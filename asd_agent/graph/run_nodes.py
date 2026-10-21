@@ -107,10 +107,19 @@ def record_execution(state) -> dict:
     child_id, day = state["child_id"], state["date"]
     raw = list(state.get("feedbacks") or [])
 
+    # ★ 当天生效的那版计划里的**活动定义**。
+    #   生成项（`gen:` 前缀）不在活动库里 —— 没有这张表，
+    #   它的标题取不到、抗拒桥接做不了（桥接要读 refusal_behaviors）。
+    #   来源是**计划**而不是活动库：家长填的反馈是针对今天排出来的那几条，
+    #   而"那几条是什么"就记在计划里。
+    conn = store.connect()
+    acts = _plan_activities(conn, child_id, day)
+
     if raw:
         fbs = [ActivityFeedback(**f) for f in raw]
         plan = plan_feedbacks(fbs, date=day,
-                              no_llm=bool(state.get("no_llm", False)))
+                              no_llm=bool(state.get("no_llm", False)),
+                              activities=acts)
     else:
         plan = _plan_from_db(child_id, day)
 
@@ -120,12 +129,23 @@ def record_execution(state) -> dict:
         [ActivityFeedback(**f) for f in raw], day)
 
     # 当天生效的那一版计划（练习记录要挂在它下面）。
-    conn = store.connect()
     cur = store.active_plan(conn, child_id, on=day)
     out["plan_id"] = int(cur["id"]) if cur else None
     out["plan_version"] = int(cur["version"]) if cur else 0
     out["trace"] = _mark(state, "record_execution")
     return out
+
+
+def _plan_activities(conn, child_id: str, day: str) -> dict:
+    """当天生效的那版计划里的活动定义：`{activity_id: Activity}`。
+
+    ★ 为什么走"计划"而不是"活动库"：
+      生成项（`gen:` 前缀）不在活动库里 —— 家长对它填的反馈
+      要能取到标题（给模型看的那句）与行为词表（抗拒桥接用），
+      就只能从计划里取。计划里有完整内容（阶段 1 写进去的）。
+    """
+    cur = store.active_plan(conn, child_id, on=day)
+    return {a.activity_id: a for a in store.plan_items((cur or {}).get("payload"))}
 
 
 def _plan_from_db(child_id: str, day: str):

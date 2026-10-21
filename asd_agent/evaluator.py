@@ -63,6 +63,48 @@ class TransitionsInput(BaseModel):
     sessions: list = []      # list[statemachine.SessionRecord]
 
 
+# ================================================================== 归属解析
+def _skills_of(sessions, *, conn=None, child_id: str = "", date: str = "") -> dict[str, list[str]]:
+    """今天这些 session 各自练的是哪些技能细项。`{activity_id: [细项, ...]}`。
+
+    ★ 三路来源，按可靠性排序：
+      1. **当天生效的那版计划**（`store.plan_target_skills`）——
+         "这一条练什么"的权威答案就在计划里。
+         生成项**只在**这一路里（它不在活动库里）。
+      2. **活动库反查**（库内项的老路）。
+      3. 都没有 → **归属未知**（这个 activity_id 不在返回的字典里）。
+
+    ★ 为什么"归属未知"要**排除**而不是"算进所有技能"：
+      原来的写法是 `a is None or item.skill_item in a.target_skill_items` ——
+      查不到就当"属于所有技能"。那正是本模块要防的 bug 的另一半：
+      练语言的成果会算进共同注意的进展里。
+      宁可少算一条（那个技能慢一点），不可多算一片（所有技能一起虚高）。
+    """
+    out: dict[str, list[str]] = {}
+
+    # ---- 1. 计划里的归属（含生成项）----
+    if conn is not None and child_id and date:
+        try:
+            import store
+            out.update(store.plan_target_skills(conn, child_id, date))
+        except Exception:
+            pass
+
+    # ---- 2. 活动库反查（补上计划里没有的）----
+    try:
+        from activity_data import get as get_act
+    except Exception:
+        get_act = lambda aid: None     # noqa: E731
+    for s in sessions:
+        aid = s.activity_id
+        if aid in out:
+            continue
+        a = get_act(aid)
+        if a is not None:
+            out[aid] = list(a.target_skill_items)
+    return out
+
+
 # ================================================================== 状态转移落地
 def apply_transitions(inp: TransitionsInput, states: dict[str, dict],
                       profile, *, conn=None, child_id: str = "") -> list:
@@ -83,13 +125,24 @@ def apply_transitions(inp: TransitionsInput, states: dict[str, dict],
     except Exception:
         get_activity = lambda aid: None     # noqa: E731
 
+    # ★ 归属表：activity_id → 它练的技能细项。
+    #   来源按可靠性排序（见 `_skills_of` 的注释）。
+    #   为什么必须先读计划里的归属：生成项（`gen:` 前缀）不在活动库里，
+    #   按 id 反查落空 → 下面那句"归属未知"会把它**排除在所有技能之外** ——
+    #   状态机永远收不到这条证据，而症状是"那个技能一直不动"，**不报错**。
+    skills_of = _skills_of(inp.sessions, conn=conn, child_id=child_id,
+                           date=inp.date)
+
     out: list = []
     for item in profile.assessments:
         # 只保留目标技能命中这条技能细项的 session
         todays = []
         for s in inp.sessions:
-            a = get_activity(s.activity_id)
-            if a is None or item.skill_item in a.target_skill_items:
+            skills = skills_of.get(s.activity_id)
+            if skills is None:
+                # 不知道归属：算作不属于任何细项（宁可少算，不可多算）
+                continue
+            if item.skill_item in skills:
                 todays.append(s)
 
         if conn is not None and child_id:

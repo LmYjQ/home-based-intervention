@@ -424,8 +424,15 @@ def _pick_adjustment(analysis: CoachAnalysis | None, cands: list[ScoredActivity]
         return None, "诊断判定今天不适合做（drop）——已跳出发卡环节"
 
     if impact == "ease":
+        # ★ ★ 换活动只在**库内**候选里挑（`kind == "library"`）。
+        #   生成项（模型出的策略）换不动：把它换成另一条库内活动，
+        #   等于把"针对这个孩子这一周的具体情况生成的做法"降级成一条通用活动 ——
+        #   家长会问"我昨天那个做法呢？"。所以生成项只能 keep / drop。
+        #   （这是本阶段的**已知限制**，不是 bug；阶段 3 起生成项成体系之后
+        #     再谈"生成项之间怎么换"。）
         easier = [s for s in cands
                   if s.activity.activity_id != a.activity_id
+                  and s.activity.kind == "library"
                   and s.activity.difficulty < a.difficulty
                   and set(s.activity.domains) & set(a.domains)]
         if easier:
@@ -433,14 +440,24 @@ def _pick_adjustment(analysis: CoachAnalysis | None, cands: list[ScoredActivity]
             return pick, (
                 f"诊断判定今天状态不佳（ease）——{a.activity_id} 难度{a.difficulty} "
                 f"换成同能区更简单的 {pick.activity.activity_id}")
+        if a.kind == "generated":
+            return cur, (f"诊断判定今天状态不佳（ease）——但 {a.activity_id} 是针对孩子"
+                         f"具体情况生成的做法，候选表里没有更简单的可换，保持原样，"
+                         f"改在卡片里把要求降下来")
         return cur, ("诊断判定今天状态不佳（ease）——但候选表里没有难度更低的活动，"
                      f"保持 {a.activity_id}（它已经是难度{a.difficulty}）")
 
     if impact == "swap":
-        alts = [s for s in cands if s.activity.activity_id != a.activity_id]
+        # ★ 同 ease：只换到**库内**活动（生成项换不动，见上面的注释）。
+        alts = [s for s in cands
+                if s.activity.activity_id != a.activity_id
+                and s.activity.kind == "library"]
         if alts:
             return alts[0], (f"诊断判定这条活动踩雷（swap）——"
                              f"{a.activity_id} 换成 {alts[0].activity.activity_id}")
+        if a.kind == "generated":
+            return cur, (f"诊断判定需要换（swap）——但 {a.activity_id} 是生成的做法，"
+                         f"候选表里没有可换的库内活动，保持原样")
         return cur, f"诊断判定需要换（swap）——但候选表里只有 {a.activity_id} 一条，保持原样"
 
     # ---- 功能驱动的加强规则（接线后的核心收益）----

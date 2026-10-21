@@ -208,7 +208,7 @@ def quality_for(fb: ActivityFeedback) -> float:
 # ================================================================== 主入口
 def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
                    other_notes: str = "", no_llm: bool = False,
-                   on_step=None) -> FeedbackPlan:
+                   on_step=None, activities: dict | None = None) -> FeedbackPlan:
     """逐条反馈 → **纯计算**的落库计划。**一个字节都不写。**
 
     流程（顺序有讲究）：
@@ -221,10 +221,18 @@ def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
       但调用方（HTTP 层）传空 —— Phase 1 起「其他观察」改走
       `POST /api/observe/run` 的图，两处都做 = 抽两次、写两行、付两次 LLM。
       `loop.py` 的 CLI 还在用它那条路径。
+
+    ★ `activities`：**activity_id → 活动定义**（调用方给）。
+      生成项（`gen:` 前缀）不在活动库里，按 id 反查查不到 ——
+      于是它的标题取不到、抗拒桥接也做不了（桥接要读
+      `refusal_behaviors` 与 `linked_scenes`）。
+      调用方从**当天生效的那版计划**里取（计划里有完整内容），
+      传进来。
     """
     from activity_data import get as get_act
 
     plan = FeedbackPlan(date=date)
+    acts = activities or {}
 
     # ---- ① sessions：纯映射 ----
     for fb in feedbacks:
@@ -256,7 +264,7 @@ def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
     for fb in feedbacks:
         if not fb.note.strip():
             continue
-        act = get_act(fb.activity_id)
+        act = acts.get(fb.activity_id) or get_act(fb.activity_id)
         title = act.title if act else fb.activity_id
         out = observe.extract_observations(
             fb.note, date=date, activity=(fb.activity_id, title),
@@ -290,7 +298,11 @@ def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
         # ★ seq 在 `observe.refusal_sessions` 里定好了（当天第几次抗拒），
         #   这里不重新编号 —— 两个地方编号就会有一处漏，
         #   而漏的表现是"两条抗拒撞成一条"，抗拒计数随之少一次。
-        plan.refusal_hits.extend(observe.refusal_sessions(out, fb.activity_id))
+        # ★ `activity=` 显式传进去：生成项不在活动库里，
+        #   `refusal_sessions` 自己反查会落空 → 抗拒桥接做不了
+        #   （而它的表现是"家长填了不配合，系统没记"）。
+        plan.refusal_hits.extend(observe.refusal_sessions(
+            out, fb.activity_id, activity=acts.get(fb.activity_id)))
 
     # 「其他观察」框：activity_id=None → refusal_sessions 直接返回 []。
     # 这行调用是为了让"它不计入"在代码里是显式的一次调用，
@@ -308,17 +320,25 @@ def write_feedbacks(conn: psycopg.Connection, child_id: str, plan: FeedbackPlan,
       1. sessions（家长点的那些条）—— 状态机的唯一输入。
       2. observations（从 note 抽出来的事件）—— 检索器的硬过滤输入。
       3. 桥接补记的 refused sessions —— 它们也是状态机的输入。
+
+    ★ 阶段 1：sessions 落库时**带上这一行的技能归属**。
+      归属来自**当天生效的那版计划**（`store.plan_target_skills`），
+      而不是按 activity_id 回活动库反查 ——
+      生成项不在活动库里，反查落空 → 状态机收不到它的证据（且不报错）。
     """
     res = FeedbackWriteResult()
     if run_id is None:
         run_id = store.day_run_id(child_id, plan.date)
+    # 归属表：当天那版计划里，每一项练什么
+    skills_of = store.plan_target_skills(conn, child_id, plan.date)
 
     # ---- ① sessions ----
     for rec, meta in zip(plan.sessions, plan.rows):
         res.session_ids.append(store.log_session(
             conn, child_id, rec, meta["note"], run_id=run_id,
             source=meta["source"], seq=meta["seq"],
-            prompt_level=meta["prompt_level"], steps_done=meta["steps_done"]))
+            prompt_level=meta["prompt_level"], steps_done=meta["steps_done"],
+            target_skills=skills_of.get(rec.activity_id)))
     res.written_sessions = len(res.session_ids)
 
     # ---- ② observations ----
@@ -340,11 +360,14 @@ def write_feedbacks(conn: psycopg.Connection, child_id: str, plan: FeedbackPlan,
     for h in plan.refusal_hits:
         if isinstance(h, dict):
             sess, note, seq = h["session"], h["note"], int(h.get("seq", 1))
+            aid = h.get("activity_id", "")
         else:
             sess, note, seq = h.session, h.note, int(getattr(h, "seq", 1))
+            aid = getattr(h, "activity_id", "")
         res.bridge_session_ids.append(store.log_session(
             conn, child_id, sess, note, run_id=run_id,
-            source="bridge", seq=seq))
+            source="bridge", seq=seq,
+            target_skills=skills_of.get(aid)))
     return res
 
 

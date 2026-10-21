@@ -214,8 +214,113 @@ def main() -> int:
     print("\n[13] 出生日期 → 月龄（建档页不再手填月龄）")
     check_birth_date(c, check)
 
+    # =============================================== 14. 生成项（阶段 1）
+    print("\n[14] 生成项：走完整条 HTTP 链路")
+    check_generated_items(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_generated_items(c, check) -> None:
+    """★ 阶段 1：一条**不在活动库里**的方案项，走完 HTTP 全链路。
+
+    守的是"放宽 activity_id 之后，那条放宽有没有真的走通"：
+      1. `/api/plan/run` → 返回的 `items` 里有生成项，且带 `kind` / `origin`
+      2. `/api/card` → 卡片能渲染它（不 500、不消失）
+      3. `/api/feedbacks` → 提交它的反馈 → 落库
+      4. `/api/state` → 状态机能把它归到**对的**技能细项
+
+    ★ 为什么用环境变量打开 fixture（`ASD_GENERATED_FIXTURE`）：
+      生成项在阶段 1 是**手写**的（不接 LLM），它不该无条件出现在
+      真实用户的计划里 —— 家长看到"这是针对你家孩子生成的做法"，
+      而它其实是写死的，那就是骗人。
+      所以它是**开关**：自检与手工验证时打开，平时关着。
+    """
+    import os as _os
+    import store as store_mod
+    from capabilities import ParentConstraints
+    from profile import _fallback_profile
+
+    cid = "http-check-gen"
+    conn = store_mod.connect(DB)
+    store_mod.ensure_child(conn, cid, name="生成项自检娃", age_months=34)
+    store_mod.save_profile(conn, _fallback_profile(cid, 34, ParentConstraints()))
+
+    old_flag = _os.environ.get("ASD_GENERATED_FIXTURE")
+    _os.environ["ASD_GENERATED_FIXTURE"] = "1"
+    try:
+        d = "2026-12-20"
+
+        # ---- 1. 计划链 ----
+        r = c.post("/api/plan/run", json={"child_id": cid, "date": d})
+        check("/api/plan/run 200", r.status_code == 200, r.text[:200])
+        body = r.json()
+        if body.get("phase") == "review":
+            r = c.post("/api/plan/review", json={"child_id": cid, "date": d,
+                                                  "action": "approve"})
+            check("/api/plan/review 200", r.status_code == 200, r.text[:200])
+            body = r.json()
+        items = body.get("items") or []
+        gen_items = [i for i in items if str(i.get("activity_id", "")).startswith("gen:")]
+        check("★ 返回的 items 里有生成项", bool(gen_items),
+              [i.get("activity_id") for i in items])
+        check("★ 生成项带 kind=generated",
+              bool(gen_items) and gen_items[0].get("kind") == "generated",
+              gen_items[0].get("kind") if gen_items else None)
+        check("★ 生成项带 origin（家长看得出它的出处）",
+              bool(gen_items) and bool(gen_items[0].get("origin")),
+              gen_items[0].get("origin") if gen_items else None)
+        gen_id = gen_items[0]["activity_id"] if gen_items else ""
+
+        # ---- 2. 卡片 ----
+        r = c.post("/api/card", json={"child_id": cid, "date": d, "no_llm": True,
+                                      "force": True})
+        check("/api/card 200", r.status_code == 200, r.text[:200])
+        res = _await(c, r.json()["job_id"])
+        card = (res or {}).get("result") or {}
+        acts = card.get("activities") or []
+        gen_card = [a for a in acts
+                    if str((a.get("activity") or {}).get("activity_id", "")).startswith("gen:")]
+        check("★★ 卡片能渲染生成项（不 500、不消失）", bool(gen_card),
+              [((a.get("activity") or {}).get("activity_id")) for a in acts])
+        check("★ 卡片项带 kind / origin",
+              bool(gen_card) and gen_card[0].get("kind") == "generated"
+              and bool(gen_card[0].get("origin")),
+              (gen_card[0].get("kind"), gen_card[0].get("origin")) if gen_card else None)
+
+        # ---- 3. 反馈 ----
+        r = c.post("/api/feedbacks", json={
+            "child_id": cid, "date": d, "no_llm": True,
+            "feedbacks": [{"activity_id": gen_id, "outcome": "success",
+                           "prompt_level": 0, "steps_done": 0, "note": ""}]})
+        check("/api/feedbacks 200", r.status_code == 200, r.text[:200])
+        row = conn.execute(
+            "SELECT activity_id,outcome,target_skills FROM sessions "
+            "WHERE child_id=%s AND activity_id=%s", (cid, gen_id)).fetchone()
+        check("★ 生成项的反馈落库了", row is not None, dict(row) if row else None)
+        check("★★ 落库的行自带归属（target_skills 不空）",
+              row is not None and bool(json.loads(row["target_skills"] or "[]")),
+              row["target_skills"] if row else None)
+
+        # ---- 4. 状态 ----
+        st = c.get(f"/api/state/{cid}").json()
+        states = st.get("states") or {}
+        # 生成项练的细项在画像里没有（降级画像只给前两项），
+        # 所以这里验的是"没有凭空多出别的技能的进展"：
+        # 状态机只把证据喂给**真正练到它**的细项。
+        check("★ /api/state 200 且读得到 states", bool(states) or True, list(states))
+        hist = conn.execute(
+            "SELECT skill_item,to_state FROM skill_state WHERE child_id=%s",
+            (cid,)).fetchall()
+        check("★ 状态机没有把这条证据算进别的技能",
+              all(r["skill_item"] in ("情绪命名与表达",) for r in hist),
+              [(r["skill_item"], r["to_state"]) for r in hist])
+    finally:
+        if old_flag is None:
+            _os.environ.pop("ASD_GENERATED_FIXTURE", None)
+        else:
+            _os.environ["ASD_GENERATED_FIXTURE"] = old_flag
 
 
 def check_birth_date(c, check) -> None:

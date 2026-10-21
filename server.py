@@ -235,6 +235,10 @@ def _candidate_payload(req: PlanRequest, cands: list[ScoredActivity],
             "domains": act.domains,
             "materials": [m.name for m in act.materials],
             "target_skill_items": act.target_skill_items,
+            # ★ 来源标记：库里现成的 / 模型生成的。
+            #   家长与前端都据此知道"这条不是活动库里的做法"。
+            "kind": act.kind,
+            "origin": act.origin,
             "why": explain_retrieval(req, s),
             "breakdown": {k: round(v, 3) for k, v in s.breakdown.items()},
             # ★ 每条候选**自己的**反馈表单。
@@ -512,9 +516,23 @@ def api_card(inp: CardIn):
         #   以前两条路径各自 pack_day，结果**当前恰好一致**——
         #   但那是巧合，不是结构上保证一致：将来任何一个改了装箱规则，
         #   两条路就会分叉，而家长看到的卡片与被批准的计划不是同一份。
-        plan_ids = list(((cur or {}).get("payload") or {}).get("activity_ids") or [])
+        #
+        # ★ 阶段 1：计划里的项从 **payload 的 items** 读（`store.plan_items`），
+        #   而不是从 `activity_ids` 反查活动库 ——
+        #   生成项（`gen:` 前缀）不在活动库里，反查必然落空，
+        #   于是**家长批准的生成项会从卡片上消失**（而界面上看不出为什么）。
+        plan_acts = store.plan_items((cur or {}).get("payload"))
+        plan_ids = [a.activity_id for a in plan_acts]
         by_id = {s.activity.activity_id: s for s in cands}
-        planned = [by_id[i] for i in plan_ids if i in by_id]
+        # 计划里的项在候选表里找不到的（= 生成项）→ 用计划里的定义补上。
+        # 它们与库内项**平权**：同样出卡片、同样被家长填反馈。
+        from activities import ScoredActivity
+        planned = []
+        for a in plan_acts:
+            s = by_id.get(a.activity_id)
+            if s is None:
+                s = ScoredActivity(activity=a, score=0.0, passed=True)
+            planned.append(s)
         if planned:
             step(f"当天有一份已批准的计划（{len(planned)} 条）→ 卡片按它出")
         else:
@@ -526,16 +544,26 @@ def api_card(inp: CardIn):
         prefs = prof.parent_constraints.preferences
         focus_id = (planned[0].activity.activity_id if planned
                     else cands[0].activity.activity_id)
+        # 焦点那条的**活动定义**：库内项从候选表拿，
+        # 生成项从计划里拿（它不在活动库里）。
+        focus_act = (planned[0].activity if planned else cands[0].activity)
+        # 教练的候选表里也要有生成项 —— 否则它**看不见**今天要做的这条，
+        # 诊断与卡片都会去讲另一条活动。
+        coach_cands = list(cands)
+        have = {s.activity.activity_id for s in coach_cands}
+        for s in planned:
+            if s.activity.activity_id not in have:
+                coach_cands.append(s)
         if no_llm:
             step("离线模式：用活动定义直接生成兜底卡片")
             out = CoachOutcome(
-                card=card_from_activity(by_id[focus_id].activity, prefs),
-                activity=by_id[focus_id].activity, degraded=True,
+                card=card_from_activity(focus_act, prefs),
+                activity=focus_act, degraded=True,
                 adjustment="（离线：使用活动定义直接生成的兜底卡片）")
         else:
             step("教练 Agent 调模型（2 次）")
             out = coach_today(
-                cands, today_id=focus_id,
+                coach_cands, today_id=focus_id,
                 observations=prev, req=req, recent_summary=req.recent_summary,
                 # ★ 家长批准过的那一版不许被诊断换掉
                 keep_focus=bool(planned),
@@ -576,6 +604,9 @@ def api_card(inp: CardIn):
                 "card": _jsonable(card),
                 "card_text": card.render(),
                 "from_llm": bool(is_focus and not out.degraded),
+                # ★ 来源标记：家长在卡片上看到"这不是活动库里的现成做法"。
+                "kind": act.kind,
+                "origin": act.origin,
                 "why": explain_retrieval(req, s),
                 # 每条**自己**的反馈表单。与 /api/plan 用同一个 render_feedback_form，
                 # 两处不会漂移；少这一项前端就只能退回用焦点那条的，
@@ -773,6 +804,10 @@ def _plan_result(g, cfg: dict) -> dict:
         # ★ 暂停时前端要显示"今天没排"，并指向红旗横幅。
         "paused": bool(vals.get("plan_paused")),
         "activities": list(vals.get("plan_activity_ids") or []),
+        # ★ 阶段 1：方案的**完整项**（含 `kind` / `origin` / steps / materials）。
+        #   只给 id 列表的话，前端分不出"库里现成的"和"针对孩子生成的" ——
+        #   而生成项不在活动库里，前端拿 id 也反查不出内容。
+        "items": _jsonable(vals.get("plan_items") or []),
         "total_minutes": vals.get("plan_total_minutes", 0),
         "focus_domain": vals.get("focus_domain", ""),
         "focus_reason": vals.get("focus_reason", ""),

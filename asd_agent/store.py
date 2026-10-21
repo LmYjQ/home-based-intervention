@@ -293,7 +293,13 @@ def _init(c: psycopg.Connection) -> None:
         --   以前它们只以中文形式塞在 note 里（"家长选「部分做到」，做到第 2 步"），
         --   于是结构化数据取不回来 —— 谁想按"用了第几级提示"统计都得去解析中文。
         prompt_level  INTEGER NOT NULL DEFAULT 0,
-        steps_done    INTEGER NOT NULL DEFAULT 0
+        steps_done    INTEGER NOT NULL DEFAULT 0,
+        -- ★ 阶段 1：这一行属于**哪些技能细项**（JSON 数组，如 ["共同注意"]）。
+        --   以前归属靠按 activity_id 回活动库反查，放宽 activity_id 之后
+        --   生成项反查不到 → 状态机收不到它的证据（且不报错）。
+        --   归属跟着执行记录落库，这条路才走得通。
+        --   老行是空串 → 读时回退到活动库反查。
+        target_skills TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_session_child ON sessions(child_id, session_date);
     CREATE INDEX IF NOT EXISTS idx_session_act   ON sessions(child_id, activity_id);
@@ -427,6 +433,14 @@ def _migrate(c: psycopg.Connection) -> None:
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS seq INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS prompt_level INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS steps_done INTEGER NOT NULL DEFAULT 0",
+        # ── 阶段 1：执行记录自带归属 ────────────────────────────────────
+        #   以前"这条练习属于哪个技能细项"是靠**按 activity_id 回活动库反查**
+        #   得到的（`sessions_for_skill`）。放宽 activity_id 之后这条路断了：
+        #   生成项不在活动库里 → 反查不到 → 它的 session 归属不到任何细项
+        #   → **状态机永远收不到这条证据**（而它不报错，只是那个技能不动）。
+        #   所以归属信息跟着执行记录一起落库。
+        #   老行没有这一列 → 读时仍走活动库反查（老数据本来都来自活动库）。
+        "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS target_skills TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE skill_state ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
         # ── 出生日期 ────────────────────────────────────────────────────
@@ -680,6 +694,66 @@ def active_plan(conn: psycopg.Connection, child_id: str,
     return {**dict(row), "payload": json.loads(row["payload"])} if row else None
 
 
+def plan_items(payload: dict | None) -> list:
+    """一份计划 payload → 它的方案项（`Activity` 对象列表）。
+
+    ★ 两种格式都要能读（阶段 1 之前写的行 vs 阶段 1 之后写的行）：
+      · 新格式：payload["items"] —— 每项一份完整的 `Activity` dict
+        （含 `kind` / `origin` / steps / materials）。
+        生成项**只在**这一份里 —— 它不在活动库里，
+        按 id 反查永远查不到，所以必须把内容存下来。
+      · 老格式：payload["activity_ids"] —— 只有 id。
+        按 id 从活动库还原成完整项（老行本来就都来自活动库）。
+
+    ★ 为什么不重写老行：边界 #2 是 append-only，
+      "真实发生的事不能被改写"。老行读得出来就够了。
+    """
+    if not payload:
+        return []
+    from activities import Activity
+
+    raw_items = payload.get("items")
+    if raw_items:
+        out = []
+        for d in raw_items:
+            try:
+                out.append(Activity.model_validate(d))
+            except Exception:
+                continue      # 单项坏了不该让整份计划读不出来
+        return out
+    # 老格式：按 id 从活动库还原
+    ids = list(payload.get("activity_ids") or [])
+    if not ids:
+        return []
+    try:
+        from activity_data import load_activities
+        by_id = {a.activity_id: a for a in load_activities()}
+    except Exception:
+        return []
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def plan_target_skills(conn: psycopg.Connection, child_id: str,
+                       on: str) -> dict[str, list[str]]:
+    """某一天生效的那版计划 → `{activity_id: [技能细项, ...]}`。
+
+    ★ 这是"执行记录自带归属"的**来源**：
+      家长填的反馈是针对**今天排出来的那几条**，
+      而"这条练什么"这件事，答案在**计划**里（不是活动库里）。
+      生成项只在计划里 —— 按 activity_id 回活动库反查必然落空。
+
+    ★ 为什么按"生效的那一版"取：
+      家长执行的是被批准的那一版，不是被拒的那一版。
+      计划被改过之后，昨天的反馈仍然挂在昨天那一版上
+      （`sessions.plan_id` 记着是哪一版）。
+    """
+    cur = active_plan(conn, child_id, on=on)
+    out: dict[str, list[str]] = {}
+    for a in plan_items((cur or {}).get("payload")):
+        out[a.activity_id] = list(a.target_skill_items)
+    return out
+
+
 def plan_versions(conn: psycopg.Connection, child_id: str, plan_date: str) -> list[dict]:
     """某一天的全部版本，按版本升序。**纯读**，自检与"家长改了几次"用它。"""
     return [dict(r) for r in conn.execute(
@@ -750,7 +824,8 @@ def latest_plan(conn: psycopg.Connection, child_id: str, plan_date: str) -> dict
 def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "",
                 plan_id: int | None = None, plan_version: int | None = None, *,
                 run_id: str | None = None, source: str = "parent", seq: int = 0,
-                prompt_level: int = 0, steps_done: int = 0) -> int:
+                prompt_level: int = 0, steps_done: int = 0,
+                target_skills: list[str] | None = None) -> int:
     """记一次练习。rec 是 statemachine.SessionRecord。
 
     note 之前没被写进 INSERT（表里有列，语句里没有）。接上闭环之后这成了一个
@@ -790,20 +865,28 @@ def log_session(conn: psycopg.Connection, child_id: str, rec, note: str = "",
         run_id = day_run_id(child_id, rec.date)
     # out_of_routine 直接传 bool：列已经是 BOOLEAN，迁移前的 int(...) 是
     # 在假装它是整数。
+    # ★ target_skills：这一行属于哪些技能细项。**不传就自己查** ——
+    #   查得到（库内项）就落库，查不到（生成项）就落空串，
+    #   而空串在读的时候会被"按 activity_id 回活动库反查"兜住（老数据兼容）。
+    #   调用方**能传就传**：生成项只有调用方知道它练什么。
+    if target_skills is None:
+        target_skills = _target_skills_of(rec.activity_id)
     row = conn.execute(
         "INSERT INTO sessions(child_id,session_date,activity_id,outcome,quality,"
         "out_of_routine,note,plan_id,plan_version,run_id,source,seq,"
-        "prompt_level,steps_done) "
-        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "prompt_level,steps_done,target_skills) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (child_id, session_date, activity_id, run_id, seq) DO UPDATE SET "
         "outcome=EXCLUDED.outcome, quality=EXCLUDED.quality, "
         "out_of_routine=EXCLUDED.out_of_routine, note=EXCLUDED.note, "
         "plan_id=EXCLUDED.plan_id, plan_version=EXCLUDED.plan_version, "
         "source=EXCLUDED.source, prompt_level=EXCLUDED.prompt_level, "
-        "steps_done=EXCLUDED.steps_done RETURNING id",
+        "steps_done=EXCLUDED.steps_done, target_skills=EXCLUDED.target_skills "
+        "RETURNING id",
         (child_id, rec.date, rec.activity_id, rec.outcome, rec.quality,
          bool(rec.out_of_routine), note, plan_id, plan_version,
-         run_id, source, seq, prompt_level, steps_done)).fetchone()
+         run_id, source, seq, prompt_level, steps_done,
+         json.dumps(list(target_skills or []), ensure_ascii=False))).fetchone()
     conn.commit()
     return int(row["id"])
 
@@ -1046,18 +1129,41 @@ def state_history(conn: psycopg.Connection, child_id: str, skill_item: str) -> l
     return [{**dict(r), "evidence": json.loads(r["evidence"])} for r in rows]
 
 
+def _target_skills_of(activity_id: str) -> list[str]:
+    """按 activity_id 反查这条练习属于哪些技能细项（**回退路径**）。
+
+    ★ 以前这是**唯一**一条路。放宽 activity_id 之后它对生成项**查不到**，
+      所以归属信息改成跟着执行记录落库（`sessions.target_skills`），
+      这条路只负责两件事：
+        · 库内项：给 `log_session` 一个默认值（调用方没传时的兜底）
+        · **老行**：`target_skills` 是空串的行（阶段 1 之前写的），
+          它们的归属只能从这里反查 —— 不反查的话，老历史会全部从状态机里消失，
+          而状态机的升级/回退判定全靠时间窗统计（PROGRESS.md 阶段 2 坑 5）。
+    """
+    try:
+        from activity_data import get as get_act
+        a = get_act(activity_id)
+    except Exception:
+        return []
+    return list(a.target_skill_items) if a is not None else []
+
+
 def sessions_for_skill(conn: psycopg.Connection, child_id: str, skill_item: str,
                        *, until: str | None = None):
     """某个技能细项的全部练习记录，转成 SessionRecord 直接喂给状态机。
 
-    关联方式：sessions 里存的是 activity_id，技能的归属从活动库反查
-    （一条活动可能练多个细项）。活动库在进程内且被 lru_cache，
-    所以这里连一次 SQL 就够了，剩下的走内存。
+    关联方式：**先读这一行自带的 `target_skills`**，没有才按 activity_id
+    回活动库反查。
+    ★ 顺序不能反：生成项不在活动库里，反查必然落空 →
+      它归属不到任何细项 → **状态机永远收不到这条证据**，
+      而症状是"那个技能一直不动"，**不报错**。
+      （一条 session 归属不到任何细项时按"不知道"处理，
+        不按"属于所有细项"处理 —— 后者会让所有技能的统计一起虚高。）
     """
     from statemachine import SessionRecord
 
-    sql = ("SELECT session_date,activity_id,outcome,quality,out_of_routine "
-           "FROM sessions WHERE child_id=%s")
+    sql = ("SELECT session_date,activity_id,outcome,quality,out_of_routine,"
+           "target_skills FROM sessions WHERE child_id=%s")
     args: list[Any] = [child_id]
     if until:
         sql += " AND session_date<=%s"
@@ -1073,8 +1179,17 @@ def sessions_for_skill(conn: psycopg.Connection, child_id: str, skill_item: str,
 
     out: list[SessionRecord] = []
     for r in conn.execute(sql, args).fetchall():
-        a = by_id.get(r["activity_id"])
-        if a is not None and skill_item not in a.target_skill_items:
+        raw = r["target_skills"] or ""
+        if raw:
+            try:
+                skills = json.loads(raw)
+            except Exception:
+                skills = []
+        else:
+            # 老行：回退到活动库反查
+            a = by_id.get(r["activity_id"])
+            skills = list(a.target_skill_items) if a is not None else []
+        if skills and skill_item not in skills:
             continue
         out.append(SessionRecord(date=r["session_date"], activity_id=r["activity_id"],
                                  outcome=r["outcome"], quality=r["quality"],

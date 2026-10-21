@@ -40,6 +40,18 @@ from vocab import (
 )
 
 PROMPT_LEVEL = Literal["natural", "gesture", "verbal", "model", "physical"]
+
+#: activity_id 的两种形态。
+#:   库内项  `^[a-z]{2,4}-\d{3}$`（如 "soc-014"）
+#:   生成项  `gen:{candidate_id}:{item_index}`（如 "gen:12:0"）
+#: ★ 为什么要放宽：以前 activity_id 必须来自活动库，于是"方案里出现一条
+#:   活动库里没有的做法"这件事在**类型层面**就不可能 ——
+#:   放宽的只是**来源**，不是**形状**：下游读的都是 Activity 的字段。
+#:   （REFACTOR.md §1.5.1：放宽的是「ID 必须来自活动库」这条约束，
+#:     不是「Activity 这个形状」。）
+#:   生成项的 ID 必须**稳定** —— 幂等键（sessions 唯一键）与状态机归属
+#:   都按 activity_id 走，ID 每次重生成都变的话，那两处就会漂。
+ACTIVITY_ID_PATTERN = r"^(?:[a-z]{2,4}-\d{3}|gen:[^:\s]+:[^:\s]+)$"
 PROMPT_LEVEL_CN = {
     "natural": "自然情境（不额外提示）",
     "gesture": "手势提示",
@@ -73,8 +85,18 @@ class Step(BaseModel):
 class Activity(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    activity_id: str = Field(pattern=r"^[a-z]{2,4}-\d{3}$")   # 如 "soc-014"
+    activity_id: str = Field(pattern=ACTIVITY_ID_PATTERN)   # 如 "soc-014" / "gen:12:0"
     title: str
+
+    # ---- 来源：库里 / 模型生成 ----
+    # ★ 为什么加这两个字段而不是另立一个 PlanItem 类型：
+    #   下游（planner / coach / evaluator / 卡片 / 反馈）读的都是**字段**，
+    #   不是**来源**。改形状 = 改六个下游；改来源 = 只改这一处 + 一个转换函数。
+    #   （REFACTOR.md §1.5.1）
+    kind: Literal["library", "generated"] = "library"
+    #: 生成项的出处说明（"LLM 候选 #3 · 基于 known_facts[2]"）。
+    #: 家长在卡片上看到"这不是活动库里的现成做法"。
+    origin: str = ""
     domains: list[Literal[tuple(ABILITY_DOMAIN)]] = Field(min_length=1, max_length=2)
     target_skill_items: list[str] = Field(min_length=1)
 
@@ -257,6 +279,16 @@ class PlanRequest:
     #   位置对了，它才有价值：让教练知道"精细动作连着三天没进展"，
     #   然后由教练在**今天做什么**这一层体现调整。
     recent_summary: list[dict] = field(default_factory=list)     # store.latest_summary
+
+    # ★ **装配进来的方案项**（不在活动库里的那些）。
+    #   它们不是"检索出来的"，是"放进去的" —— 但放进去之后**不享有任何豁免**：
+    #   同一套硬过滤、同一套权重、同一套难度闸门（见 `score_item`）。
+    #
+    #   为什么放在 PlanRequest 而不是单独传参：
+    #   `request_to_dict` 会把它序列化进 checkpoint，节点还原 request 时一并拿到，
+    #   于是**节点体不查库、不重新检索**，只有一个口径。
+    #   （REFACTOR.md §1.1：把 extra_items 算好注入 PlanRequest，唯一口径在入口。）
+    extra_items: list[Activity] = field(default_factory=list)
 
     def state_of(self, domain: str) -> str:
         return self.target_states.get(domain, "not_started")
@@ -446,30 +478,65 @@ def negative_penalty(pref: PreferenceSet, a: Activity, known_refusals: list[str]
     return pen
 
 
-def retrieve(req: PlanRequest, *, pool: list[Activity] | None = None) -> list[ScoredActivity]:
-    """返回**全部**活动，带 passed 标记和分项得分。
+def score_item(item: Activity, req: PlanRequest) -> ScoredActivity:
+    """给**一个**方案项打分。**库内项与生成项走的是这一个函数。**
 
-    刻意不做 top_k 截断 —— 被剔除的活动带着原因一并返回，前端可以显示
-    "因为您说抗拒 XX，所以今天没推这条"。让检索结果可解释，比给一个数字有用。
+    ★ 为什么单独抽出来：放宽 activity_id 之后，"候选从哪来"和"怎么打分"
+      这两件事必须分开 ——
+        · 库内项来自 `load_activities()`（检索）
+        · 生成项来自 `req.extra_items`（装配）
+      但**怎么打分**只有一份实现：同一套硬过滤、同一套 8 项权重。
+      生成项不享有任何豁免：难度闸门、材料检查、时间预算一个都不少，
+      `state_match` 的 0.30 权重对它们同样生效
+      （"喜好不能推翻教学判断"这条不能因来源不同而破）。
     """
-    from activity_data import load_activities
-    pool = pool if pool is not None else load_activities()
+    reason = _hard_filter(req, item)
+    if reason:
+        return ScoredActivity(activity=item, passed=False,
+                              hard_filter_reason=reason)
+    bd = _score(req, item)
+    raw = sum(WEIGHTS[k] * v for k, v in bd.items())
+    # 家长标了不喜欢的东西：不硬剔除，而是扣分留在榜上。
+    raw += negative_penalty(req.preferences, item, req.known_refusals)
+    return ScoredActivity(activity=item, score=round(raw, 4), passed=True,
+                          breakdown=bd)
+
+
+def build_pool(req: PlanRequest, *, library: list[Activity] | None = None) -> list[Activity]:
+    """**候选池 = 活动库 + 装配进来的生成项**。全项目唯一的一处装配点。
+
+    ★ 为什么收成一处而不是在两个调用点各拼一次：
+      REFACTOR.md §1.3.4 记的坑就是"生成项注入两处都要加，只加一处就会出现
+      `excluded` 里显示了、装箱时却不见了的不一致"。
+      收在一处之后，**漏不掉** —— retrieve 与 candidates 共用这个池。
+    """
+    if library is None:
+        from activity_data import load_activities
+        library = list(load_activities())
+    pool = list(library)
+    seen = {a.activity_id for a in pool}
+    for it in (req.extra_items or []):
+        if it.activity_id not in seen:      # 同 id 以库内那份为准
+            pool.append(it)
+            seen.add(it.activity_id)
+    return pool
+
+
+def retrieve(req: PlanRequest, *, pool: list[Activity] | None = None) -> list[ScoredActivity]:
+    """返回**全部**候选，带 passed 标记和分项得分。
+
+    刻意不做 top_k 截断 —— 被剔除的项带着原因一并返回，前端可以显示
+    "因为您说抗拒 XX，所以今天没推这条"。让检索结果可解释，比给一个数字有用。
+
+    `pool` 显式传入时**不再**追加 extra_items —— 那是"已经装配好的池"，
+    调用方自己负责。默认走 `build_pool`（库 + 生成项）。
+    """
+    if pool is None:
+        pool = build_pool(req)
 
     out: list[ScoredActivity] = []
     for a in pool:
-        reason = _hard_filter(req, a)
-        if reason:
-            out.append(ScoredActivity(activity=a, passed=False,
-                                      hard_filter_reason=reason))
-            continue
-        bd = _score(req, a)
-        raw = sum(WEIGHTS[k] * v for k, v in bd.items())
-
-        # 家长标了不喜欢的东西：不硬剔除，而是扣分留在榜上。
-        # 这样前端能解释"因为您说喜欢 XX，所以今天没推这条"，而不是静悄悄地消失。
-        raw += negative_penalty(req.preferences, a, req.known_refusals)
-
-        out.append(ScoredActivity(activity=a, score=round(raw, 4), passed=True, breakdown=bd))
+        out.append(score_item(a, req))
 
     out.sort(key=lambda s: (not s.passed, -s.score))
     return out
@@ -764,6 +831,10 @@ def request_to_dict(req: PlanRequest) -> dict:
         "successes_outside_home": dict(req.successes_outside_home),
         "preferences": req.preferences.model_dump(mode="json"),
         "recent_summary": list(req.recent_summary),
+        # ★ 装配进来的生成项。存的是**纯 dict**（不是 Activity 对象）——
+        #   checkpoint 用 msgpack 序列化，Pydantic 实例属于未注册类型
+        #   （与 plan_request 整体存 dict 同一个理由，见上面 docstring）。
+        "extra_items": [a.model_dump(mode="json") for a in (req.extra_items or [])],
     }
 
 
@@ -785,4 +856,6 @@ def request_from_dict(d: dict) -> PlanRequest:
         successes_outside_home=d.get("successes_outside_home") or {},
         preferences=PreferenceSet.model_validate(d.get("preferences") or {}),
         recent_summary=list(d.get("recent_summary") or []),
+        # 老 checkpoint 里没有这个键 → 空列表（缺字段不能让半年前的 run 读不出来）
+        extra_items=[Activity.model_validate(x) for x in (d.get("extra_items") or [])],
     )

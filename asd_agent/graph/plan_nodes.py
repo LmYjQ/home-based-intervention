@@ -54,6 +54,7 @@ from activities import (                                          # noqa: E402
     request_from_dict,
     retrieve,
 )
+import plan_item                                                  # noqa: E402
 from planner import (                                              # noqa: E402
     is_substantive_change,
     pack_day,
@@ -92,10 +93,19 @@ def _acts_by_id(state) -> dict[str, Activity]:
       存 id 意味着老 checkpoint 永远读得出来；存对象的话，
       活动库一改，历史 state 里的 Pydantic 对象就成了当时的快照，
       与现在的活动定义悄悄分叉 —— 而"当时那条难度是 2"没人会去查。
+
+    ★ ★ 现在**多了一路来源**：装配进来的生成项不在活动库里，
+      反查不到 —— 曾经的 `if i in acts` 会把它们**静默丢掉**，
+      于是生成项的指纹永远不参与审批判据（换什么生成方案都不打断家长），
+      而且**不报错**。所以这里要把 req.extra_items 一起并进来。
     """
     from activity_data import load_activities
     ids = set(state.get("plan_activity_ids") or [])
-    return {a.activity_id: a for a in load_activities() if a.activity_id in ids}
+    acts = {a.activity_id: a for a in load_activities() if a.activity_id in ids}
+    for it in (_req(state).extra_items or []):
+        if it.activity_id in ids:
+            acts[it.activity_id] = it
+    return acts
 
 
 # ================================================================== 1. 选目标
@@ -147,6 +157,11 @@ def retrieve_activities(state) -> dict:
 
     ★ 走全量 `retrieve` 而不是 `candidates`：前者带 `hard_filter_reason`，
       审批文案里要能说清"今天为什么没有推那条"。
+
+    ★ ★ 候选池 = 活动库 **+ 装配进来的生成项**（`activities.build_pool`）。
+      这里是**唯一**一处装配点：生成项与库内项走同一条硬过滤、同一套权重，
+      所以它出现在 `excluded` 里时带着**和库内项一模一样的原因**
+      （"家里没有必需材料：…"、"当前水平不适合难度3"）。
     """
     req = _req(state)
     scored: list[ScoredActivity] = retrieve(req)
@@ -189,16 +204,24 @@ def generate_plan(state) -> dict:
 
     req = _req(state)
     from activities import candidates as _cands
+    # ★ 候选表来自**同一个池**（库 + 生成项），由 `activities.build_pool` 装配。
+    #   这里如果自己再拼一次池，就会出现 REFACTOR.md §1.3.4 记的那个不一致：
+    #   `excluded` 里说明了某条生成项被剔除，装箱时它却不见了。
     passed = _cands(req, top_k=12)
     picks = pack_day(passed, req.daily_minutes)
-    acts = _acts_by_id({"plan_activity_ids": [p.activity.activity_id for p in picks]})
+    # ★ ★ 指纹的输入**直接来自 picks 里的对象**，
+    #   不再走"按 id 回活动库反查"。
+    #   反查对生成项**查不到** → `if i in acts` 把它**静默丢掉** →
+    #   生成项的指纹永远不参与审批判据（换什么生成方案都不打断家长），
+    #   而且**不报错**。直接从对象拿就没有这个洞。
     return {
         "plan_activity_ids": [p.activity.activity_id for p in picks],
+        # ★ 每项存完整的 dict（含 kind / origin / steps / materials）。
+        #   生成项不在活动库里，只存 id 的话下游就再也拿不回它的内容了。
+        "plan_items": [plan_item.to_item(p.activity) for p in picks],
         "plan_total_minutes": sum(p.activity.total_min + p.activity.prep_min
                                   for p in picks),
-        "draft_fingerprint": plan_fingerprint([acts[i] for i in
-                                               [p.activity.activity_id for p in picks]
-                                               if i in acts]),
+        "draft_fingerprint": plan_fingerprint([p.activity for p in picks]),
         "plan_paused": False,
         "trace": _mark(state, "generate_plan"),
     }
@@ -224,18 +247,20 @@ def validate_plan(state) -> dict:
         return {"needs_review": False, "changes": [],
                 "trace": _mark(state, "validate_plan(skipped)")}
 
-    from activities import candidates as _cands
     req = _req(state)
     ids = list(state.get("plan_activity_ids") or [])
-    picks = [s for s in _cands(req, top_k=12) if s.activity.activity_id in ids]
+    # ★ 校验的是**当天排出来的那几项**（`plan_items`，含生成项），
+    #   不是"再检索一次筛出 id 相同的" ——
+    #   后者对生成项查不到（它不在活动库里），会让生成项被当成"没排进计划"。
+    picks = plan_item.items_to_activities(state.get("plan_items") or [])
 
     problems: list[str] = []
-    if len({s.activity.activity_id for s in picks}) != len(ids):
+    if len({a.activity_id for a in picks}) != len(ids):
         problems.append("草稿里有重复的活动")
-    skills = [it for s in picks for it in s.activity.target_skill_items]
+    skills = [it for a in picks for it in a.target_skill_items]
     if len(skills) != len(set(skills)):
         problems.append("同一天重复练同一个技能细项")
-    spent = sum(s.activity.total_min + s.activity.prep_min for s in picks)
+    spent = sum(a.total_min + a.prep_min for a in picks)
     if spent > req.daily_minutes:
         problems.append(f"总时长 {spent} 分钟超过家长给的 {req.daily_minutes} 分钟")
 
@@ -337,6 +362,11 @@ def publish_plan(state) -> dict:
         "date": day,
         "profile_id": state.get("profile_id"),
         "activity_ids": list(state.get("plan_activity_ids") or []),
+        # ★ ★ 每项的**完整内容**（含 kind / origin / steps / materials）。
+        #   存这一份是因为生成项不在活动库里 —— 只存 id，
+        #   下次读这份计划（出卡片 / 收反馈 / 算技能归属）就找不到它了。
+        #   老行没有这个键 → 读时按 activity_id 从活动库还原（见 store.plan_items）。
+        "items": list(state.get("plan_items") or []),
         "total_minutes": state.get("plan_total_minutes", 0),
         "budget_minutes": _req(state).daily_minutes,
         "fingerprint": state.get("draft_fingerprint") or {},

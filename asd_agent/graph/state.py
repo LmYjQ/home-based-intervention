@@ -134,6 +134,16 @@ class PlanState(TypedDict, total=False):
     candidate_ids: list[str]
     excluded: list[dict[str, Any]]
     plan_activity_ids: list[str]
+    #: ★ 今天排的那几项，**每项一份完整的 `Activity` dict**（含 `kind` / `origin`）。
+    #:
+    #:   为什么不能只存 `plan_activity_ids`：
+    #:   生成项（`gen:` 前缀）**不在活动库里** —— 只存 id 的话，
+    #:   下游（卡片 / 反馈 / 状态机归属）拿不到它的步骤、材料、目标技能，
+    #:   而"从活动库按 id 反查"这条路对生成项**查不到**。
+    #:
+    #:   为什么存 dict 而不是对象：checkpoint 用 msgpack 序列化，
+    #:   Pydantic 实例属于未注册类型（见 `plan_item.to_item` 的说明）。
+    plan_items: list[dict[str, Any]]
     plan_total_minutes: int
     draft_fingerprint: dict[str, Any]
     #: ★ **当前生效的那一版**的指纹，由图入口从 `plans` 表读回来。
