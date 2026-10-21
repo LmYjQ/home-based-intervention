@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rdi-agent
+  labels:
+    app: rdi-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: rdi-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

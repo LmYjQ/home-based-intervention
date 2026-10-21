@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rdi-agent-config
+  labels:
+    app: rdi-agent
+data:
+  DATABASE_URL: postgresql://rdi:CHANGE_ME@postgres-rdi:5432/rdi
+  LLM_BASE_URL: https://api.siliconflow.cn/v1
+  LLM_MODEL: Qwen/Qwen2.5-7B-Instruct
+  LLM_TIMEOUT_S: "20"
+  EMBEDDING_MODEL: BAAI/bge-m3
+  RERANK_MODEL: BAAI/bge-reranker-v2-m3
+  DEMO_MODE: live
+  KEYWORD_BACKEND: postgres_fts
+  RAG_ENABLED: "true"
+  MEMORY_ENABLED: "true"
+  RERANK_ENABLED: "true"

@@ -790,25 +790,27 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 
 ### 7.2 任务
 
-- [ ] 按 2.1 保存快照、打 tag、开 `rebuild/rdi-agent` 分支。
-- [ ] 把书籍移到 `data/documents/`，确认 `.gitignore` 生效。
-- [ ] 创建 `pyproject.toml`：`fastapi`、`uvicorn`、`langgraph`、`langgraph-checkpoint-postgres`、`langchain-core`、`langchain-openai`、`pydantic`、`pydantic-settings`、`sqlalchemy`、`psycopg[binary,pool]`、`alembic`、`pgvector`、`pymupdf`、`httpx`、`python-dotenv`、`pytest`、`pytest-asyncio`。
-- [ ] 用清华镜像安装：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e ".[dev]"`。
-- [ ] `config.py`：环境变量、路径、模型名、开关（`RAG_ENABLED` / `MEMORY_ENABLED` / `RERANK_ENABLED`）。
-- [ ] 迁移并裁剪 `llm.py`：只保留 `json_schema`、超时/重试、live/replay/capture、`LLMTrace`。
-- [ ] `db/engine.py`：SQLAlchemy async engine、连接池、事务；`alembic` 管理迁移。
-- [ ] `docker compose -f deploy/docker-compose.yml up -d db`，验证 `vector` 扩展、`to_tsvector`、GIN 索引可用。
-- [ ] `GET /health`：返回 db、pgvector、全文检索后端、模型配置、replay 模式状态。
-- [ ] `schemas/` 放入 4.3 的契约，先写校验测试。
-- [ ] `Makefile`：`install`、`test`、`dev`、`ingest`、`search`、`eval`。
-- [ ] 建立 `tests/` 目录和第一个 smoke test。
+- [x] 按 2.1 保存快照、打 tag、开 `rebuild/rdi-agent` 分支。
+- [x] 把书籍移到 `data/documents/`，确认 `.gitignore` 生效。
+- [x] 创建 `pyproject.toml`：`fastapi`、`uvicorn`、`langgraph`、`langgraph-checkpoint-postgres`、`langchain-core`、`langchain-openai`、`pydantic`、`pydantic-settings`、`sqlalchemy`、`psycopg[binary,pool]`、`alembic`、`pgvector`、`pymupdf`、`httpx`、`python-dotenv`、`pytest`、`pytest-asyncio`。
+- [x] 用清华镜像安装：`pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -e ".[dev]"`。
+- [x] `config.py`：环境变量、路径、模型名、开关（`RAG_ENABLED` / `MEMORY_ENABLED` / `RERANK_ENABLED`）。
+- [x] 迁移并裁剪 `llm.py`：只保留 `json_schema`、超时/重试、live/replay/capture、`LLMTrace`。
+- [x] `db/engine.py`：SQLAlchemy async engine、连接池、事务；`alembic` 管理迁移。
+- [x] `docker compose -f deploy/docker-compose.yml up -d db`，验证 `vector` 扩展、`to_tsvector`、GIN 索引可用。
+- [x] `GET /health`：返回 db、pgvector、全文检索后端、模型配置、replay 模式状态。
+- [x] `schemas/` 放入 4.3 的契约，先写校验测试。
+- [x] `Makefile`：`install`、`test`、`dev`、`ingest`、`search`、`eval`。
+- [x] 建立 `tests/` 目录和第一个 smoke test。
 
 ### 7.3 验收
 
 ```bash
 docker compose -f deploy/docker-compose.yml up -d db
-psql "$DATABASE_URL" -c "CREATE EXTENSION IF NOT EXISTS vector; SELECT '[1,2,3]'::vector;"
-psql "$DATABASE_URL" -c "SELECT to_tsvector('english','guided participation');"
+# 本机没装 psql 时用容器里的：
+docker exec rdi-db psql -U rdi -d rdi \
+  -c "CREATE EXTENSION IF NOT EXISTS vector; SELECT '[1,2,3]'::vector;" \
+  -c "SELECT to_tsvector('english','guided participation');"
 alembic upgrade head
 pytest -q
 uvicorn rdi_agent.api.main:app --reload
@@ -820,9 +822,42 @@ curl -s localhost:8000/health | python -m json.tool
 - Pydantic 契约测试通过。
 - replay 模式不访问网络。
 
+### 7.3.1 阶段 0 实际执行记录（2026-10-21）
+
+全部验收项通过。落地时的三处调整，都记在这里免得后面再踩：
+
+1. **`pymupdf` 锁 `<2.0`**。2.0 系列的 wheel 元数据名字是 `pymupdf-lite`，
+   与 `pymupdf` 不匹配，镜像装不上。`pyproject.toml` 里写 `pymupdf>=1.24,<2.0`。
+2. **所有契约加 `extra="forbid"`**。Pydantic 默认忽略多余字段，那模型就能悄悄
+   在 `CaseSummary` 里塞一个 `diagnostic_conclusion` 而没人拦得住 —— 计划 §4.3
+   说的"结构上禁止诊断"就落空了。改成 forbid 后多字段直接 ValidationError。
+3. **图需要至少一个入口节点**。LangGraph 拒绝编译没有 entrypoint 的图，
+   阶段 0 留了一个 `echo` 占位节点，阶段 1 接真节点时删掉。
+
+另外 `.env` 里已有的 `SILICONFLOW_API_KEY` / `SILICONFLOW_BASE_URL` 保持兼容
+（`config.py` 用 `AliasChoices` 兜住），不用改用户的密钥文件。
+
+**当前测试规模**：29 个用例（含 4 个真连 Postgres 的集成用例，数据库不可用时自动跳过）。
+
 ### 7.4 交付物
 
 可启动的 FastAPI 骨架 + 契约 + LLM 适配器 + 数据库迁移 + 测试入口。
+
+已落地的文件：
+
+| 路径 | 内容 |
+|---|---|
+| `rdi_agent/config.py` | 全部环境变量、路径、开关、模型名 |
+| `rdi_agent/llm.py` | 唯一 LLM 出口：`json_schema` 受限解码、重试、live/replay/capture、`LLMTrace` |
+| `rdi_agent/schemas/` | 计划 §4.3 的全部契约（case / evidence / recommendation / feedback / memory） |
+| `rdi_agent/db/engine.py`、`db/models.py` | async engine + 连接池 + ORM 模型 |
+| `rdi_agent/graph/state.py`、`graph/builder.py` | `CoachState` + 最小可编译图 |
+| `rdi_agent/api/main.py`、`api/health.py` | FastAPI 入口 + 逐项自检的 `/health` |
+| `alembic/` | `001_init`：13 张表 + pgvector 扩展 + GIN/HNSW 索引 |
+| `deploy/docker-compose.yml` | 本地 Postgres 16 + pgvector |
+| `deploy/k8s/` | Deployment / Service / ConfigMap / Secret 模板 / 迁移 Job / 索引 Job |
+| `tests/` | 29 个用例：契约、LLM 适配器、State、API、数据库集成 |
+| `Makefile`、`.env.example` | 命令入口与环境变量模板 |
 
 ---
 

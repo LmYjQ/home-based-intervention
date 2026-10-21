@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rdi-agent
+  labels:
+    app: rdi-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rdi-agent
+  template:
+    metadata:
+      labels:
+        app: rdi-agent
+    spec:
+      containers:
+        - name: api
+          image: rdi-agent:latest
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: rdi-agent-config
+            - secretRef:
+                name: rdi-agent-secrets
+          # /health 会真连一次数据库并检查 pgvector / 全文检索，
+          # 数据库不可用时返回 503，探针据此把 Pod 摘出去。
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # Pod 无状态：不挂 PVC，重启后从 Postgres 恢复
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
