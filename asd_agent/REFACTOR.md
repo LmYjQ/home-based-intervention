@@ -7,14 +7,20 @@
 > 需求输入：`refract.md`《基于现有基建的家庭干预智能体重构方案》（2026-10-21，最新版）。
 > 旧的设计文档已归档到 `docs/legacy/`，**不要照着它们实现**。
 
+**阶段按「家长真实使用流程」排序**（描述问题 → 系统评估 → 出方案 → 家长选 → 执行 → 反馈 → 调整），
+外加一条**地基阶段排在最前**：先把"方案必须来自活动库"这条约束松开，后面每一层才不用返工。
+
 **状态**：⬜ 未开始　🟡 进行中　✅ 已完成
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| A | 最小闭环：多轮追问 → 多候选方案 → 家长选择 → 反馈关联 → 重启可恢复 | ⬜ |
-| B | 反馈与决策重构：反馈三层分离 + `decide_next_action`（LLM 提议 / Python 批准） | ⬜ |
-| C | 历史回放与分支实验：time travel + `workflow_audit_events` | ⬜ |
-| D | 逐步放宽固定规则：活动库降为参考库、硬过滤分层、评分降为辅助 | ⬜ |
+| **1** | **放宽 activity_id**：方案项统一抽象，计划能装不在活动库里的项（**地基，先做**） | ⬜ |
+| **2** | **观察链一次性做完**：证据模型 + 多轮追问 + 评估版本 + case 图 + clarify interrupt + API + 前端 | ⬜ |
+| **3** | 生成候选方案 + 家长选择（LLM 出多候选 → 校验 → 选 → 落 `plans`） | ⬜ |
+| **4** | 执行 + 反馈 + 下一步决策（反馈三层分离 + `decide_next_action` + 旧状态机降级） | ⬜ |
+| **5** | 历史回放与分支实验（time travel + `workflow_audit_events`） | ⬜ |
+
+> 阶段 2 与阶段 3 之间有依赖（候选生成要吃评估结果），阶段 1 与谁都不依赖 → 可以先做、也可以并行。
 
 ---
 
@@ -47,11 +53,11 @@
 │  按 case 状态决定：跑哪条链 / 只跑反馈 / 重跑评估                          │
 └──┬──────────────────────┬──────────────────────┬────────────────────────┘
    │ 观察链 {child}:{date} │ 计划链 plan:{child}:{date} │ 反馈链 run:{child}:{date}
-   │ （阶段 A 不动）       │ （阶段 A 扩展）        │ （阶段 B 扩展）
+   │ （阶段 2 扩）         │ （阶段 1+3 扩）        │ （阶段 4 扩）
    │ publish 写库         │ publish_plan 写库     │ apply_transitions 写库
 └──┬──────────────────────┴──────────────────────┴────────────────────────┘
    │
-   │ ★ 新增第四张图：case:{case_id}（长期 thread，一个案例一条）
+   │ ★ 第四张图：case:{case_id}（长期 thread，一个案例一条）—— 阶段 2 落地
    │   load_case_context → extract_new_evidence(LLM) → update_assessment
    │   → safety_check → detect_unknowns → ⚡clarify_with_parent →（回抽取）
    │   → publish_case_events（★ 唯一写库节点）
@@ -92,8 +98,9 @@
 每次调用都有降级路径；有 replay（读本地文件，不发网络）与 capture（只存 response，**改 prompt 会让全部 fixture 失效**）模式。
 
 **关键组件**：
-`activities.py`（50 条活动 / 6 条硬过滤 / 8 项权重 `WEIGHTS`：`state_match .30` `skill_gap .15` `prereq_ready .14`
-`preference .10` `diversity .10` `material_fit .08` `method_fit .08` `parent_pref .05` + `negative_penalty` 扣分不硬剔除）、
+`activities.py`（`Activity` 30+ 字段；50 条活动；6 条硬过滤；8 项权重 `WEIGHTS`：
+`state_match .30` `skill_gap .15` `prereq_ready .14` `preference .10` `diversity .10` `material_fit .08`
+`method_fit .08` `parent_pref .05` + `negative_penalty` 扣分不硬剔除）、
 `capabilities.py`（`SkillAssessment` 词表硬校验 / inferred 置信度钳 0.35）、
 `statemachine.py`（5 状态 + `RULES` 阈值表 `statemachine.py:106` + `upgrade_min_confidence 0.5`）、
 `redflag.py`（11 条规则 + `referral{who,do,avoid,emergency}`）、
@@ -113,103 +120,263 @@
 
 ---
 
-## 1. 阶段 A：最小闭环 ⬜ ← **下一步从这里开始**
+## 1. 阶段 1：放宽 activity_id（地基）⬜ ← **下一步从这里开始**
 
-### A.0 目标与验收（可判定的）
+### 1.0 目标与验收
 
-**目标**：家长可以在一个"案例"里多轮描述问题 → 系统发现缺口并追问 → 信息足够后给出**多个实质不同的候选方案** →
-家长选一个 → 真实执行反馈能关联到这个案例与这一版方案 → **服务重启后流程能恢复**。
+**目标**：让"方案"不再等于"一串活动库 ID"。计划里可以出现**不在活动库里的项**（由模型生成的策略），
+而活动库退回到它该有的位置：**参考知识库**（`refract.md` §5.1）。
 
 **验收**（全部可自动判定）：
-1. 家长两次补充信息，系统两次更新评估并**只问真正缺的**（不是重复问已答过的）。
-2. 候选方案 ≥ 2 个，且彼此在执行步骤上**实质不同**（不是改措辞）。
-3. 家长选定的那一版落到 `plans` 且 `status='active'`；`/api/plan/{child}` 与 `/api/card` 读到的就是它。
-4. 反馈能关联到 `case_id` / `cycle_id` / `execution_id`。
-5. 进程重启后，`GET /api/cases/{id}` 仍能显示当前处于哪个阶段、待办是什么。
-6. 任何一步的 LLM 不可用时，系统**仍能走完**（走降级路径，不编数据、不返回空）。
+1. 一个**不在活动库里**的方案项能被装箱进当天计划，和库内项**平权**。
+2. 生成项**同样过**难度闸门、材料检查、时间预算 —— 放宽不等于绕过约束。
+3. 生成项的语义变化能进指纹（该打断家长时打断），而**仅仅换了 ID 不打断**。
+4. 生成项能出卡片、能被家长反馈、能被状态机归属到正确的技能细项。
+5. 老 `plans.payload` / 老 checkpoint / 老 session 行**仍能读**。
 
-### A.1 本阶段专属的坑（先看，再写代码）
+### 1.1 本阶段专属的坑（先看，再写代码）
 
-1. **第四张图也要满足边界 #1**：case 图的 `publish_case_events` 是**唯一**写库节点，排在**所有 interrupt 之后**。
-   现有三张图都是这个形状（`nodes.py:313` / `plan_nodes.py:324` / `run_nodes.py:352`），照抄。
-2. **`Command(resume=)` 打在没有 pending interrupt 的 thread 上会让 LangGraph 从头重跑整条图** ——
-   不报错、不抛异常，就是数据写了两遍。守卫必须在 `graph.invoke` **之前**，返回 **409**。
-   现成写法：`server.py:827-829`（计划链审批）与 `server.py:993-997`（观察链澄清）。
-3. **FastAPI 按声明顺序匹配路由**：`/api/cases/{case_id}/xxx` 必须声明在 `/api/cases/{case_id}` **之前**，
-   否则会被参数路由吃掉（`server.py:736-740` 记着 `/api/plan/status` 的坑）。
-4. **多轮追问 vs "只许问一次"**：现有 `clarify_asked` 守卫是为了防"系统把自己没听懂的锅推给人"（`LANGGRAPH.md` 第四节）。
-   本阶段要放开多轮，但必须补上**三条硬约束**（见 A.3.5），否则那个坑会回来。
-5. **checkpoint 只存纯 dict**（边界 #9）。`CandidatePlan` / `CaseEvidence` 是 Pydantic → 进 state 前转 dict。
-6. **`plans` 表加列要走 `_migrate()`**，且索引跟着补列走；老库有重复行 → 建唯一索引前先回填。
-7. **`store.plan_paused` 是唯一「暂停计划生成」口径** —— case 层要暂停就调它，不许自己写一遍 `exists urgent ...`。
+1. **★ 指纹会被 ID 污染。** 现在的指纹是
+   `(activity_id, materials集合, difficulty, prompt_hierarchy[0], duration*sessions)`（`planner.py:495-505`）。
+   生成项的 ID 每次重新生成都不同 → **指纹必然变** → 每次都打断家长 →
+   "只在真变化时审批"这条判据被它自己吃掉（`LANGGRAPH.md` 第四节之四记着这个坑的成因）。
+   → **指纹必须改成语义签名**（见 1.3.4）。
+2. **★ 技能归属会查不到人。** `evaluator.apply_transitions` 用
+   `activity.target_skill_items` 做归属过滤（`evaluator.py:90`），
+   而 `store.sessions_for_skill` 靠**进程内活动库**反查 `activity_id → target_skill_items`
+   （`PROGRESS.md` 第五节记着"技能/场景归属靠进程内活动库反查"这个老问题）。
+   生成项不在活动库里 → 反查不到 → **它的 session 归属不到任何技能细项** → 状态机永远收不到这条证据。
+   → 执行记录必须**自带** `target_skill_items`（见 1.3.5）。
+3. **`Activity.activity_id` 有正则约束** `^[a-z]{2,4}-\d{3}$`（`activities.py:73-113`），
+   `gen:xxx` 过不了 → 要么放宽正则，要么把"项"和"活动"分成两层（见 1.3.2）。
+4. **`PlannedActivity.activity_id` 的字段说明写着"必须逐字取自候选表里的 activity_id"**
+   （`planner.py:55`）—— 这句话就是"方案 = 活动 ID 列表"这条约束的成文处，放宽时要一起改。
+5. **`coach._pick_adjustment` 的 `ease`/`swap` 依赖候选池**（`coach.py:426-444` 拿库里活动换），
+   生成项**换不动**（只能 keep / drop）→ 本阶段先记为已知限制，不为了它把活动库再拉回来。
+6. **`Activity.target_skill_items` 现在是自由文本**（不校验词表），但 `activities.retrieve` 用
+   `SKILL_ITEM_DOMAIN` 反查能区（`vocab.py`）→ 生成项若带**词表外**的技能细项，反查会失败 →
+   要么生成项只用词表内细项，要么能区反查要能兜底（阶段 3 才需要，本阶段先只允许词表内）。
 
-### A.2 改动清单（按文件）
+### 1.2 改动清单
 
 **新增**
 
-| 文件 | 职责 | 关键函数 / 类 |
-|---|---|---|
-| `asd_agent/case/__init__.py` | 包入口 | 导出下列符号 |
-| `asd_agent/case/models.py` | Pydantic 模型（`extra="forbid"`，字段带中文 description） | `Case` / `CaseEvidence` / `AssessmentVersion` / `CandidatePlan` / `CasePlanSelection` / `CaseClarify` / `CaseStatus` |
-| `asd_agent/case/lifecycle.py` | 生命周期纯函数（0 token） | `ALLOWED_TRANSITIONS` / `can_transition(a, b) -> bool` / `next_status(current, *, has_unknowns, has_selected_plan, has_feedback, paused) -> str` |
-| `asd_agent/case/evidence.py` | 证据抽取（LLM）+ 校验 + 降级 | `extract_evidence(...)` / `verify_evidence(draft, source) -> (draft, unverified)` / `_fallback_evidence()` |
-| `asd_agent/case/candidates.py` | 候选方案生成（LLM）+ 校验 + 参考活动拼装 | `build_reference_block(req) -> str` / `generate_candidates(...)` / `validate_candidate(cand, req) -> (ok, problems)` / `_fallback_candidates()` |
-| `asd_agent/case/router.py` | case 编排：下一步该做什么 | `next_step(case_row) -> Literal[...]` |
-| `asd_agent/case/selfcheck.py` | case 层自检 | `_cli()` |
-| `asd_agent/graph/case_graph.py` | case 图定义 + `case_inputs()` | `build_case_graph()` / `case_inputs()` |
-| `asd_agent/graph/case_nodes.py` | case 图节点体 | `load_case_context` / `extract_new_evidence` / `update_assessment` / `safety_check` / `detect_unknowns` / `clarify_with_parent` / `publish_case_events` |
-| `frontend/src/pages/CasePage.vue` | 案例页（新增页签） | — |
-| `frontend/src/components/CaseStage.vue` | 生命周期徽标 | — |
-| `frontend/src/components/CaseClarify.vue` | 追问卡片 | — |
-| `frontend/src/components/CandidatePlanCard.vue` | 候选方案卡 | — |
-| `frontend/src/components/EvidenceList.vue` | 事实/假设/未知三栏 | — |
+| 文件 | 职责 |
+|---|---|
+| `asd_agent/plan_item.py` | 方案项的**统一形状** + 库内项↔生成项的互转 + 语义签名（指纹用） |
+| `asd_agent/plan_item_selfcheck.py` 或并入 `activities.py --validate` | 本阶段自检（见 1.5） |
 
 **修改**
 
 | 文件 | 改什么 |
 |---|---|
-| `asd_agent/store.py` | `_init()` 加 5 张新表；`_migrate()` 加 `plans` 4 列 + `sessions` 3 列；新增读写函数（`cases` / `assessment_versions` / `case_evidence` / `plan_candidates` / `decision_log`） |
-| `asd_agent/graph/state.py` | 新增 `CaseState` TypedDict + `CaseClarify` / `CasePlanSelection` 载荷 + `case_thread_id()` / `case_config()`（前缀 `case:`） |
-| `asd_agent/graph/runtime.py` | 新增第五张图的单例缓存与 getter（照抄现有四个 getter 的形状） |
-| `asd_agent/graph/plan_nodes.py` | `approve_plan` 的 interrupt 载荷扩展：新增 action `"select_candidate"` + `candidate_id`（**不改旧枚举值**） |
-| `asd_agent/server.py` | 新增 7 个 `/api/cases/...` 路由；旧路由**一字不改** |
-| `frontend/src/App.vue` | `TABS` 加 `case` + `VALID` 白名单 + 路由声明顺序 |
-| `frontend/src/api.js` | 新增 7 个 fetch 封装（唯一出口，URL 字面量不进组件） |
-| `asd_agent/PROGRESS.md` | 每阶段完成后更新进度与自检组数 |
-| `asd_agent/REFACTOR.md`（本文） | 勾状态、记录该阶段的实际决策与踩坑 |
+| `asd_agent/activities.py` | `Activity` 增加 `kind: Literal['library','generated']`（默认 `'library'`）与 `origin: str`；`activity_id` 的约束放宽以容纳 `gen:` 前缀；`retrieve()` 返回的项一律 `kind='library'` |
+| `asd_agent/planner.py` | `PlannedActivity` 的字段说明与模型放宽（不再要求"取自候选表"）；`plan_fingerprint` 改成**语义签名**；`pack_day` 接受库外项 |
+| `asd_agent/graph/plan_nodes.py` | `retrieve_activities` / `generate_plan` / `validate_plan` / `freeze_plan` / `publish_plan` 存 `items`（含生成项）而不是纯 `activity_ids`；`state` 里的 `candidate_ids` → `items`（**纯 dict**） |
+| `asd_agent/store.py` | `sessions` 加 `target_skills JSON`（执行记录自带归属）；`plans.payload` 兼容旧格式 |
+| `asd_agent/evaluator.py` | 归属过滤优先读 session 自带的 `target_skills`，回退到活动库反查 |
+| `asd_agent/coach.py` | 卡片能渲染生成项（形状相同即可）；`ease`/`swap` 对生成项的已知限制写进 docstring |
+| `asd_agent/server.py` | `/api/card`、`/api/plan/{child}` 的 payload 兼容新 `items` 字段；`/api/feedbacks` 接受生成项的 `activity_id` |
+| `frontend/src/components/CoachCard.vue` / `FeedbackItem.vue` | 显示生成项时用 `origin` 说明出处 |
 
-### A.3 详细设计
+### 1.3 详细设计
 
-#### A.3.1 数据库
+#### 1.3.1 统一抽象：方案项（PlanItem）
 
-**新增 5 张表**（DDL 放 `store.py` 的 `_init()`，列进 `_migrate()`，索引跟着补列走）：
+**核心决定：放宽的是「ID 必须来自活动库」这条约束，不是「Activity 这个形状」。**
+
+理由：下游（planner / coach / evaluator / 卡片 / 反馈）读的都是 `Activity` 的**字段**，
+不是它的**来源**。改形状 = 改六个下游；改来源 = 只改一处 + 加一个转换函数。
+
+#### 1.3.2 `Activity` 的两处放宽
+
+```python
+class Activity(BaseModel):
+    kind: Literal["library", "generated"] = "library"   # 来源：库里 / 模型生成
+    origin: str = ""        # 生成项的出处说明（"LLM 候选 #3 · 基于 known_facts[2]"）
+    activity_id: str        # 约束从 `^[a-z]{2,4}-\d{3}$` 放宽为接受 `gen:{candidate_id}:{index}`
+    # 其余字段一律不动
+```
+
+- `gen:` 前缀的 ID 必须**稳定**：同一份候选方案的同一项，ID 在多次读之间不变
+  （否则 session 唯一键 `(child,date,activity,run_id,seq)` 与状态机归属会漂）。
+  建议 `gen:{candidate_id}:{item_index}`，其中 `candidate_id` 是 `plan_candidates.id`（落库后即稳定）。
+- `origin` 是给人看的：家长在卡片上看到"这不是活动库里的现成做法"。
+
+#### 1.3.3 生成项怎么进计划：与库内项**同一条流水线**
+
+**关键约束：生成项不享有任何豁免。** 它必须：
+
+1. 过**同一条**难度闸门（画像 level < 2 而难度 > 1 → 挡掉，`activities.py:296-299`）；
+2. 过**同一条**材料检查（essential 材料不在家 → 挡；可给 substitute 才放行）；
+3. 过**同一条**时间预算（`total_min + prep_min ≤ daily_minutes`）；
+4. 拿**同一套权重**打分（`state_match .30` 仍是最高项 → **喜好不能推翻教学判断**这条不破）；
+5. 被 `state_match` 按**同一个状态机目标难度**评判。
+
+实现：`activities.py` 增加 `score_item(item: Activity, req: PlanRequest) -> ScoredActivity`，
+让库内项与生成项走**同一个打分函数**（现在库内项在 `_score` 里直接拿 `a: Activity` → 天然可复用，
+只要把"候选从哪来"与"怎么打分"分开）。
+
+> 这是本阶段最重要的一条：**放宽的是"方案从哪来"，不是"方案要满足什么"。**
+
+#### 1.3.4 指纹改成语义签名（本阶段的头号坑）
+
+```
+现在的指纹（planner.py:495-505）
+  skills     = 所有 target_skill_items 的并集
+  activities = sorted((activity_id, materials集合, difficulty, prompt_hierarchy[0], duration*sessions))
+
+改成
+  skills     = 同上（不变）
+  items      = sorted((语义签名))      ← 不含 activity_id
+  语义签名   = (tuple(sorted(target_skill_items)),
+                 tuple(sorted(materials 名称)),
+                 difficulty,
+                 prompt_hierarchy[0],
+                 duration*sessions,
+                 steps 签名)            ← 新增：步骤变了就是实质变更
+  steps 签名 = tuple((s.action, s.prompt_level) for s in steps)
+```
+
+- 库内项的语义签名**与现在等价**（`activity_id` 去掉后，同一活动仍然同签名）→ 老指纹行为不变。
+- 生成项换了 ID 但语义相同 → 签名相同 → **不打断家长**。
+- 生成项换了步骤/材料/难度/起点提示级别 → 签名变 → **打断**。
+- ⚠️ 指纹是**存进 `plans.payload` 的**（`plan_nodes.py:342`），老行里存的是老格式指纹。
+  → 比较时两个格式都要能读（老格式按 `(activity_id, ...)` 比，新格式按语义签名比）；
+  **老行不重写**（append-only，边界 #2）。
+
+#### 1.3.5 执行记录自带归属（第二个坑）
+
+`sessions` 表加一列 `target_skills JSON`，写 `sessions` 时**同时落**该行的 `target_skill_items`。
+
+- `evaluator.apply_transitions` 的归属过滤（`evaluator.py:90`）改为：
+  **先读 session 自带的 `target_skills`**，没有再回退到活动库反查（老数据兼容）。
+- `store.sessions_for_skill` 同样优先用该列。
+- 顺带修掉 `PROGRESS.md` 第五节记的老问题：「技能/场景归属靠进程内活动库反查，
+  全库没有指向 `activity_id` 的外键」—— 现在归属信息**跟着执行记录一起落库**了。
+
+#### 1.3.6 向后兼容
+
+| 老数据 | 怎么读 |
+|---|---|
+| `plans.payload.activities = [{activity_id, slot, minutes, why_this}]` | 读时按 `activity_id` 从活动库还原成完整项；新写入改成 `items = [...]`（含 `kind`） |
+| 老 `plans.payload.fingerprint` | 比较时按老格式读（`(activity_id, materials, difficulty, prompt[0], dur)`） |
+| 老 checkpoint 里的 `candidate_ids` | 读时当成库内项处理 |
+| 老 `sessions` 行 | 没有 `target_skills` → 回退活动库反查 |
+
+**不重写任何老行**（边界 #2）。
+
+### 1.4 本阶段的已知限制（明确写出来，别到时候当成 bug）
+
+1. 生成项**换不动**：教练的 `ease`/`swap` 只在库内候选池里挑，生成项只能 `keep` / `drop`。
+2. 生成项**不参与检索排序**：它是被"装配"进来的，不是被"检索"出来的（检索仍只查活动库）。
+3. 生成项的 `target_skill_items` 暂时**只允许词表内**（阶段 3 起放宽到开放标签，`refract.md` §4.3）。
+4. 本阶段**不接 LLM**：生成项用**固定 fixture** 造（自检里手写一个），
+   真正的 LLM 生成在阶段 3 —— 这样阶段 1 的每一条断言都不依赖网络。
+
+### 1.5 自检断言（建议 8 组）
+
+1. 库内项与生成项能被 `pack_day` 一起装箱；**生成项超预算时同样被砍掉**。
+2. 生成项同样过难度闸门（level<2 且 difficulty>1 → 被挡）与材料检查（essential 缺失 → 被挡）。
+3. 生成项能被打分，且 `state_match` 权重不因 `kind` 改变（喜好不能推翻教学判断这条不破）。
+4. **指纹**：同一生成项换 ID 但语义相同 → 指纹不变（不打断家长）；改步骤/材料/难度/起点提示级别 → 指纹变（打断）。
+5. 生成项能出卡片（`/api/card` 返回它，且带 `origin`）。
+6. 生成项的执行反馈**能落到正确的技能细项**（`sessions_for_skill` 不再依赖活动库反查）。
+7. 生成项能进状态机统计（`skill_state` 归属正确、`sessions` 唯一键不撞）。
+8. **老 payload / 老 checkpoint / 老 session 行仍能读**（各造一条老格式 fixture 验证）。
+
+### 1.6 验证命令
+
+```bash
+cd asd_agent
+ASD_DB_PATH=/tmp/graph_selfcheck.db   ../.venv/bin/python -m graph.selfcheck    # 29 → 30+
+ASD_DB_PATH=/tmp/graph_ckpt_check.db  ../.venv/bin/python -m graph.checkpointer
+ASD_DB_PATH=/tmp/http_selfcheck.db    ../.venv/bin/python http_selfcheck.py     # 13 → 14+
+../.venv/bin/python activities.py --validate
+cd ../frontend && npx vite build
+```
+
+**真起服务打接口**：`/api/plan/run` → 看返回的 `items` 里有没有生成项；
+`/api/card` → 卡片能渲染它；`/api/feedbacks` → 提交它的反馈 → `GET /api/state` 能看到归属。
+
+### 1.7 提交要求
+
+一个可 revert 的 commit，message 写"为什么"（例：`放宽 activity_id：方案项统一抽象 + 指纹改语义签名 + 执行记录自带归属`）。
+提交前更新 `asd_agent/PROGRESS.md`（自检组数、验证结果、踩坑）与本文（勾状态 + 记录实际决策）。
+
+### 1.8 交接
+
+在本文阶段 1 末尾追加 `### 1.9 本阶段实际发生的事`：哪些设计被推翻、最终改了哪些文件、
+自检组数从多少到多少、遗留项、**下一阶段的第一件事**。
+
+---
+
+## 2. 阶段 2：观察链一次性做完 ⬜
+
+对应家长使用流程的第 1–2 步：**家长描述 → 系统理解 → 追问 → 形成评估**。
+本阶段**不生成方案**（那是阶段 3），终点是"评估版本更新完成"。
+
+### 2.0 目标与验收
+
+**目标**：家长在一个"案例"里多次自然描述 → 系统积累**带原文引用的证据** → 主动发现**未知项**并追问
+（一次一个、有限轮、有新信息才问）→ 形成**可追溯的评估版本**。
+
+**验收**：
+1. 家长两次补充信息 → 两次评估版本，`known_facts` 累积、`unknowns` 收敛。
+2. 缺信息时系统**主动追问**，且**不重复问已答过的**；连续一轮没有新证据就不许再问。
+3. 事实 / 假设 / 未知 / 矛盾四类信息**分开存**，家长一眼能看出哪条是事实、哪条是系统的猜测。
+4. 编造的引文、没引文的"直述"、`support=none` 的结论**都进不了 known_facts**。
+5. 服务重启后，案例的阶段与待办仍在。
+
+### 2.1 专属坑
+
+1. **case 图也要满足边界 #1**：`publish_case_events` 是**唯一**写库节点，排在**所有 interrupt 之后**
+   （照抄现有三张图的形状）。
+2. **`Command(resume=)` 打在没有 pending interrupt 的 thread 上会让 LangGraph 从头重跑整条图** ——
+   不报错、不抛异常，就是数据写了两遍。守卫必须在 `graph.invoke` **之前**，返回 **409**
+   （现成写法：`server.py:827-829`）。
+3. **多轮追问 vs "只许问一次"**：现有 `clarify_asked` 守卫是为了防"系统把自己没听懂的锅推给人"。
+   本阶段要放开多轮，就得用**"这一轮有没有新证据"**来替代"问没问过"（见 2.3.5）。
+4. **checkpoint 只存纯 dict**（边界 #9）。`CaseEvidence` / `AssessmentVersion` 是 Pydantic → 进 state 前转 dict。
+5. **FastAPI 按声明顺序匹配路由**：`/api/cases/{case_id}/xxx` 必须声明在 `/api/cases/{case_id}` **之前**
+   （`server.py:736-740` 记着 `/api/plan/status` 被参数路由吃掉的坑）。
+
+### 2.2 改动清单
+
+**新增**
+
+| 文件 | 职责 |
+|---|---|
+| `asd_agent/case/__init__.py` / `models.py` | `Case` / `CaseEvidence` / `AssessmentVersion` / `CaseClarify` / `CaseStatus` |
+| `asd_agent/case/lifecycle.py` | 生命周期纯函数：`ALLOWED_TRANSITIONS` / `can_transition()` / `next_status()` |
+| `asd_agent/case/evidence.py` | 证据抽取（LLM）+ 回指校验 + 降级 |
+| `asd_agent/case/router.py` | 案例编排：下一步该做什么（纯 Python） |
+| `asd_agent/case/selfcheck.py` | case 层自检 |
+| `asd_agent/graph/case_graph.py` / `case_nodes.py` | 第四张图（见 2.3.3） |
+| `frontend/src/pages/CasePage.vue` + `CaseStage.vue` + `CaseClarify.vue` + `EvidenceList.vue` | 案例页与三个组件 |
+
+**修改**：`asd_agent/store.py`（3 张新表 + 读写函数）、`asd_agent/graph/state.py`（`CaseState` + 载荷 + `case_thread_id()`）、
+`asd_agent/graph/runtime.py`（第五张图的单例）、`asd_agent/server.py`（新路由）、
+`frontend/src/App.vue`（页签）、`frontend/src/api.js`（fetch 封装）。
+
+### 2.3 详细设计
+
+#### 2.3.1 数据库
 
 | 表 | 列 | 唯一键 | 可变性 |
 |---|---|---|---|
 | `cases` | `case_id TEXT PK`, `child_id TEXT`, `thread_id TEXT`, `status TEXT`, `title TEXT`, `current_assessment_version INT`, `current_cycle_id TEXT`, `created_at`, `updated_at` | PK | **仅 `status` 可改** |
 | `assessment_versions` | `id BIGINT IDENTITY PK`, `case_id TEXT`, `version INT`, `known_facts JSON`, `hypotheses JSON`, `unknowns JSON`, `contradictions JSON`, `risk_flags JSON`, `evidence_snapshot JSON`, `created_at` | `uq_assess_version(case_id, version)` | 只追加 |
 | `case_evidence` | `id BIGINT IDENTITY PK`, `case_id TEXT`, `assessment_version INT`, `claim TEXT`, `quote TEXT`, `source TEXT`, `status TEXT`, `support TEXT`, `occurred_at TEXT`, `scene TEXT`, `created_at` | `uq_evidence_once(case_id, assessment_version, claim_hash, source_hash)` | 只追加 |
-| `plan_candidates` | `id BIGINT IDENTITY PK`, `case_id TEXT`, `cycle_id TEXT`, `based_on_assessment_version INT`, `content JSON`, `reference_activity_ids JSON`, `validation JSON`, `status TEXT`, `created_at` | `idx_cand_case(case_id, cycle_id, id DESC)` | **仅 `status` 可改**（selected / rejected） |
-| `decision_log` | `id BIGINT IDENTITY PK`, `case_id TEXT`, `cycle_id TEXT`, `based_on_assessment_version INT`, `proposed_action TEXT`, `applied_action TEXT`, `reasoning TEXT`, `evidence_ids JSON`, `parent_decision TEXT`, `created_at` | `idx_decision_case(case_id, id DESC)` | 只追加 |
 
-枚举值：
-
-- `cases.status`（`refract.md` §7.1）：
-  `assessing` / `awaiting_parent_input` / `ready_to_execute` / `awaiting_feedback` / `reviewing_outcome` /
-  `revising_plan` / `paused` / `closed`
+枚举：
+- `cases.status`（`refract.md` §7.1）：`assessing` / `awaiting_parent_input` / `ready_to_execute` /
+  `awaiting_feedback` / `reviewing_outcome` / `revising_plan` / `paused` / `closed`
 - `case_evidence.source`：`parent_message` / `parent_report` / `clinical_report` / `observation` / `model_inference`
 - `case_evidence.status`：`parent_reported` / `observed` / `inferred` / `confirmed`
 - `case_evidence.support`：`direct` / `partial` / `none`
-- `plan_candidates.status`：`proposed` / `selected` / `rejected` / `superseded`
 
-**改 2 张现有表**（只加列，不改语义，老数据不动）：
-
-| 表 | 加什么 | 为什么 |
-|---|---|---|
-| `plans` | `case_id TEXT`, `cycle_id TEXT`, `based_on_assessment_version INT`, `source TEXT DEF 'activity_library'` | 让"生效方案"能回指案例与评估版本；`source` 让家长选择页知道它是模型生成还是活动库拼的 |
-| `sessions` | `case_id TEXT`, `cycle_id TEXT`, `execution_id TEXT` | 反馈要能关联到案例与一次执行（`plan_id` / `plan_version` 已有） |
-
-#### A.3.2 证据模型（refract.md §4.1/§4.2）
+#### 2.3.2 证据模型（`refract.md` §4.1/§4.2）
 
 **两类检查必须分开**：
 
@@ -218,7 +385,7 @@
 | **引用真实性**（原文是否真含这段话） | Python，0 token | `llm.check_quote(source, quote)`（`llm.py:182`）—— 沿用现有实现 |
 | **结论支持程度**（这段话够不够支撑这个结论） | **受限枚举字段 + Python 规则** | LLM 在抽取时自评 `support: direct/partial/none`；Python 据此**禁止**升级状态 |
 
-**硬不变量**（写进 `case/models.py` 的 model_validator，降级而不是报错 —— 与 `capabilities.py` 的
+**硬不变量**（写进 `case/models.py` 的 model_validator，降级而不是报错 —— 与 `capabilities.py`
 "inferred 高置信静默钳到 0.35"同风格）：
 
 1. `status == "parent_reported"`（或 `confirmed`）但 `quote` 为空 → **不许进 `known_facts`**，降级为 `inferred`。
@@ -228,10 +395,10 @@
 3. `support == "partial"` → 可以进 `known_facts`，但必须带 `partial` 标记，且**不能**是 `confirmed`。
 4. `status == "inferred"` → 置信度钳到 `< 0.4`（沿用 `INFERRED_MAX_CONFIDENCE = 0.35`）。
 
-**矛盾处理**（refract.md §4.2 / FR-08）：同一 case 内两条 claim 冲突时**并列保留**，
-在 `AssessmentVersion.contradictions` 里记下来，**不自动删任何一条**（原始陈述不可被覆盖）。
+**矛盾处理**：同一 case 内两条 claim 冲突时**并列保留**，记进 `AssessmentVersion.contradictions`，
+**不自动删任何一条**（原始陈述不可被覆盖）。
 
-#### A.3.3 case 图
+#### 2.3.3 case 图
 
 ```
 START → load_case_context → extract_new_evidence(LLM) → update_assessment
@@ -240,65 +407,31 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
       → 信息足够 → publish_case_events → END
 ```
 
-- **thread_id = `case:{case_id}`**（长期稳定，一个案例一条）→ 对应 `refract.md` §9.1。
+- **thread_id = `case:{case_id}`**（长期稳定）→ 对应 `refract.md` §9.1。
 - `publish_case_events` 是**唯一**写库节点：写 `case_evidence` + `assessment_versions` + 改 `cases.status`。
 - `safety_check` 直接复用 `redflag.scan()`（`redflag.py:280`）与 `store.plan_paused()`（`store.py:973`），
   **判定逻辑一字不改**；命中 urgent 时与观察链同款：先给转诊指引（`redflag.guidance_for`），但**仍要 publish**
   （`LANGGRAPH.md` 第四节之二记着"urgent 那天最该被记下来"）。
 - 节点体默认纯函数；`extract_new_evidence` 是本图唯一的 LLM 节点。
 
-#### A.3.4 候选方案（LLM 生成 + Python 校验 + 家长选）
+#### 2.3.4 新 LLM stage `case_evidence_extract`
 
-**新 LLM stage `plan_candidates`**（`case/candidates.py`）：
+- 输入：家长这一轮的原话 + 已有 `known_facts` / `unknowns`（要增量，不是重新抽一遍）。
+- 输出：`ObservationBatch` 风格的证据列表 —— `claims[{claim, quote, source, status, support, occurred_at, scene}]` +
+  `unknowns[]` + `contradictions[]` + `clarifying_question`（**一次一个**）。
+- 超时 60s（同 `observe_extract`），重试 3 次，**降级路径交白卷**（`events=[]`、`degraded=True`）——
+  照 `observe.py:385` 的做法：降级时**一条都不编**。
+- 证据抽取的字段必须**给例子**（7B 跟例子走，不跟论述走 —— `LANGGRAPH.md` 第四节之一）。
 
-- **输入**：当前 `AssessmentVersion`（known_facts / hypotheses / unknowns）+ 家长约束
-  （`daily_minutes` / `materials_at_home` / `alone_only`）+ **参考实践块**。
-- **参考实践块怎么拼**（`refract.md` §5.1，活动库降为参考知识库）：
-  **不上向量检索**（项目既有立场）→ 用现成的 `activities.retrieve()` 拿候选，把 top-N（8–12 条）的
-  `title` / `steps` 摘要 / `materials` / `success_criteria` 拼进 prompt；
-  **同时把被硬过滤掉的活动和排除原因一起喂进去**（"家里没有必需材料：…"、"当前水平不适合难度 3"），
-  让模型据此**生成替代材料/替代难度**的方案，而不是只会说"没有合适的活动"。
-- **输出模型 `CandidatePlan`**（Pydantic，`extra="forbid"`）：
-  `title` / `problem_addressed` / `based_on_facts[]` / `assumptions[]` /
-  `steps[{action, prompt_level, time_limit_sec}]` / `total_minutes` /
-  `materials[{name, essential, substitute}]` / `observation_metrics[]` / `stop_conditions[]` /
-  `risks[]` / `reference_activity_ids[]`（可空 = 全新策略）/ `differentiation`（**强制字段**，与其他候选的实质区别）
-- **Python 校验**（`validate_candidate`，0 token，硬约束）：
-  ① 总时长 ≤ 家长预算；
-  ② essential 材料不可得**但有 substitute** 才放行，否则剔除；
-  ③ 必须有 `observation_metrics` 与 `stop_conditions`（`refract.md` §5.3）；
-  ④ 候选之间**不能只是改措辞** —— 校验 `differentiation` 非空且与其它候选的 `steps` 签名不重合；
-  ⑤ 安全：不允许出现"强行/惩罚/压制"类步骤（与红旗规则的 `avoid` 口径一致）。
-  校验不通过的候选落 `status='rejected'` 并写明原因，**不静默丢弃**（与 `plan_nodes.validate_plan` 的 `changes` 同一路数）。
-- **家长选择**：复用计划链已有的 ⚡ `approve_plan` interrupt，载荷扩展 action `"select_candidate"` + `candidate_id`；
-  选定后 `freeze_selected_plan` 落 `plans` 表（`source='llm_candidate'`、`case_id`、`cycle_id`、`based_on_assessment_version`）。
-  → **`/api/plan/{child}` 与 `/api/card` 的读路径一行不用改**（它们只认 `status='active'`）。
-- **降级路径**（LLM 挂了必须还有路）：`_fallback_candidates()` → 从活动库按难度/材料挑 2 条，
-  用活动字段填成结构完整的 `CandidatePlan` → 家长照样能选、能执行。**绝不返回空列表。**
+#### 2.3.5 多轮追问的三条硬约束
 
-#### A.3.5 多轮追问的三条硬约束
-
-1. **一次只问 1 个问题**（`refract.md` §8.1："生成具体、易回答的问题"）。
+1. **一次只问 1 个问题**（`refract.md` §8.1）。
 2. **全局最多 3 轮**（`MAX_CLARIFY_ROUNDS`）。
 3. **连续一轮没有新证据就不许再问** —— 判据：这一轮的回答**没有产生新的 `CaseEvidence`**。
-   ★ 这条是"系统把自己没听懂的锅推给人"那个坑的解药：现有 `clarify_asked` 守卫把它压成"只许问一次"，
+   ★ 这是"系统把自己没听懂的锅推给人"那个坑的解药：现有 `clarify_asked` 守卫把它压成"只许问一次"，
    本阶段放开多轮，就得用"有没有新信息"来替代"问没问过"。
 
-#### A.3.6 路由（case 编排）
-
-`case/router.py::next_step(case_row)` 返回下一步动作，**纯 Python 0 token**：
-
-| `cases.status` | next_step | 触发什么 |
-|---|---|---|
-| `assessing` | `assess` | 跑 case 图（抽证据 → 更新评估） |
-| `awaiting_parent_input` | `await_reply` | 等家长回答追问（不跑图） |
-| `ready_to_execute` | `await_feedback` | 等真实执行（不跑图） |
-| `awaiting_feedback` | `review` | 收到反馈 → 反馈链（阶段 B 再扩） |
-| `reviewing_outcome` | `revise` | 需要出新候选 → 计划链 |
-| `paused` | `await_reply` | 红旗未关闭（`store.plan_paused` 判定）→ 提示转诊 |
-| `closed` | `none` | 归档 |
-
-#### A.3.7 API
+#### 2.3.6 API
 
 | 路由 | 形态 | 说明 |
 |---|---|---|
@@ -306,24 +439,18 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
 | `POST /api/cases/{case_id}/messages` | job+SSE | 家长补充描述 → 跑 case 图（可能返回 `phase="clarify"`） |
 | `POST /api/cases/{case_id}/clarify` | job+SSE | 回答追问（`Command(resume=)`；**无 pending interrupt 必须 409**） |
 | `GET /api/cases/{case_id}` | 直接 JSON | 当前评估、生命周期状态、待办、最近决策 |
-| `GET /api/cases/{case_id}/history` | 直接 JSON | 评估版本 / 证据 / 候选 / 决策时间线 |
-| `GET /api/cases/{case_id}/plan-candidates` | 直接 JSON | 候选方案列表 |
-| `POST /api/cases/{case_id}/plan-selection` | 直接 JSON | 选候选 / 要求重生成 / 暂不执行 |
+| `GET /api/cases/{case_id}/history` | 直接 JSON | 评估版本 / 证据时间线 |
 
 - 旧路由 `/api/profile` `/api/plan/run` `/api/feedbacks` **一字不改**，继续可用（渐进迁移）。
-- **路由声明顺序**：`/api/cases/{case_id}/xxx` 全部在 `/api/cases/{case_id}` 之前。
-- **409 守卫**：照抄 `server.py:827-829`（计划链）的写法。
 
-#### A.3.8 前端
+#### 2.3.7 前端
 
 - 新增 hash 页签 `case`（`App.vue` 的 `TABS` + `VALID`）→ `pages/CasePage.vue`。
-- 组件：`CaseStage.vue`（阶段徽标）/ `CaseClarify.vue`（追问卡，一次一个问题）/ `CandidatePlanCard.vue`
-  （展示"试图解决什么 / 依据哪些已知信息 / 建立了什么假设 / 家长要做什么 / 观察什么 / 什么情况停止 / 预计投入"，
-  **不显示总分** —— `refract.md` §10.3）/ `EvidenceList.vue`（事实与假设必须一眼能分开）。
-- 候选多张卡并列，每张底部「选这个」+「都不合适，重新生成」。
+- `CaseStage.vue`（阶段徽标）/ `CaseClarify.vue`（追问卡，一次一个问题）/
+  `EvidenceList.vue`（**事实 / 假设 / 未知 / 矛盾四栏**，事实与假设必须一眼能分开）。
 - 所有 fetch 走 `api.js`（唯一出口）。
 
-### A.4 自检断言（`asd_agent/case/selfcheck.py`，建议 10 组）
+### 2.4 自检断言（建议 10 组）
 
 1. 建案例 → `cases` 落库、`thread_id='case:{id}'`、`status='assessing'`
 2. 补充信息 → `case_evidence` 追加行、`assessment_versions` 版本 +1
@@ -332,63 +459,65 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
 5. `support='none'` → 不许进 `known_facts`；`support='partial'` → 可进但不可 `confirmed`
 6. 未知项非空 → `status='awaiting_parent_input'`，图停在 ⚡clarify
 7. 回答后**没有新证据** → **不再问第二轮**
-8. 信息足够 → 候选 ≥ 2 且 `steps` 签名互不重合
-9. 家长选一个 → `plans` 落一行 `status='active'`、`source='llm_candidate'`、`cases.status='ready_to_execute'`
+8. 两次补充信息 → 评估版本 +2，`known_facts` 累积且 `unknowns` 收敛
+9. 矛盾的两条 claim **并列保留**、进 `contradictions`，不自动删
 10. **无 pending interrupt 时 `Command(resume=)` → 409**（不重跑图、不多写一行）
 
-另加：
-- `http_selfcheck.py` +1 组（建案例 → 补充 → 选方案 → 反馈 → 读回，**真起服务打接口**）
-- `graph/selfcheck.py` +1 组（case 图 interrupt 往返 + 恢复不双写，**必须用 PostgresSaver**）
+另加：`http_selfcheck.py` +1 组（建案例 → 补充 → 答追问 → 读回，**真起服务打接口**）；
+`graph/selfcheck.py` +1 组（case 图 interrupt 往返 + 恢复不双写，**必须用 PostgresSaver**）。
 
-### A.5 验证命令
+### 2.5 验证 / 提交 / 交接
 
-```bash
-cd asd_agent
-ASD_DB_PATH=/tmp/graph_selfcheck.db   ../.venv/bin/python -m graph.selfcheck    # 29 → 30+
-ASD_DB_PATH=/tmp/graph_ckpt_check.db  ../.venv/bin/python -m graph.checkpointer
-ASD_DB_PATH=/tmp/http_selfcheck.db    ../.venv/bin/python http_selfcheck.py     # 13 → 14+
-ASD_DB_PATH=/tmp/case_selfcheck.db    ../.venv/bin/python -m case.selfcheck     # 新增
-../.venv/bin/python activities.py --validate
-cd ../frontend && npx vite build
-```
-
-**真起服务打接口**（`server.py` 不在回归集里，这步不能省）：
-
-```bash
-cd /Users/qiyusama/Documents/code/ganyu
-ASD_DB_PATH=/tmp/case_live.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
-  ./.venv/bin/python -c "import uvicorn,server; uvicorn.run(server.app,host='127.0.0.1',port=8123,log_level='warning')"
-# 建案例 → 补充 → 答追问 → 生成候选 → 选方案 → 读 /api/cases/{id} → 提交反馈 → 再读
-```
-
-每一步都要能说清"这一请求付了几次 LLM、写了哪几张表"。
-
-### A.6 提交要求
-
-- 一个 commit，可 revert；message 写"为什么"（例：`案例级重构 A1：cases/case_evidence 表 + case 图（末尾唯一写库）`）。
-- 提交前更新 `asd_agent/PROGRESS.md`（自检组数、验证结果、踩坑）与本文（勾状态 + 记录实际决策）。
-- 涉及 `store.py` 表结构的改动 → **必须重启后端**（`store._init` 只在某个 schema 首次创建时跑，
-  跑着的服务不会凭空多出新表，新路由会 500 `relation "cases" does not exist`）。
-
-### A.7 交接给下一个 session 的话
-
-阶段 A 完成后，在本文「阶段 A」末尾追加一段 `### A.8 本阶段实际发生的事`：
-- 哪些设计在实现时被推翻、为什么；
-- 新增/改动的文件清单（最终版）；
-- 自检组数从多少到多少；
-- 遗留项与已知妥协；
-- **下一阶段的第一件事**是什么。
+同阶段 1 的 1.6–1.8（验证命令 / 提交要求 / 交接位）。
 
 ---
 
-## 2. 阶段 B：反馈与决策重构 ⬜
+## 3. 阶段 3：生成候选方案 + 家长选择 ⬜
 
-对应 `refract.md` §6 / §11 阶段二。
+对应使用流程的第 3–4 步：**信息足够 → 出多个候选 → 家长选 → 冻结方案版本**。
+依赖阶段 1（能装生成项）与阶段 2（评估作为输入）。
 
-- `ExecutionFeedback` 三层分离：**执行情况**（是否尝试 / 实际几次 / 哪些步骤 / 是否因家长精力不足而没做）/
-  **当次表现**（目标行为是否出现 / 反应变化 / 需要多少帮助 / 是否出现新困难）/ **跨时间效果**（不同日期是否一致变化 /
-  不同场景下是否变化 / 需要的帮助是否减少 / 有无新的负面反应）。
-- `quality_for()` **保留**为兼容统计字段（照 `refract.md` §6.2），但不再单独驱动状态升级。
+### 3.1 内容
+
+- **新 LLM stage `plan_candidates`**（`asd_agent/case/candidates.py`）：
+  - 输入：当前 `AssessmentVersion`（known_facts / hypotheses / unknowns）+ 家长约束 + **参考实践块**。
+  - **参考实践块怎么拼**（`refract.md` §5.1，活动库降为参考知识库）：
+    **不上向量检索**（项目既有立场）→ 用现成的 `activities.retrieve()` 拿候选，把 top-N（8–12 条）的
+    `title` / `steps` 摘要 / `materials` / `success_criteria` 拼进 prompt；
+    **同时把被硬过滤掉的活动和排除原因一起喂进去**（"家里没有必需材料：…"、"当前水平不适合难度 3"），
+    让模型据此**生成替代材料/替代难度**的方案，而不是只会说"没有合适的活动"。
+  - 输出 `CandidatePlan`（`extra="forbid"`）：`title` / `problem_addressed` / `based_on_facts[]` /
+    `assumptions[]` / `steps[{action, prompt_level, time_limit_sec}]` / `total_minutes` /
+    `materials[{name, essential, substitute}]` / `observation_metrics[]` / `stop_conditions[]` /
+    `risks[]` / `reference_activity_ids[]`（可空 = 全新策略）/ `differentiation`（**强制字段**）。
+  - 超时 90s（同建档抽取），重试 2 次，**降级路径**：`_fallback_candidates()` → 从活动库挑 2 条
+    结构完整的候选（**绝不返回空列表**）。
+- **转成方案项**：`plan_item.py::from_candidate(cand) -> Activity`（`kind='generated'`），
+  再走阶段 1 建好的**同一条**打分/闸门/装箱流水线。
+- **Python 校验**（0 token，硬约束）：① 总时长 ≤ 预算；② essential 材料不可得但有 substitute 才放行；
+  ③ 必须有 `observation_metrics` 与 `stop_conditions`；④ 候选之间**不能只是改措辞**
+  （`differentiation` 非空且 `steps` 签名不重合）；⑤ 安全：不允许"强行/惩罚/压制"类步骤。
+  校验不通过的候选落 `status='rejected'` 并写明原因，**不静默丢弃**（与 `plan_nodes.validate_plan` 的 `changes` 同一路数）。
+- **家长选择**：复用计划链已有的 ⚡ `approve_plan` interrupt，载荷扩展 action `"select_candidate"` + `candidate_id`；
+  选定后落 `plans`（`source='llm_candidate'`、`case_id`、`cycle_id`、`based_on_assessment_version`），
+  **下游 `/api/plan/{child}` 与 `/api/card` 的读路径一行不用改**（它们只认 `status='active'`）。
+- **新表** `plan_candidates`：`id` / `case_id` / `cycle_id` / `based_on_assessment_version` / `content JSON` /
+  `reference_activity_ids JSON` / `validation JSON` / `status` / `created_at`。
+- **API**：`GET /api/cases/{case_id}/plan-candidates`、`POST /api/cases/{case_id}/plan-selection`。
+- **前端**：`CandidatePlanCard.vue` —— 展示"试图解决什么 / 依据哪些已知信息 / 建立了什么假设 / 家长要做什么 /
+  观察什么 / 什么情况停止 / 预计投入"，**不显示总分**（`refract.md` §10.3）；多张卡并列。
+
+---
+
+## 4. 阶段 4：执行 + 反馈 + 下一步决策 ⬜
+
+对应使用流程的第 5–7 步：**执行 → 反馈 → 更新评估 → 决定继续/调整/更换/重新评估/暂停**。
+
+- `ExecutionFeedback` 三层分离（`refract.md` §6.2）：
+  **执行情况**（是否尝试 / 实际几次 / 哪些步骤 / 是否因家长精力不足而没做）/
+  **当次表现**（目标行为是否出现 / 反应变化 / 需要多少帮助 / 是否出现新困难）/
+  **跨时间效果**（不同日期是否一致变化 / 不同场景下是否变化 / 需要的帮助是否减少 / 有无新的负面反应）。
+- `quality_for()` **保留**为兼容统计字段，但不再单独驱动状态升级。
 - 新 LLM stage `decide_next_action`（LLM 提议 `{action, reasoning, evidence_ids, uncertainties, proposed_changes}`，
   `action ∈ {continue, adjust, replace, reassess, pause}`）+ **Python 批准层** `case/decision.py::approve_action`：
   - **永不批准**：`pause`（除非 urgent 红旗 → `store.plan_paused` 判定）、
@@ -396,9 +525,13 @@ ASD_DB_PATH=/tmp/case_live.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
   - `adjust` 的改动只允许落在白名单（步骤 / 材料 / 时长 / 提示级别）。
   - `decision_log` 同时记 `proposed_action` 与 `applied_action` —— **模型提议与实际执行分开记**。
 - 旧状态机降级为「约束与统计模块」：继续算、继续落 `skill_state`，但不再单独决定明天推什么难度（加开关，渐进关）。
-- 词汇校验分层（`refract.md` §4.3）：结构字段 / 安全字段 / 引用对应关系继续严格；自然语言描述与新能力标签放开。
+- 词汇校验分层（`refract.md` §4.3）：结构字段 / 安全字段 / 引用对应关系继续严格；
+  自然语言描述与新能力标签放开（生成项的 `target_skill_items` 可用词表外标签）。
+- `case/router.py::next_step()` 落地：按 `cases.status` 决定下一步跑哪条链。
 
-## 3. 阶段 C：历史回放与分支实验 ⬜
+---
+
+## 5. 阶段 5：历史回放与分支实验 ⬜
 
 对应 `refract.md` §9 / §11 阶段三，也是本仓库 LangGraph 的 **Phase 5**（`LANGGRAPH.md` 第五节列了三条优先项）。
 
@@ -408,20 +541,9 @@ ASD_DB_PATH=/tmp/case_live.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
   （`refract.md` §9.4；三条唯一索引是 Phase 4 的幂等承诺，分叉必须尊重）。
 - 四类使用场景（`refract.md` §9.3）：评估修正 / 方案对比 / 提示词与模型回归 / 反馈解析纠错。
 
-## 4. 阶段 D：逐步放宽固定规则 ⬜
-
-对应 `refract.md` §5 / §11 阶段四。
-
-- 活动库彻底降为参考知识库；最终方案**可以不对应任何 activity_id**。
-- 硬过滤分层（`refract.md` §5.2）：预算=硬约束；材料不可用→优先生成替代方案；抗拒冷却→提醒与调整信号
-  （不自动等同于"孩子不配合"）；前置未完成→改成检查该方案的真实前提；难度门槛→改成对具体方案的适配性与风险检查；
-  最近三天重复→保留提醒但允许有理由地继续。
-- 8 项评分从"选唯一方案"改为辅助评估。
-- 每条规则改动都要有**明确的作用域、触发原因和日志**（否则重构后无法解释某个方案为何被过滤）。
-
 ---
 
-## 5. 全局验收清单（重构收尾时逐条过）
+## 6. 全局验收清单（重构收尾时逐条过）
 
 - [ ] 多轮追问：能问、能停、不重复问
 - [ ] 多候选：≥2 个且实质不同；家长能选、能改、能要求重生成、能暂缓
@@ -432,10 +554,11 @@ ASD_DB_PATH=/tmp/case_live.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
 - [ ] 幂等：同一反馈重复提交不多写一行、不白付 LLM
 - [ ] 历史：能从 checkpoint 复现指定状态下的方案生成，且分支不覆盖真实事实
 - [ ] 旧能力零回退：`/api/profile` `/api/plan/run` `/api/feedbacks` `/api/card` 行为不变
+- [ ] **放宽没有变成绕过**：生成项同样过难度闸门、材料检查、预算与同一套权重打分
 
 ---
 
-## 6. 附录：ID 与命名约定
+## 7. 附录：ID 与命名约定
 
 | 概念 | 形式 | 备注 |
 |---|---|---|
@@ -445,5 +568,7 @@ ASD_DB_PATH=/tmp/case_live.db ASD_NO_LLM=1 PYTHONPATH=.:./asd_agent \
 | `assessment_version` | 该 case 内自增整数 | 对应 `assessment_versions.version` |
 | `plan_id` / `plan_version` | 复用现有 `plans` 表 | 版本作用域仍是 `(child_id, plan_date)` |
 | `execution_id` | `exec:{cycle_id}:{n}` | 对应 `sessions.execution_id` |
+| 库内方案项 id | `activity_id`（`^[a-z]{2,4}-\d{3}$`） | `kind='library'` |
+| 生成方案项 id | `gen:{candidate_id}:{item_index}` | `kind='generated'`；**必须稳定**（指纹不依赖它，但幂等键依赖它） |
 | `evidence_id` | `case_evidence.id` | `decision_log.evidence_ids` 引用它 |
 | `checkpoint_id` | LangGraph 提供的 | **不代替任何业务 ID**（`refract.md` §9.1） |
