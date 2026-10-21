@@ -52,6 +52,10 @@ DEFAULT_DB = os.getenv("ASD_DB_PATH", str(
 
 _TLS = threading.local()      # 每线程一份连接，见 connect()
 
+#: 建 schema / 建表那段要**串行**（见 `connect()` 里那段注释）。
+#: 它是**每个 schema 一次**的开销，串行化不影响稳态性能。
+_CONNECT_LOCK = threading.Lock()
+
 
 #: 「一天的执行」的身份。**它同时是 checkpoint 的命名空间与落库行的 run_id。**
 #:
@@ -137,14 +141,30 @@ def connect(path: str | None = None) -> psycopg.Connection:
     if conns is None:
         conns = _TLS.conns = {}
     if sch not in conns:
-        c = psycopg.connect(DEFAULT_DSN, autocommit=True)
-        c.row_factory = dict_row                  # 保住 row["col"] 与 dict(row)
-        with c.cursor() as cur:
-            cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{sch}"')
-            cur.execute(f'SET search_path TO "{sch}"')
-        c.commit()
-        _init(c)
-        conns[sch] = c
+        # ★ 这段要**串行**。
+        #   `CREATE SCHEMA IF NOT EXISTS` 在 Postgres 里**不是**原子的：
+        #   两个线程同时执行时，都看到"schema 不存在"，
+        #   都去建 —— 第二个撞 `pg_namespace_nspname_index` 唯一索引，
+        #   报 `UniqueViolation: duplicate key value violates unique constraint
+        #   "pg_namespace_nspname_index"`。
+        #
+        #   ★ 为什么平时没炸
+        #   -----------------
+        #   只有**这个 schema 的第一次连接**才会走到这段。
+        #   平时开发用的库早就建好了，于是这条竞态一直藏着 ——
+        #   直到换一个新库 + 前端并发发两个请求（案例页正好会）才炸。
+        #   `IF NOT EXISTS` 给人的安全感在这里是假的：它防的是"重复执行"，
+        #   不是"同时执行"。
+        with _CONNECT_LOCK:
+            if sch not in conns:          # 拿到锁后**再查一次**（双检）
+                c = psycopg.connect(DEFAULT_DSN, autocommit=True)
+                c.row_factory = dict_row              # 保住 row["col"] 与 dict(row)
+                with c.cursor() as cur:
+                    cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{sch}"')
+                    cur.execute(f'SET search_path TO "{sch}"')
+                c.commit()
+                _init(c)
+                conns[sch] = c
     return conns[sch]
 
 
@@ -392,6 +412,83 @@ def _init(c: psycopg.Connection) -> None:
         ON red_flags(child_id, observed_at, code, source_hash);
     CREATE INDEX IF NOT EXISTS idx_rf_child_status
         ON red_flags(child_id, status, observed_at DESC);
+
+    -- ── 案例（阶段 2）─────────────────────────────────────────────────
+    --   第四张图（case:{case_id}）落的三张表。
+    --   ★ 与现有观察链**并排**，不是替代：观察链落 observations / red_flags，
+    --     这里落 cases / case_evidence / assessment_versions。
+    --     两边各写各的表 → 现有观察链在阶段 2 一行都不用改。
+    --
+    --   cases 是**唯一**一个"可改 status"的案例表（其余 append-only），
+    --   理由与 red_flags.status 一样：行的身份不可改写，只有状态在动，
+    --   而状态只由**流程推进**驱动，不由内容决定。
+    CREATE TABLE IF NOT EXISTS cases (
+        case_id     TEXT PRIMARY KEY,          -- 形如 case:{child_id}:{seq}
+        child_id    TEXT NOT NULL REFERENCES children(child_id),
+        thread_id   TEXT NOT NULL DEFAULT '',  -- case:{case_id}，长期不变
+        status      TEXT NOT NULL DEFAULT 'assessing',
+        title       TEXT NOT NULL DEFAULT '',
+        -- 同一个孩子下的序号。**单独一列是为了唯一索引** ——
+        -- case_id 是拼出来的字符串，靠它做唯一约束就要在字符串上算序号，
+        -- 而并发下两个请求会算出同一个序号。
+        seq         INTEGER NOT NULL DEFAULT 1,
+        current_assessment_version INTEGER NOT NULL DEFAULT 0,
+        -- ★ 累积的家长原话。
+        --   为什么存在 cases 表而不是 checkpoint：
+        --   checkpoint 是**编排的位置**，不是业务事实（铁律 #1），
+        --   而"这个案例到目前为止家长说了什么"是业务事实 ——
+        --   它要能跨进程重启读回来（阶段 2 验收第 5 条）。
+        corpus      TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_case_seq ON cases(child_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_case_child ON cases(child_id, created_at DESC);
+
+    -- 一版评估。**只追加** —— 评估的历史就是"我们是怎么一步步搞明白的"。
+    CREATE TABLE IF NOT EXISTS assessment_versions (
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        case_id     TEXT NOT NULL REFERENCES cases(case_id),
+        version     INTEGER NOT NULL,
+        known_facts TEXT NOT NULL DEFAULT '[]',
+        hypotheses  TEXT NOT NULL DEFAULT '[]',
+        unknowns    TEXT NOT NULL DEFAULT '[]',
+        contradictions TEXT NOT NULL DEFAULT '[]',
+        risk_flags  TEXT NOT NULL DEFAULT '[]',
+        -- ★ 追问往来（JSON 数组，每项 {unknown, question, answer, skipped}）。
+        --   为什么单独一列：评估版本记的是「现在我们知道什么」，
+        --   而"我们问过什么、家长怎么答的"是**怎么知道的**那部分 ——
+        --   少了它，一份评估就看不出哪些结论是被追问逼出来的。
+        clarifications TEXT NOT NULL DEFAULT '[]',
+        created_at  TEXT NOT NULL
+    );
+    -- ★ 幂等键：同一个案例的同一个版本号只能有一行。
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_assess_version
+        ON assessment_versions(case_id, version);
+
+    -- 一条证据。**只追加**。
+    CREATE TABLE IF NOT EXISTS case_evidence (
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        case_id     TEXT NOT NULL REFERENCES cases(case_id),
+        assessment_version INTEGER NOT NULL DEFAULT 0,
+        claim       TEXT NOT NULL,          -- 一条事实陈述
+        quote       TEXT NOT NULL DEFAULT '',   -- 家长原话
+        source      TEXT NOT NULL DEFAULT 'parent_message',
+        status      TEXT NOT NULL DEFAULT 'inferred',
+        support     TEXT NOT NULL DEFAULT 'none',
+        occurred_at TEXT NOT NULL DEFAULT '',
+        scene       TEXT NOT NULL DEFAULT '',
+        -- ★ 幂等键的一半。原文不进唯一索引（btree unique index 遇到
+        --   超长 text 会报 "index row size exceeds maximum"），
+        --   索引里放 claim 的 sha256。
+        claim_hash  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL
+    );
+    -- ★ 键里**不含 thread_id**：分叉重跑同一段话，不该在真实历史里多一条。
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_once
+        ON case_evidence(case_id, assessment_version, claim_hash);
+    CREATE INDEX IF NOT EXISTS idx_evidence_case
+        ON case_evidence(case_id, id);
     """)
     _migrate(c)
     c.commit()
@@ -1536,6 +1633,273 @@ def what_progressed(conn: psycopg.Connection, child_id: str,
             if ABILITY_STATE.index(open_state) > ABILITY_STATE.index(actual):
                 rep.frozen.append((item, actual, open_state))
     return rep
+
+
+# ================================================================== 案例（阶段 2）
+#
+# ★ 这一段是第四张图（case:{case_id}）的落库侧。
+#   三张表：cases / assessment_versions / case_evidence。
+#   写库**只有一个节点**（`publish_case_events`），这里是它调用的函数。
+#
+# ★ 幂等的两层
+#   第一层：唯一索引（uq_assess_version / uq_evidence_once）+ ON CONFLICT。
+#   第二层：checkpoint 里的输入指纹（见 graph/case_nodes.py）。
+#   只做一层：数据对但白付 LLM，或白跑图。
+
+def _claim_hash(claim: str) -> str:
+    """claim 的 sha256。**只用在写路径与唯一索引上**，不做查询谓词。"""
+    import hashlib
+    return hashlib.sha256((claim or "").strip().encode("utf-8")).hexdigest()
+
+
+def create_case(conn: psycopg.Connection, child_id: str, *, title: str = "",
+                corpus: str = "") -> dict:
+    """建一个案例。返回那一行。
+
+    ★ case_id 的形式是 `case:{child_id}:{seq}`
+      —— 与 `refract.md` §9.1 的命名约定一致，且**长期稳定**
+      （它是 thread_id 的一部分，thread_id 一变，checkpoint 里的历史就接不上了）。
+
+    ★ 为什么用"插入 + 撞了就换 seq 重试"，而不是"先查 max(seq) 再插"
+      -----------------------------------------------------------
+      `connect()` 是每线程一条连接，前端并发下两个线程都能查到同一个 max(seq)，
+      然后都插 —— 一个成功一个撞唯一索引。**唯一索引在这里是承重墙**，
+      不是"顺手加一个"。
+    """
+    import hashlib
+    created = datetime.now().isoformat(timespec="seconds")
+    for _ in range(8):
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq),0) AS s FROM cases WHERE child_id=%s",
+            (child_id,)).fetchone()
+        seq = int(row["s"]) + 1
+        case_id = f"case:{child_id}:{seq}"
+        try:
+            conn.execute(
+                "INSERT INTO cases(case_id,child_id,thread_id,status,title,seq,"
+                "current_assessment_version,corpus,created_at,updated_at) "
+                "VALUES(%s,%s,%s,'assessing',%s,%s,0,%s,%s,%s)",
+                (case_id, child_id, f"case:{case_id}", title, seq,
+                 corpus, created, created))
+            conn.commit()
+            return get_case(conn, case_id)          # type: ignore[return-value]
+        except Exception as e:                      # 唯一索引撞了 → 换 seq
+            if "uq_case_seq" not in str(e) and "duplicate key" not in str(e).lower():
+                raise
+            conn.rollback()
+    raise RuntimeError(f"建案例失败：{child_id} 的序号一直被占着")
+
+
+def get_case(conn: psycopg.Connection, case_id: str) -> dict | None:
+    """取一个案例那一行。读不到返回 None（**不抛**）。"""
+    row = conn.execute(
+        "SELECT * FROM cases WHERE case_id=%s", (case_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def list_cases(conn: psycopg.Connection, child_id: str) -> list[dict]:
+    """一个孩子的所有案例，按创建的倒序。"""
+    rows = conn.execute(
+        "SELECT * FROM cases WHERE child_id=%s ORDER BY created_at DESC, seq DESC",
+        (child_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_case(conn: psycopg.Connection, case_id: str, *,
+                status: str | None = None, corpus: str | None = None,
+                version: int | None = None) -> None:
+    """改案例的**可变**部分。
+
+    ★ 只改三样：status / corpus / current_assessment_version。
+      case_id / child_id / thread_id / seq / created_at 一律不动 ——
+      它们是行的身份，改了就等于改写了历史。
+    """
+    sets: list[str] = []
+    vals: list[Any] = []
+    if status is not None:
+        sets.append("status=%s")
+        vals.append(status)
+    if corpus is not None:
+        sets.append("corpus=%s")
+        vals.append(corpus)
+    if version is not None:
+        sets.append("current_assessment_version=%s")
+        vals.append(version)
+    if not sets:
+        return
+    sets.append("updated_at=%s")
+    vals.append(datetime.now().isoformat(timespec="seconds"))
+    vals.append(case_id)
+    conn.execute(f"UPDATE cases SET {', '.join(sets)} WHERE case_id=%s", vals)
+    conn.commit()
+
+
+def append_corpus(conn: psycopg.Connection, case_id: str, text: str) -> str:
+    """把家长这一轮说的话**追加**到案例的累积语料里。返回追加后的语料。
+
+    ★ 为什么语料在**消息到达时**就落库，而不是等图跑完
+    --------------------------------------------------
+    图可能停在 ⚡ interrupt 上等家长回答追问，而家长**可能再也不回答**。
+    那一刻如果语料还没落库，家长说过的话就**整个不见了** ——
+    没有报错，只是下次进来时他得从头再说一遍。
+
+    ★ 为什么这不是"interrupt 之前写库"那个坑
+    -----------------------------------------
+    那个坑是"resume 会重跑整个节点 → 写两遍"。
+    这里的幂等靠**判据**而不是靠节点位置：语料的尾巴已经是这段话，就不追加。
+    于是重复提交、resume 重跑、进程重启后重放，都不会多出一份。
+    """
+    text = (text or "").strip()
+    row = conn.execute(
+        "SELECT corpus FROM cases WHERE case_id=%s", (case_id,)).fetchone()
+    if not row:
+        return ""
+    corpus = row["corpus"] or ""
+    if not text or corpus.endswith(text):
+        return corpus
+    corpus = f"{corpus}\n{text}" if corpus else text
+    conn.execute(
+        "UPDATE cases SET corpus=%s, updated_at=%s WHERE case_id=%s",
+        (corpus, datetime.now().isoformat(timespec="seconds"), case_id))
+    conn.commit()
+    return corpus
+
+
+def merge_corpus(conn: psycopg.Connection, case_id: str, corpus: str) -> str:
+    """把图算出来的语料并进库里的语料。**只增不减。**
+
+    ★ 为什么不是直接覆盖
+    -------------------
+    库里的语料可能比图手里的**更新**（家长在图跑的这一轮里又发了一段）。
+    直接覆盖就把那段话抹掉了 —— 而抹掉的是家长刚说的话。
+
+    所以规则是：
+      · 新的比旧的长、且**以旧的为前缀**（图看到的就是全部）→ 覆盖
+      · 否则 → **不动**（图手里的比库里旧，或者压根不是同一条线）
+    「以旧为前缀」这个条件是关键：它保证图不会拿一段陈旧的语料
+    把库里的新内容覆盖掉。
+    """
+    corpus = corpus or ""
+    row = conn.execute(
+        "SELECT corpus FROM cases WHERE case_id=%s", (case_id,)).fetchone()
+    if not row:
+        return ""
+    old = row["corpus"] or ""
+    if not corpus or corpus == old:
+        return old
+    if corpus.startswith(old) and len(corpus) > len(old):
+        conn.execute(
+            "UPDATE cases SET corpus=%s, updated_at=%s WHERE case_id=%s",
+            (corpus, datetime.now().isoformat(timespec="seconds"), case_id))
+        conn.commit()
+        return corpus
+    return old
+
+
+def append_assessment_version(conn: psycopg.Connection, case_id: str,
+                              version: int, payload: dict) -> int:
+    """落一版评估。**只追加。**
+
+    `payload` 是 `Assessment` 的 dict（known_facts / hypotheses / unknowns /
+    contradictions / risk_flags）。各列按 JSON 存 TEXT —— 与本文件其余表一致。
+    """
+    row = conn.execute(
+        "INSERT INTO assessment_versions(case_id,version,known_facts,hypotheses,"
+        "unknowns,contradictions,risk_flags,clarifications,created_at) "
+        "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT(case_id, version) DO NOTHING RETURNING id",
+        (case_id, version,
+         json.dumps(payload.get("known_facts") or [], ensure_ascii=False),
+         json.dumps(payload.get("hypotheses") or [], ensure_ascii=False),
+         json.dumps(payload.get("unknowns") or [], ensure_ascii=False),
+         json.dumps(payload.get("contradictions") or [], ensure_ascii=False),
+         json.dumps(payload.get("risk_flags") or [], ensure_ascii=False),
+         json.dumps(payload.get("clarifications") or [], ensure_ascii=False),
+         datetime.now().isoformat(timespec="seconds"))).fetchone()
+    conn.commit()
+    return int(row["id"]) if row else 0
+
+
+def append_evidence(conn: psycopg.Connection, case_id: str, version: int,
+                     rows: list[dict]) -> list[int]:
+    """落一批证据，返回**真正新插入**的 id。
+
+    ★ 返回值只含新插入的行 —— 与 `append_red_flags` 同一口径：
+      调用方要能说清"这一轮新增了几条"，而不是"库里现在总共几条"。
+    """
+    if not rows:
+        return []
+    created = datetime.now().isoformat(timespec="seconds")
+    ids: list[int] = []
+    for r in rows:
+        row = conn.execute(
+            "INSERT INTO case_evidence(case_id,assessment_version,claim,quote,"
+            "source,status,support,occurred_at,scene,claim_hash,created_at) "
+            "VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT(case_id, assessment_version, claim_hash) DO NOTHING "
+            "RETURNING id",
+            (case_id, version, r.get("claim", ""), r.get("quote", ""),
+             r.get("source", "parent_message"), r.get("status", "inferred"),
+             r.get("support", "none"), r.get("occurred_at", ""),
+             r.get("scene", ""), _claim_hash(r.get("claim", "")), created)
+        ).fetchone()
+        if row:
+            ids.append(int(row["id"]))
+    conn.commit()
+    return ids
+
+
+def latest_assessment(conn: psycopg.Connection, case_id: str) -> dict | None:
+    """最新一版评估。读不到返回 None。"""
+    row = conn.execute(
+        "SELECT * FROM assessment_versions WHERE case_id=%s "
+        "ORDER BY version DESC LIMIT 1", (case_id,)).fetchone()
+    if not row:
+        return None
+    return {
+        "version": int(row["version"]),
+        "known_facts": json.loads(row["known_facts"]),
+        "hypotheses": json.loads(row["hypotheses"]),
+        "unknowns": json.loads(row["unknowns"]),
+        "contradictions": json.loads(row["contradictions"]),
+        "risk_flags": json.loads(row["risk_flags"]),
+        "clarifications": json.loads(row["clarifications"]),
+        "created_at": row["created_at"],
+    }
+
+
+def case_evidence(conn: psycopg.Connection, case_id: str,
+                  version: int | None = None) -> list[dict]:
+    """案例的证据（时间线）。`version=None` → 全部。"""
+    if version is None:
+        rows = conn.execute(
+            "SELECT * FROM case_evidence WHERE case_id=%s ORDER BY id",
+            (case_id,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM case_evidence WHERE case_id=%s AND assessment_version=%s "
+            "ORDER BY id", (case_id, version)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def case_versions(conn: psycopg.Connection, case_id: str) -> list[dict]:
+    """案例的评估版本历史（**倒序**，新的在前）。"""
+    rows = conn.execute(
+        "SELECT * FROM assessment_versions WHERE case_id=%s ORDER BY version DESC",
+        (case_id,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "version": int(r["version"]),
+            "known_facts": json.loads(r["known_facts"]),
+            "hypotheses": json.loads(r["hypotheses"]),
+            "unknowns": json.loads(r["unknowns"]),
+            "contradictions": json.loads(r["contradictions"]),
+            "risk_flags": json.loads(r["risk_flags"]),
+            "clarifications": json.loads(r["clarifications"]),
+            "created_at": r["created_at"],
+        })
+    return out
 
 
 # ================================================================== 自检

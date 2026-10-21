@@ -36,7 +36,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ================================================================== interrupt 载荷
@@ -404,3 +404,173 @@ def run_thread_id(child_id: str, date: str) -> str:
 
 def run_config(child_id: str, date: str) -> dict:
     return {"configurable": {"thread_id": run_thread_id(child_id, date)}}
+
+
+class CaseClarifyAnswer(BaseModel):
+    """★ 家长对**一个问题**的回答。
+
+    `unknown` 是回指 —— 它把这条回答挂回评估里那条「还不清楚的」，
+    家长答完那一项就该销掉（`assessment.fold` 用它精确销账）。
+
+    `answer` 是**家长说的话**（选中的选项文字，或者他自己打的那句）。
+    它会被**追加进语料** —— 也就是说，选了一个选项，
+    等于家长亲口说了那句话。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    unknown: str = Field(default="", max_length=200,
+                         description="这条回答对应哪个未知项")
+    answer: str = Field(default="", max_length=1000,
+                        description="家长的回答原话。允许为空 —— "
+                                    "「我想不起来」本身也是有效信息")
+    skipped: bool = Field(default=False,
+                          description="家长明确跳过这一条（说不上来）")
+
+
+class CaseClarifyAnswers(BaseModel):
+    """★ 一次提交**全部**问题的回答。
+
+    ★ 为什么是"一次提交全部"
+    ----------------------
+    家长面对的是**一屏问题**，不是一个一个被问。
+    逐个问、逐个答的代价是：每答一个就要重新加载页面，
+    而"还有个问题没答"这件事只有服务端知道 —— 于是家长很容易卡在半路。
+    一次提交全部，交互上就是"填完一张表再交"。
+
+    ★ `answers` 可以是空的
+    -------------------
+    家长可能一个问题都不想答（或者页面刷新了想跳过）。
+    空列表是合法的，图会照常往下走。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answers: list[CaseClarifyAnswer] = Field(
+        default_factory=list, max_length=8,
+        description="家长对每一个问题的回答，**顺序与问题一致**")
+
+
+# ================================================================== 案例（阶段 2）
+class CaseState(TypedDict, total=False):
+    """一个案例的评估流程。
+
+    ★ 与 `InterventionState` 的区别只有一处，但很要紧：
+      观察链的 state 是「**一天**的」，案例的 state 是「**长期**的」。
+      所以这里多了一个 `corpus`（累积语料）——
+      观察链每天从零开始，案例不能。
+
+    ★ 字段少是有意的（沿用本文件开头的约定）：
+      一个字段如果今天没有对应的模型 / 表 / 纯函数能填它，它就不该出现在 state 里。
+    """
+
+    # ---- 身份 ----
+    case_id: str
+    child_id: str
+    thread_id: str
+    title: str
+    no_llm: bool
+
+    # ---- 输入与语料 ----
+    #: 家长**这一轮**说的话。
+    parent_text: str
+    #: 累积语料（这个案例到目前为止家长说的全部话）。
+    #: ★ 它也落在 `cases.corpus` 里 —— checkpoint 是编排位置，不是业务事实（铁律 #1），
+    #:   而"这个案例家长说了什么"要能跨进程重启读回来。
+    corpus: str
+
+    # ---- 评估（`Assessment` 的 dict，**纯 dict**）----
+    known_facts: list[str]
+    hypotheses: list[str]
+    unknowns: list[str]
+    contradictions: list[dict[str, Any]]
+    risk_flags: list[dict[str, Any]]
+
+    # ---- 本轮抽出的证据 ----
+    #: `EvidenceOutcome` 的 dict（**纯 dict**）。checkpoint 只存纯 dict（铁律 #9）。
+    #: 整个 outcome 一起存，是因为"证据 / 未知 / 矛盾 / 追问"是**一次抽取的产物**，
+    #: 拆成四个字段存就得保证它们永远同步 —— 而同步是靠人记的。
+    outcome: dict[str, Any]
+    #: ★ **累积**的证据（这个案例到目前为止的每一条）。
+    #:
+    #:   为什么不能只留最后一轮
+    #:   ----------------------
+    #:   追问的往返是在**同一张图**里绕圈的：`clarify → extract → … → publish`。
+    #:   绕完两圈再 publish 时，`outcome` 里只剩**最后一轮**抽出来的东西，
+    #:   而前几轮抽出的事实已经进了 `known_facts`（字符串）。
+    #:   于是落库的证据表只有最后那几条，而评估版本里有全部 ——
+    #:   **证据表与评估对不上**，而证据表正是"这句话从哪来"的出处。
+    #:
+    #:   所以证据在这里**累积**：每轮的新证据都往里追加，
+    #:   publish 落的是**全部**（唯一索引按 claim_hash 去重）。
+    all_claims: list[dict[str, Any]]
+    #: ★ 模型这一轮的**分析**（`EvidenceBatch.thinking`）。
+    #:
+    #:   为什么它是一个字段而不是日志
+    #:   ------------------------------
+    #:   追问一旦发生，家长面前就凭空多出几个问题 ——
+    #:   而"我明明已经说了这么多"是这时候最典型的反应。
+    #:   把模型自己那句「你现在确定的是什么、还差什么」摆出来，
+    #:   问题就从"凭什么问我"变成"哦，确实没提"。
+    #:   它也随评估版本一起落库，所以几个月后回看这一版为什么长这样，仍然说得清。
+    thinking: str
+    #: 这一轮**新**出现的证据条数。
+    #: ★ 多轮追问的判据（`detect_unknowns`）：家长回答了却没带来新信息 → 不再问。
+    new_claims: int
+    #: ★ 这一轮要问家长的**全部**问题（`ClarifyQuestion` 的 dict）。
+    #: 一次给全，不是给一个 —— 理由见 `case/models.py::ClarifyQuestion`。
+    questions: list[dict[str, Any]]
+    #: ★ 已经**问过并且家长答了**的未知项。
+    #: 销账用（`assessment.fold`），也是给模型的"别再问这个"清单。
+    answered_unknowns: list[str]
+    #: 已经发生过的追问往来
+    #: （`{unknown, question, why, answer, skipped}`），
+    #: 落进评估版本的历史里 —— "我们问过什么、为什么问、家长怎么答的"要能查。
+    clarifications: list[dict[str, Any]]
+    #: ★ 本轮回答的「问题 + 答案」对照（`{question, answer}`）。
+    #: 家长选的选项文字是没有主语的（"换了新环境才会这样"），
+    #: 抽取时要**连着问题一起**给它，它才能把答案还原成一句完整的话。
+    #: ★ 只进 prompt，**不进语料** —— 语料里只有家长说过的话。
+    qa_context: list[dict[str, Any]]
+
+    # ---- 追问的往返 ----
+    needs_clarification: bool
+    clarify_rounds: int
+    #: 家长对追问的回答原话（展示用）。
+    clarification_answer: str
+
+    # ---- 安全 ----
+    verdict: dict[str, Any]
+    escalation: dict[str, Any]
+
+    # ---- 产出 ----
+    assessment_version: int
+    evidence_ids: list[int]
+    status: str
+    degraded: bool
+    note: str
+
+    trace: list[str]
+
+
+#: 案例链的 thread 前缀。**它就是 `case_id` 前面加一个前缀** ——
+#: 案例的 thread 是**长期**的（不像观察链按天开新的），
+#: 所以它必须与 `{child}:{date}` 那个命名空间分开，否则会互相顶掉。
+CASE_PREFIX = "case:"
+
+
+def case_thread_id(case_id: str) -> str:
+    """`case:{case_id}`。
+
+    ★ 注意 `case_id` 本身已经是 `case:{child}:{seq}`，
+      所以最终长这样：`case:case:demo-001:1`。
+      看起来重复，但它是**故意的**：
+      `cases.thread_id` 这一列存的就是它，而"thread_id 以 case: 开头"
+      是路由层判断"这是个案例 thread"的唯一依据 ——
+      与 `plan:` / `run:` / `draft:` 同一套命名空间隔离的办法。
+    """
+    return f"{CASE_PREFIX}{case_id}"
+
+
+def case_config(case_id: str) -> dict:
+    return {"configurable": {"thread_id": case_thread_id(case_id)}}

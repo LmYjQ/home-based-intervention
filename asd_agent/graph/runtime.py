@@ -39,6 +39,7 @@ _GRAPHS: dict[str, object] = {}        # schema 名 -> 观察链 CompiledStateGr
 _DRAFTS: dict[str, object] = {}        # schema 名 -> 草稿图
 _PLANS: dict[str, object] = {}         # schema 名 -> 计划链 CompiledStateGraph
 _RUNS: dict[str, object] = {}          # schema 名 -> 反馈链 CompiledStateGraph
+_CASES: dict[str, object] = {}         # schema 名 -> 案例链 CompiledStateGraph
 
 
 def _key(path: str | None) -> str:
@@ -95,6 +96,21 @@ def get_run_graph(path: str | None = None):
     return _cached(_RUNS, _key(path), _build)
 
 
+def get_case_graph(path: str | None = None):
+    """案例链图（阶段 2）。与前三张**分开缓存**，理由同 `get_plan_graph`。
+
+    ★ 为什么必须分开而不是共用一个 dict：
+      四张图的 saver 用的是**同一个连接**（`saver_for` 按 schema 缓存），
+      而编译出来的 CompiledStateGraph 各自持有节点表。
+      共用一个 key 的话，第二张图会把第一张覆盖掉 ——
+      症状是"建案例的接口返回了一段观察"，没有任何报错。
+    """
+    def _build(path=path):
+        from .case_graph import build_case_graph
+        return build_case_graph(saver_for(path))
+    return _cached(_CASES, _key(path), _build)
+
+
 def close_all() -> None:
     """关掉本进程持有的 saver 连接 + 清缓存。**只给测试与关停用。**"""
     from .checkpointer import close_all as _close
@@ -103,6 +119,7 @@ def close_all() -> None:
         _DRAFTS.clear()
         _PLANS.clear()
         _RUNS.clear()
+        _CASES.clear()
     _close()
 
 
@@ -122,4 +139,7 @@ if __name__ == "__main__":
     print(f"反馈图同一实例= {r1 is r2}")
     print(f"反馈图≠观察图 = {r1 is not g1}")
     print(f"反馈图≠计划图 = {r1 is not p1}")
+    c1, c2 = get_case_graph(), get_case_graph()
+    print(f"案例图同一实例= {c1 is c2}")
+    print(f"案例图≠观察图 = {c1 is not g1}")
     close_all()

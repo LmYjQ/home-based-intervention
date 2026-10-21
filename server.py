@@ -89,8 +89,9 @@ from schema import Observation
 #   （里面含 CREATE INDEX CONCURRENTLY），绝不能每请求调一次。
 from graph import draft as graph_draft
 from graph.plan_graph import MAX_EDIT_LOOPS, plan_inputs
-from graph.runtime import get_graph, get_draft_graph, get_plan_graph
-from graph.state import ClarifyAnswer, plan_config, thread_config
+from graph.runtime import get_graph, get_draft_graph, get_plan_graph, get_case_graph
+from graph.state import (CaseClarifyAnswer, ClarifyAnswer, case_config,
+                         plan_config, thread_config)
 
 app = FastAPI(title="家长干预教练 Agent", version="0.5")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
@@ -1423,6 +1424,392 @@ def api_config(no_llm: bool = True):
 @app.get("/api/health")
 def api_health():
     return {"ok": True, "no_llm": _NO_LLM, "mode": os.getenv("DEMO_MODE", "live")}
+
+
+# ================================================================== 案例（阶段 2）
+#
+# ★ 这一段是**第四张图**（case:{case_id}）的 HTTP 侧。
+#   与观察链并排，不是替代 —— 观察链落 observations / red_flags，
+#   案例图落 cases / case_evidence / assessment_versions。
+#
+# ★ 为什么建案例也是慢路径（job + SSE）
+# -------------------------------------
+# 建案例要跑一次抽取（可到 60s）。同步等会把 HTTP 连接挂在那里，
+# 而前端已经有 job + SSE 这一套（`streamJob()`），两处各写一套只会漂。
+#
+# ★ 路由顺序
+# ---------
+# FastAPI 按声明顺序匹配路由。`/api/cases/{case_id}` 与
+# `/api/cases/{case_id}/messages` 段数不同，不会互相吃掉
+# （`/api/plan/status` 被 `/api/plan/{child_id}` 吃掉那个坑是**同段数**）。
+# 但仍然把具体的写在前面 —— 依赖"段数不同所以没事"是拿项目的坑换自己的坑。
+
+class CaseIn(BaseModel):
+    """建一个案例。
+
+    ★ `text` 是家长的第一段话。**建案例与第一次评估是同一件事** ——
+      拆成"先建空案例、再发消息"两步的话，中间那个空案例就没有意义，
+      而家长会以为自己已经说过了。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    child_id: str = "demo-001"
+    title: str = Field(default="", max_length=120)
+    text: str = Field(min_length=1, max_length=5000)
+    no_llm: bool | None = None
+
+
+class CaseMessageIn(BaseModel):
+    """家长补充一段描述。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=5000)
+    no_llm: bool | None = None
+
+
+class CaseClarifyIn(BaseModel):
+    """回答追问。**一次提交全部问题的回答。**
+
+    ★ 为什么用 `CaseClarifyAnswer`（图里那个 Pydantic）而不是在这里另写一份
+      --------------------------------------------------------------
+      这一次的载荷是**一个列表**，形状不平凡（每条要带 unknown 回指 + 答案 + 跳过标记）。
+      另写一份的话，语义校验就成了两处 —— 而两处必然漂移：
+      图里按 `unknown` 销账，前端按顺序对齐，两边一旦对不上，
+      症状是"家长答了，那一项却还挂在「还不清楚的」里"。
+
+    图里 `clarify_with_parent` 已经挂了 `response_schema=CaseClarifyAnswers`，
+    真正的校验发生在**恢复那一刻**。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answers: list[CaseClarifyAnswer] = Field(default_factory=list, max_length=8)
+    no_llm: bool | None = None
+
+
+def _case_payload(case_id: str, vals: dict, *, pending: bool,
+                  questions: list[dict], rounds: int) -> dict:
+    """案例的当前状态 → 给家长的形状。
+
+    ★ 这一段是"内部字段不发给家长"的落点
+    --------------------------------------
+    响应里**没有**：`support` / `evidence[].status` / `confidence` /
+    `claim_hash` / `assessment_version` / `thread_id`。
+    家长看到的是「我们已经知道的」这类措辞 + 每条证据一个「谁说的」角标。
+    （措辞的唯一出处是 `asd_agent/case/labels.py`，前端不硬编码。）
+    """
+    from case import labels as case_labels
+
+    ev_out = vals.get("outcome") or {}
+    # ★ 证据取**累积**的那份（`all_claims`）——
+    #   追问的往返在同一张图里绕圈，`outcome` 里只剩最后一轮。
+    claims = vals.get("all_claims") or ev_out.get("claims") or []
+    return {
+        "case_id": case_id,
+        "child_id": vals.get("child_id") or "",
+        "title": vals.get("title") or "",
+        "status": vals.get("status") or "assessing",
+        "status_label": case_labels.status_label(vals.get("status") or "assessing"),
+        # 四栏：标题与解释由后端给，前端只渲染
+        "columns": case_labels.column_labels(),
+        "known_facts": list(vals.get("known_facts") or []),
+        "hypotheses": list(vals.get("hypotheses") or []),
+        "unknowns": list(vals.get("unknowns") or []),
+        "contradictions": list(vals.get("contradictions") or []),
+        "risk_flags": list(vals.get("risk_flags") or []),
+        # 证据条目：只给「说了什么」「原话」「谁说的」。
+        # ★ 不给 support / status / confidence —— 那些是给代码看的。
+        "evidence": [
+            {
+                "claim": c.get("claim", ""),
+                "quote": c.get("quote", ""),
+                "origin": case_labels.claim_origin(c.get("status", "")),
+                "issue": c.get("issue", ""),
+            }
+            for c in claims
+        ],
+        "clarify": {
+            "pending": pending,
+            # ★ 这一轮要问的**全部**问题（每个带候选答案），前端一次全渲染出来。
+            "questions": questions,
+            "rounds": rounds,
+            "labels": case_labels.CLARIFY_LABELS,
+        },
+        "escalation": _jsonable(vals.get("escalation")),
+        "degraded": bool(vals.get("degraded")),
+        "note": vals.get("note") or "",
+        "trace": list(vals.get("trace") or []),
+    }
+
+
+def _case_result(g, cfg: dict, case_id: str) -> dict:
+    """把 checkpoint 上的状态读成前端要的形状。
+
+    ★ 中断判定用 `snap.next` / `snap.interrupts`，**不用** state 里的
+      `needs_clarification`：resume 跑完之后那个字段是**上一次**的值
+      （铁律 #8）。
+    """
+    snap = g.get_state(cfg)
+    vals = snap.values or {}
+    nxt = tuple(snap.next or ())
+    ints = list(getattr(snap, "interrupts", None) or [])
+    interrupted = bool(nxt) and bool(ints)
+
+    # ★ 问题清单有两个来源，取**更新的那个**
+    # ------------------------------------
+    # interrupt 的载荷里是"这一轮要问的"（图停在上面时最准）；
+    # state 里的 `questions` 是最后一轮抽出来的（resume 跑完之后才准）。
+    # 两者内容一样，取错也不会错到家长身上 —— 但取 interrupt 的那个
+    # 在"停着等回答"时更直接（它就是家长马上要答的那一屏）。
+    questions: list[dict] = []
+    if ints:
+        payload = ints[0].value
+        if isinstance(payload, dict):
+            questions = list(payload.get("questions") or [])
+    if not questions:
+        questions = list(vals.get("questions") or [])
+
+    out = _case_payload(case_id, vals, pending=interrupted,
+                         questions=questions,
+                         rounds=int(vals.get("clarify_rounds") or 0))
+    out["phase"] = "clarify" if interrupted else "done"
+    # ★ 停在追问上时，**显示**的状态是「想请你补充一点」。
+    #   库里的 status 要等 publish（那在 interrupt 之后）才更新，
+    #   而家长此刻看到的应该是"系统在等我回答"。
+    #   只改显示，不改库 —— 写库仍然只有 publish 一个点。
+    if interrupted:
+        from case import labels as case_labels
+        out["status"] = "awaiting_parent_input"
+        out["status_label"] = case_labels.status_label("awaiting_parent_input")
+    return out
+
+
+def _case_or_400(case_id: str) -> dict:
+    conn = _conn()
+    row = store.get_case(conn, case_id)
+    if not row:
+        raise HTTPException(404, f"案例 {case_id} 不存在")
+    return row
+
+
+@app.post("/api/cases")
+def api_create_case(inp: CaseIn):
+    """建案例 + 跑第一轮评估。**慢路径（抽取可到 60s）→ job + SSE。**
+
+    返回 `case_id` 是为了让前端**立刻**能拿到它 ——
+    job 跑完之前用户已经在填下一段话了，而那段话要挂在这个 case_id 上。
+    """
+    no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    conn = _conn()
+    store.ensure_child(conn, inp.child_id)
+    row = store.create_case(conn, inp.child_id, title=inp.title, corpus="")
+    case_id = row["case_id"]
+    # ★ 家长说的话**先存下来**，再跑图。
+    #   图可能停在 ⚡ interrupt 上等家长回答追问，而家长可能再也不回答 ——
+    #   那一刻如果语料还没落库，他说的话就整个不见了（见 store.append_corpus）。
+    store.append_corpus(conn, case_id, inp.text)
+
+    def work(step):
+        t0 = time.time()
+        g = get_case_graph()
+        step("跑案例图…")
+        g.invoke({"case_id": case_id, "child_id": inp.child_id,
+                  "parent_text": inp.text, "no_llm": no_llm},
+                 case_config(case_id))
+        step("案例图结束")
+        r = _case_result(g, case_config(case_id), case_id)
+        r["llm_calls"] = 0 if no_llm else 1
+        r["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return r
+
+    return {"case_id": case_id, "job_id": _start_job(f"case:{case_id}", work)}
+
+
+@app.post("/api/cases/{case_id}/messages")
+def api_case_message(case_id: str, inp: CaseMessageIn):
+    """家长补充一段描述 → 跑一轮评估。
+
+    ★ 与观察链同款的两阶段协议：可能返回 `phase="clarify"`
+      （图停在 ⚡ interrupt 上等家长回答）—— 那不是错误，是正常结果。
+    """
+    _case_or_400(case_id)
+    no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    # ★ 同上：先落语料，再跑图（家长的话不能因为图停在追问上就丢了）。
+    store.append_corpus(_conn(), case_id, inp.text)
+
+    def work(step):
+        t0 = time.time()
+        g = get_case_graph()
+        step("跑案例图…")
+        g.invoke({"case_id": case_id, "parent_text": inp.text, "no_llm": no_llm},
+                 case_config(case_id))
+        step("案例图结束")
+        r = _case_result(g, case_config(case_id), case_id)
+        r["llm_calls"] = 0 if no_llm else 1
+        r["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return r
+
+    return {"case_id": case_id, "job_id": _start_job(f"case-msg:{case_id}", work)}
+
+
+@app.post("/api/cases/{case_id}/clarify")
+def api_case_clarify(case_id: str, inp: CaseClarifyIn):
+    """回答追问，让图接着跑。
+
+    ★★ 没有待回答的追问时**必须 409** ——
+      `Command(resume=...)` 打在一个没有 pending interrupt 的 thread 上，
+      LangGraph 会把它当成**新输入**从头跑一遍：重新抽取、重新落库。
+      **不报错、不抛异常，就是数据写了两遍。**
+      守卫必须在 `graph.invoke` **之前**。
+    """
+    _case_or_400(case_id)
+    no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    g = get_case_graph()
+    cfg = case_config(case_id)
+
+    snap = g.get_state(cfg)
+    pending = bool(tuple(snap.next or ())) and bool(
+        getattr(snap, "interrupts", None) or [])
+    if not pending:
+        raise HTTPException(
+            409, "这个案例现在没有待回答的问题（可能已经答过了，或者还没跑过）")
+
+    def work(step):
+        t0 = time.time()
+        step("接着跑案例图…")
+        # ★ 传**全部**回答，一次提交。
+        #   图里 `clarify_with_parent` 挂的是 `response_schema=CaseClarifyAnswers`，
+        #   所以这一层的形状由服务端校验，前端传错字段会在**恢复那一刻**被拒。
+        g.invoke(Command(resume={"answers": [a.model_dump() for a in inp.answers]}),
+                 cfg)
+        step("案例图结束")
+        r = _case_result(g, cfg, case_id)
+        r["llm_calls"] = 0 if no_llm else 1
+        r["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return r
+
+    return {"case_id": case_id, "job_id": _start_job(f"case-clarify:{case_id}", work)}
+
+
+@app.get("/api/cases")
+def api_list_cases(child_id: str):
+    """一个孩子的所有案例。**纯读业务表，毫秒级。**"""
+    conn = _conn()
+    rows = store.list_cases(conn, child_id)
+    from case import labels as case_labels
+    return {
+        "cases": [
+            {
+                "case_id": r["case_id"],
+                "title": r["title"],
+                "status": r["status"],
+                "status_label": case_labels.status_label(r["status"]),
+                "version": int(r["current_assessment_version"] or 0),
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/cases/{case_id}")
+def api_get_case(case_id: str):
+    """案例的当前状态。**纯读，毫秒级。**
+
+    ★ 读的是**业务表**（`cases` + 最新一版评估），不是 checkpoint ——
+      家长刷新页面要立刻看到东西，而 checkpoint 是编排位置（铁律 #1）。
+      "有没有待回答的问题"那一项才读 checkpoint（那是编排状态）。
+    """
+    from case import labels as case_labels
+
+    _case_or_400(case_id)
+    conn = _conn()
+    row = store.get_case(conn, case_id)
+    latest = store.latest_assessment(conn, case_id) or {}
+    ev = store.case_evidence(conn, case_id)
+
+    g = get_case_graph()
+    cfg = case_config(case_id)
+    snap = g.get_state(cfg)
+    vals = snap.values or {}
+    ints = list(getattr(snap, "interrupts", None) or [])
+    interrupted = bool(tuple(snap.next or ())) and bool(ints)
+    # ★ 待回答的问题清单（这一轮的全部，一次给全）。
+    questions: list[dict] = []
+    if ints and isinstance(ints[0].value, dict):
+        questions = list(ints[0].value.get("questions") or [])
+    if not questions:
+        questions = list(vals.get("questions") or [])
+
+    # ★ 事实以 **checkpoint 为准**，没有才用库里的那一版
+    # --------------------------------------------------
+    # 图跑完时两者是一样的（publish 把 state 的值写进了库里）。
+    # 但图**停在追问上**的时候，checkpoint 里是这一轮刚抽出来的事实，
+    # 而库里还是上一版 —— 家长刷新页面却看不到自己刚说的话被理解成了什么，
+    # 那正是最不该发生的事。
+    #
+    # 库仍然是**落底的那一份**（铁律 #1：checkpoint 不是业务表的替代品）；
+    # 这里只是让"读到最新"这件事在图跑一半时也成立。
+    ck = vals if vals.get("known_facts") or vals.get("hypotheses") else {}
+    facts = ck.get("known_facts") or latest.get("known_facts", [])
+    hypos = ck.get("hypotheses") or latest.get("hypotheses", [])
+    unknowns = ck.get("unknowns") or latest.get("unknowns", [])
+    contradictions = ck.get("contradictions") or latest.get("contradictions", [])
+    flags = ck.get("risk_flags") or latest.get("risk_flags", [])
+    claims = ck.get("all_claims") or []
+
+    # ★ 有待回答的追问时，**显示**的状态是「想请你补充一点」。
+    #   库里的 status 要等 publish 才更新（那在 interrupt 之后），
+    #   而家长此刻看到的应该是"系统在等我回答"，不是"我们还在了解情况"。
+    #   ★ 只改**显示**，不改库 —— 写库仍然只有 publish 一个点。
+    status = "awaiting_parent_input" if interrupted else row.get("status", "assessing")
+
+    payload = {
+        "case_id": case_id,
+        "child_id": row.get("child_id", ""),
+        "title": row.get("title", ""),
+        "status": status,
+        "status_label": case_labels.status_label(status),
+        "columns": case_labels.column_labels(),
+        "known_facts": facts,
+        "hypotheses": hypos,
+        "unknowns": unknowns,
+        "contradictions": contradictions,
+        "risk_flags": flags,
+        "evidence": [
+            {
+                "claim": e.get("claim", ""),
+                "quote": e.get("quote", ""),
+                "origin": case_labels.claim_origin(e.get("status", "")),
+            }
+            for e in (claims or ev)
+        ],
+        "clarify": {
+            "pending": interrupted,
+            "questions": questions,
+            "rounds": 0,
+            "labels": case_labels.CLARIFY_LABELS,
+        },
+        "degraded": False,
+        "note": "",
+        "trace": [],
+        "phase": "clarify" if interrupted else "done",
+    }
+    return payload
+
+
+@app.get("/api/cases/{case_id}/history")
+def api_case_history(case_id: str):
+    """评估版本 + 证据时间线。**纯读，毫秒级。**"""
+    _case_or_400(case_id)
+    conn = _conn()
+    return {
+        "case_id": case_id,
+        "versions": store.case_versions(conn, case_id),
+        "evidence": store.case_evidence(conn, case_id),
+    }
 
 
 if __name__ == "__main__":

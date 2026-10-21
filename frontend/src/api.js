@@ -81,6 +81,19 @@ export const api = {
     req(`/api/plan/status?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
   planVersions: (cid, date) =>
     req(`/api/plan/versions?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+
+  // ---- 案例（阶段 2）----
+  // ★ 与观察链同款的两阶段协议：建案例 / 补充描述可能返回 phase="clarify"
+  //   （图停在 ⚡ interrupt 上等家长回答），那不是错误是正常结果。
+  //   连续性靠 case_id（→ thread_id），不靠 job_id。
+  caseCreate: (body) => req('/api/cases', { method: 'POST', body: JSON.stringify(body) }),
+  caseMessage: (cid, body) =>
+    req(`/api/cases/${encodeURIComponent(cid)}/messages`, { method: 'POST', body: JSON.stringify(body) }),
+  caseClarify: (cid, body) =>
+    req(`/api/cases/${encodeURIComponent(cid)}/clarify`, { method: 'POST', body: JSON.stringify(body) }),
+  caseGet: (cid) => req(`/api/cases/${encodeURIComponent(cid)}`),
+  caseList: (cid) => req(`/api/cases?child_id=${encodeURIComponent(cid)}`),
+  caseHistory: (cid) => req(`/api/cases/${encodeURIComponent(cid)}/history`),
 }
 
 // ★ 慢路径统一走 SSE。两条慢路径（建档 18-47s、出卡片 30-45s）共用这一份。

@@ -22,6 +22,7 @@ import { api } from './api.js'
 import { useShared } from './composables/useShared.js'
 import ProfilePage from './pages/ProfilePage.vue'
 import TodayPage from './pages/TodayPage.vue'
+import CasePage from './pages/CasePage.vue'
 import ProgressView from './components/ProgressView.vue'
 
 const { CHILD, state, day, today, loadState, loadDay, invalidateDay }
@@ -30,11 +31,12 @@ const setPlan = (p) => { day.value = p }
 
 const TABS = [
   { k: 'profile', label: '建档' },
+  { k: 'case', label: '案例' },
   { k: 'today', label: '今天' },
   { k: 'progress', label: '进度' },
 ]
 // ★ 标签写进 URL hash：刷新/前进后退保持在同一页，也能把某一页直接发给别人。
-const VALID = ['profile', 'today', 'progress']
+const VALID = ['profile', 'case', 'today', 'progress']
 const fromHash = () => {
   const k = (location.hash || '').replace('#', '')
   return VALID.includes(k) ? k : null
@@ -95,7 +97,7 @@ onMounted(boot)
     <nav class="tabs">
       <button v-for="t in TABS" :key="t.k"
               :class="[t.k, { on: tab === t.k }]"
-              :disabled="t.k !== 'profile' && !ready()"
+              :disabled="t.k !== 'profile' && t.k !== 'case' && !ready()"
               @click="go(t.k)">{{ t.label }}</button>
       <span v-if="!ready()" class="dim">先建档</span>
     </nav>
@@ -106,6 +108,12 @@ onMounted(boot)
     </p>
 
     <ProfilePage v-if="tab === 'profile'" :CHILD="CHILD" :state="state" @done="onProfileDone" />
+
+    <!-- ★ 案例页**不要求先建档**：
+         它走的是第四张图（case:{case_id}），落的是自己那三张表，
+         与能力画像那条线完全无关。要求先建档等于给家长加一道
+         与"我想说说这个孩子的情况"无关的门槛。 -->
+    <CasePage v-else-if="tab === 'case'" :CHILD="CHILD" />
 
     <template v-else-if="ready()">
       <TodayPage v-if="tab === 'today'" :CHILD="CHILD" :date="today"
