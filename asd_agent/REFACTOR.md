@@ -414,6 +414,7 @@ cd ../frontend && npx vite build
 | `asd_agent/case/lifecycle.py` | 生命周期纯函数：`ALLOWED_TRANSITIONS` / `can_transition()` / `next_status()` |
 | `asd_agent/case/evidence.py` | 证据抽取（LLM）+ 回指校验 + 降级 |
 | `asd_agent/case/router.py` | 案例编排：下一步该做什么（纯 Python） |
+| `asd_agent/case/labels.py` | **家长措辞的唯一出处**（`label` + `hint`），见 2.3.8 |
 | `asd_agent/case/selfcheck.py` | case 层自检 |
 | `asd_agent/graph/case_graph.py` / `case_nodes.py` | 第四张图（见 2.3.3） |
 | `frontend/src/pages/CasePage.vue` + `CaseStage.vue` + `CaseClarify.vue` + `EvidenceList.vue` | 案例页与三个组件 |
@@ -470,6 +471,69 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
       → 信息足够 → publish_case_events → END
 ```
 
+#### 2.3.3.1 现有观察链（今天跑的那张，阶段 2 **不动它**）
+
+```
+START → record_intake → extract_observation → validate_observation
+                                          │
+                        needs_clarification? ├─是─→ ⚡ clarify ──→ 回 extract_observation
+                                          └─否─┐
+                              safety_gate ←──┘   │
+                     highest=="urgent"? ├─是──→ escalate ──┐
+                                  └─否────────────────┴──→ publish → END
+```
+
+| 节点 | 读 state | 写 state | 调什么 | 判定在哪 |
+|---|---|---|---|---|
+| `record_intake` `nodes.py:75` | child_id, date, parent_text | parent_text（归一化） | 无 | **无** —— 只归一化，不抽不判不写 |
+| `extract_observation` `nodes.py:97` | parent_text, observation, observed_text | observation, observed_text, redflags, n_events, clarifying_question | `observe.extract_observations`（**唯一 LLM**，stage `observe_extract`） | 幂等判据在节点内：**语料没变就复用上次结果**（`observed_text == parent_text`） |
+| `validate_observation` `nodes.py:154` | observation, clarifying_question, clarify_asked | needs_clarification | 无 | **纯 Python**：任一事件 `needs_clarification` 且**没问过** 且**非降级** → 就问 |
+| `clarify` `nodes.py:190` ⚡ | clarifying_question, parent_text | clarification_answer, clarified_text, clarify_asked（+ 重抽结果） | `interrupt(..., response_schema=ClarifyAnswer)` → 再调 `extract_observations` | 回答**追加**不替换（回指校验比的是整段原话） |
+| `safety_gate` `nodes.py:251` | clarified_text or parent_text | redflags, verdict, scanned_text | `redflag.scan`（11 条正则，**0 token**） | 判定在 `redflag.py` 里已经做完 —— **节点只搬运，不重判** |
+| `escalate` `nodes.py:280` | verdict, redflags | escalation{paused, guidance, guidance_items, do_not, emergency} | `redflag.guidance_for` | 纯计算，**一个字节都不写** |
+| `publish` `nodes.py:313` | 全部 | observation_ids, red_flag_ids | `observe.persist` + `store.append_red_flags` | 幂等按**「这段语料」**；红旗按**「语料 × 这一条 code」** |
+
+**这张图的四条形状规则**（不是画着好看，每条都有代价）：
+
+1. **落库只在最后一个节点 `publish`** —— interrupt 恢复会重跑整个节点，凡是在 interrupt 之前写过库的东西，
+   resume 一次就写两遍。这条靠**节点位置**保证，不靠"记得判重"。
+2. **`clarify` 之前零副作用** —— 它只负责"停一下等人"，抽取在上一个节点已经算完。
+3. **答完回 `extract_observation`（抽取），不是回 `validate_observation`（判定）** ——
+   回答已经拼进语料，不重抽一遍，补的信息就只是躺在 state 里没人用。
+4. **条件边是"跳过"不是"进出"** —— `needs_clarification` 为假时 `clarify` 节点**根本不执行**
+   （`builder.py:62-69`）。interrupt 节点每进出一次就是一个 checkpoint，而澄清一天最多一次。
+
+**挂在四个 HTTP 路由上**：`POST /api/observe/run`（job+SSE）→ `POST /api/observe/resume`
+（`Command(resume=)`，**没有 pending interrupt 必须 409**，否则 LangGraph 当成新输入从头跑 → 写两遍）→
+`GET /api/observe/status`（纯读 checkpoint，刷新页面靠它发现"还有个问题等你答"）。
+草稿另用 `draft:` thread，**永不 invoke**。
+
+#### 2.3.3.2 新 case 图逐节点
+
+| 节点 | 读 | 写 | 调什么 | 判定在哪 |
+|---|---|---|---|---|
+| `load_case_context` | case_id | case_row, known_facts, unknowns | `store` 读 `cases` + `assessment_versions` | 纯读 |
+| `extract_new_evidence` (LLM) | parent_text, **已有 facts/unknowns** | evidence[], unknowns[], contradictions[], clarifying_question | 新 stage `case_evidence_extract` | **增量**：把已有事实一起进 prompt，不是全量重抽 |
+| `update_assessment` | evidence[], unknowns[] | known_facts, hypotheses, risk_flags | Python | 纯 Python：2.3.2 的**四条硬不变量** |
+| `safety_check` | 全段语料 | risk_flags, verdict | `redflag.scan` | **判定逻辑一字不改** |
+| `detect_unknowns` | unknowns[], evidence[] | needs_clarification, clarifying_question | 无 | 纯 Python：未知项非空 **且 本轮有新证据** **且 轮数 < 3** |
+| `clarify_with_parent` ⚡ | clarifying_question | answer, clarify_round+1, 合并语料 | `interrupt(CaseClarify)` | 一次只问一个 |
+| `publish_case_events` | 全部 | evidence_ids, assessment_version, **cases.status** | `store` 写 3 张表 | **唯一写库节点** |
+
+#### 2.3.3.3 两张观察链的分工（不是替代关系）
+
+| 维度 | 现有观察链 | 新 case 图 |
+|---|---|---|
+| thread | `{child}:{date}`（按天） | `case:{case_id}`（**长期**） |
+| 回答的问题 | "今天发生了什么"（ABC 事件） | "这个案例到底怎么回事"（证据 / 事实 / 未知 / 矛盾） |
+| 追问次数 | **一次**（`clarify_asked` 守卫） | 最多 3 轮，且**没新证据就不问** |
+| 抽取方式 | 语料变了就全量重抽 | 增量（带已有事实进 prompt） |
+| 落库 | `observations` | `case_evidence` + `assessment_versions` + `cases.status` |
+| 终点 | 今天记下了 | 评估版本更新了 |
+
+两者的**写库节点各管各的表** → 现有观察链在阶段 2 **一行都不用改**：
+新图是**并排长出来的第四张图**，不是把旧的改造。
+
 - **thread_id = `case:{case_id}`**（长期稳定）→ 对应 `refract.md` §9.1。
 - `publish_case_events` 是**唯一**写库节点：写 `case_evidence` + `assessment_versions` + 改 `cases.status`。
 - `safety_check` 直接复用 `redflag.scan()`（`redflag.py:280`）与 `store.plan_paused()`（`store.py:973`），
@@ -512,8 +576,61 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
 - `CaseStage.vue`（阶段徽标）/ `CaseClarify.vue`（追问卡，一次一个问题）/
   `EvidenceList.vue`（**事实 / 假设 / 未知 / 矛盾四栏**，事实与假设必须一眼能分开）。
 - 所有 fetch 走 `api.js`（唯一出口）。
+- **措辞不在前端硬编码** —— 家长看到的中文全部来自 API 返回的 `label` / `hint`（见 2.3.8）。
 
-### 2.4 自检断言（建议 10 组）
+#### 2.3.8 变量字典：让家长看得懂
+
+**三条原则**（这一节是"家长视角"与"代码视角"之间的那层翻译）：
+
+1. **state 字段名是给代码和模型看的，家长看到的是措辞。**
+   `known_facts` 这种名字出现在家长眼前是失败的 —— 它暴露了内部结构，还会让家长
+   误以为这是一份"结论清单"。家长要看到的是「**我们已经知道的**」。
+2. **措辞的唯一出处是一份常量表 `asd_agent/case/labels.py`**，
+   API 返回时把 `label`（标题）+ `hint`（一句解释）一起带出来；
+   前端**不硬编码措辞、不翻译、不猜**。
+   （与项目既有约定同源：前端不算业务数、`api.js` 是唯一出口。）
+3. **内部字段一律不发给家长** —— 把"模型置信度 0.35""support=none"甩给家长
+   既没有意义，又会误导（家长会以为"0.35"是孩子的某种指标）。
+
+**变量字典**
+
+| 内部变量名 | 类型 | 代码含义 | 家长看到的标题（label） | 一句话解释（hint） | 界面栏目 |
+|---|---|---|---|---|---|
+| `known_facts` | list[str] | 已确认的事实 | 我们已经知道的 | 这些是**你亲口说过、而且原话能对得上**的事 | 事实栏 |
+| `hypotheses` | list[str] | 系统的推测 | 我们的猜测（还没确认） | 这些是**我们根据已知的事推出来的**，可能不对 | 假设栏 |
+| `unknowns` | list[str] | 还不清楚的 | 还不清楚的 | 弄清楚这些，才知道该怎么做 | 未知栏 |
+| `contradictions` | list[{a,b}] | 两条说法对不上 | 两处说法对不上 | 你前后说的不一样，我们**两个都留着** | 矛盾栏 |
+| `risk_flags` | list[{code,quote,referral}] | 安全信号 | 需要特别注意的 | 这些情况下建议先找专业人士 | 顶部横幅（沿用 `RedFlagBanner.vue`） |
+| `clarifying_question` | str | 系统想问的那一句 | 想问你一句 | 只需要回答这一句就行 | 追问卡 |
+| `evidence[].claim` | str | 一条事实陈述 | 你说过 | —— | 证据条目 |
+| `evidence[].quote` | str | 家长原话 | 你的原话 | 这是你说的原话，我们没有改写 | 证据条目（引号样式） |
+| `evidence[].support` | enum | 证据够不够 | **不展示** | —— | —— |
+| `evidence[].status` | enum | 事实 / 推断 | **不展示**（但它决定这条进不进"事实栏"） | —— | —— |
+| `cases.status` | enum | 生命周期 | 见下表八种措辞 | —— | 阶段徽标 |
+| `assessment_version` | int | 第几版评估 | **不展示** | —— | —— |
+| `claim_hash` / `source_hash` | str | 幂等键 | **不展示** | —— | —— |
+
+**八个生命周期状态的家长措辞**（`cases.status` → 徽标上的字）
+
+| code | 家长看到 | hint |
+|---|---|---|
+| `assessing` | 我们在了解情况 | 你说的我们正在整理 |
+| `awaiting_parent_input` | 想请你补充一点 | 有一处还不太清楚 |
+| `ready_to_execute` | 方案准备好了 | 等你选一个 |
+| `awaiting_feedback` | 等你练完告诉我一声 | 练完回来说一句就行 |
+| `reviewing_outcome` | 我们在看看这次的效果 | —— |
+| `revising_plan` | 我们在改方案 | 上次的做法要调一下 |
+| `paused` | 先停一下 | 出现需要先处理的情况 |
+| `closed` | 这个案子结束了 | —— |
+
+**明确不展示的字段清单**（写出来是为了防止实现时"顺手就带上了"）：
+`support` / `evidence[].status` / `confidence` / `claim_hash` / `source_hash` /
+`assessment_version` / `thread_id` / `run_id` / 内部错误码。
+
+**一条验收用的规矩**：家长看到的每一句话，都必须能回答「**这是谁说的**」——
+你说的 / 我们推的 / 还没确认。说不清是谁说的，就不该出现在家长眼前。
+
+### 2.4 自检断言（建议 11 组）
 
 1. 建案例 → `cases` 落库、`thread_id='case:{id}'`、`status='assessing'`
 2. 补充信息 → `case_evidence` 追加行、`assessment_versions` 版本 +1
@@ -525,6 +642,10 @@ START → load_case_context → extract_new_evidence(LLM) → update_assessment
 8. 两次补充信息 → 评估版本 +2，`known_facts` 累积且 `unknowns` 收敛
 9. 矛盾的两条 claim **并列保留**、进 `contradictions`，不自动删
 10. **无 pending interrupt 时 `Command(resume=)` → 409**（不重跑图、不多写一行）
+11. **家长措辞**：`GET /api/cases/{id}` 的响应里，每个面向家长的字段都带 `label` + `hint`，
+    且**内部字段一个都不许出现**（`support` / `evidence[].status` / `confidence` / `*_hash` /
+    `assessment_version` / `thread_id`）—— 断言方式：把这些键名挨个在响应 JSON 里查一遍，
+    查到一个就红。（这条守的是 2.3.8 的"不展示清单"。）
 
 另加：`http_selfcheck.py` +1 组（建案例 → 补充 → 答追问 → 读回，**真起服务打接口**）；
 `graph/selfcheck.py` +1 组（case 图 interrupt 往返 + 恢复不双写，**必须用 PostgresSaver**）。
