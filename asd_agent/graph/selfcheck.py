@@ -58,7 +58,11 @@ def _counts(conn, cid: str) -> dict:
     return {"observations": q("observations"),
             "red_flags": q("red_flags"),
             "sessions": q("sessions"),
-            "skill_state": q("skill_state")}
+            "skill_state": q("skill_state"),
+            # ★ Phase 4：反馈链会写 daily_summary，所以它也得进这个字典。
+            #   漏掉它的话，"写库只在最后一个节点"那条守卫就漏了一张表 ——
+            #   而这个字典存在的理由正是"守卫漏掉一张新表时没有任何东西会提醒你"。
+            "daily_summary": q("daily_summary")}
 
 
 def _seed_observation(*, needs_clarification: bool,
@@ -112,7 +116,8 @@ def main() -> int:
           out.get("observation_ids") == [], out.get("observation_ids"))
     c1 = _counts(conn, CID)
     check("业务表零写入",
-          c1 == {"observations": 0, "red_flags": 0, "sessions": 0, "skill_state": 0}, c1)
+          c1 == {"observations": 0, "red_flags": 0, "sessions": 0,
+                 "skill_state": 0, "daily_summary": 0}, c1)
 
     # =============================================== 2. interrupt 能停
     print("\n[2] ⚡ 澄清 interrupt 能停住")
@@ -279,9 +284,213 @@ def main() -> int:
     # =============================================== 15-20. 计划链（Phase 3）
     check_plans(g, conn, check)
 
+    # =============================================== 24-28. 反馈链（Phase 4）
+    check_runs(g, conn, check)
+
     close_all()
-    print("\n" + ("✓ Phase 0/1/2/3 图级验收全绿" if ok else "✗ 有失败项，见上"))
+    print("\n" + ("✓ Phase 0/1/2/3/4 图级验收全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+# ================================================================== [24-28] 反馈链
+RUN_CID = "graph-check-run"
+
+
+def _seed_run_child(conn) -> None:
+    """一个孩子 + 一份**降级画像**（不调模型）。
+
+    降级画像 `overall_confidence=0.1` 会让状态机的**升级**闸门全部关死，
+    而**回退**不受它管（`propose_transition` 里回退判定在闸门之前）。
+    这正好够用：回退能测到，升级测不到（而升级不是 Phase 4 的重点）。
+    """
+    from capabilities import ParentConstraints
+    from profile import _fallback_profile
+    store.ensure_child(conn, RUN_CID, name="反馈链自检娃", age_months=34)
+    store.save_profile(conn, _fallback_profile(RUN_CID, 34, ParentConstraints()))
+
+
+def _run_rows(conn, cid: str) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT activity_id,outcome,quality,source,seq,run_id,prompt_level "
+        "FROM sessions WHERE child_id=%s ORDER BY id", (cid,)).fetchall()]
+
+
+def check_runs(g, conn, check) -> None:
+    """反馈链的图级验收。**第 [25] 组是整个 Phase 4 的守门人。**
+
+    「重复提交不多写一行」这条判据有一个反直觉的后果：
+    它正确时**界面上看不出任何东西**（家长重复点一下，数字一样）。
+    所以必须有断言守着，否则有人把唯一索引去掉、
+    或者把 `log_session` 改回纯 INSERT，都只会表现为
+    "家长偶尔会发现抗拒次数不对" —— 而那个现象太容易被当成"记错了"。
+    """
+    from feedback import ActivityFeedback
+    from graph.run_graph import build_run_graph, run_inputs
+    from graph.state import run_config, run_thread_id
+    from langgraph.types import Command
+
+    _seed_run_child(conn)
+    rg = build_run_graph()
+
+    # ---------------------------------------------------------- [24] 跑一遍
+    print("\n[24] 反馈链：四个节点跑完，落库一次")
+    d1 = "2026-12-01"
+    c1 = run_config(RUN_CID, d1)
+    fbs = [ActivityFeedback("gro-007", "refused", prompt_level=3),
+           ActivityFeedback("fin-001", "success", prompt_level=0)]
+    out = rg.invoke(run_inputs(conn, RUN_CID, d1, fbs, no_llm=True), c1)
+    check("四个节点按顺序跑完",
+          out.get("trace") == ["record_execution", "analyze_outcome",
+                               "next_action", "apply_transitions"],
+          out.get("trace"))
+    rows = _run_rows(conn, RUN_CID)
+    check("★ sessions 落了两行（家长点的两条）", len(rows) == 2, rows)
+    check("★ 落库的行带着 run_id（幂等键的一半）",
+          all(r["run_id"] == run_thread_id(RUN_CID, d1) for r in rows),
+          [r["run_id"] for r in rows])
+    check("★ 落库的行带着 source 与 seq",
+          all(r["source"] == "parent" and r["seq"] == 0 for r in rows),
+          [(r["source"], r["seq"]) for r in rows])
+    check("★ 结构化的提示级别存下来了（以前只在 note 的中文里）",
+          rows[0]["prompt_level"] == 3, rows[0])
+    check("★ refusal_counts 只记一次",
+          store.refusal_counts(conn, RUN_CID).get("gro-007") == 1,
+          store.refusal_counts(conn, RUN_CID))
+    check("★ 日结落库了",
+          conn.execute("SELECT count(*) AS n FROM daily_summary WHERE child_id=%s",
+                       (RUN_CID,)).fetchone()["n"] == 1)
+    check("★ 给了「接下来怎么办」",
+          out.get("next_action") in ("continue", "adjust", "pause", "escalate"),
+          out.get("next_action"))
+
+    # ---------------------------------------------------------- [25] ★ 幂等
+    print("\n[25] ★★ 同样的输入跑两次 → 一行都不多写")
+    n_sessions = len(_run_rows(conn, RUN_CID))
+    n_summary = conn.execute(
+        "SELECT count(*) AS n FROM daily_summary WHERE child_id=%s",
+        (RUN_CID,)).fetchone()["n"]
+    out2 = rg.invoke(run_inputs(conn, RUN_CID, d1, fbs, no_llm=True), c1)
+    check("★ sessions 行数不变",
+          len(_run_rows(conn, RUN_CID)) == n_sessions,
+          f"{n_sessions} → {len(_run_rows(conn, RUN_CID))}")
+    check("★ refusal_counts 没有翻倍（这条是 Phase 4 要修的真 bug）",
+          store.refusal_counts(conn, RUN_CID).get("gro-007") == 1,
+          store.refusal_counts(conn, RUN_CID))
+    check("★ 日结也只有一行",
+          conn.execute("SELECT count(*) AS n FROM daily_summary WHERE child_id=%s",
+                       (RUN_CID,)).fetchone()["n"] == n_summary)
+    check("★ 指纹相同 → HTTP 层可以不重跑（这里是同一份输入的指纹）",
+          out2.get("input_digest") == out.get("input_digest"),
+          (out.get("input_digest"), out2.get("input_digest")))
+
+    # ---------------------------------------------------------- [26] ★ run_id 隔离
+    print("\n[26] ★ 换一个 run_id → 另一组行，不撞真实历史")
+    d2 = "2026-12-02"
+    rg.invoke(run_inputs(conn, RUN_CID, d2,
+                          [ActivityFeedback("gro-007", "refused")], no_llm=True),
+              run_config(RUN_CID, d2))
+    rows3 = _run_rows(conn, RUN_CID)
+    by_run = {}
+    for r in rows3:
+        by_run.setdefault(r["run_id"], []).append(r)
+    check("★ 两个 run_id 各有各的行（键里有 run_id）", len(by_run) == 2, list(by_run))
+    check("★ 不同日期的行 run_id 不同",
+          by_run[run_thread_id(RUN_CID, d2)][0]["run_id"]
+          != by_run[run_thread_id(RUN_CID, d1)][0]["run_id"],
+          list(by_run))
+    check("★ 抗拒计数是两天各一次（不是互相覆盖）",
+          store.refusal_counts(conn, RUN_CID).get("gro-007") == 2,
+          store.refusal_counts(conn, RUN_CID))
+
+    # ---------------------------------------------------------- [27] ★ 更正
+    print("\n[27] ★ 家长更正 → 覆盖当天那一条，而不是多出一行")
+    fbs_fix = [ActivityFeedback("gro-007", "success", prompt_level=0),
+               ActivityFeedback("fin-001", "success", prompt_level=0)]
+    rg.invoke(run_inputs(conn, RUN_CID, d1, fbs_fix, no_llm=True), c1)
+    rows2 = _run_rows(conn, RUN_CID)
+    check("★ 行数不变", len(rows2) == len(rows3), f"{len(rows3)} → {len(rows2)}")
+    check("★ 但值被改过来了（家长说「我昨天记错了」）",
+          rows2[0]["outcome"] == "success", rows2[0])
+    check("★ 更正只影响那一天（另一天的行没被动）",
+          by_run[run_thread_id(RUN_CID, d2)][0]["outcome"] == "refused",
+          by_run[run_thread_id(RUN_CID, d2)][0])
+
+    # ---------------------------------------------------------- [28] ★ 唯一写库节点
+    print("\n[28] ★★ 写库只在最后一个节点（前三个节点一个字节都不写）")
+    _check_no_writes_before_publish(conn, RUN_CID, check)
+
+    # ---------------------------------------------------------- [29] next_action
+    print("\n[29] next_action：四个取值都判得出来")
+    check_next_actions(conn, check)
+
+
+def _check_no_writes_before_publish(conn, cid: str, check) -> None:
+    """★ 前三个节点不许碰业务表。**用一个只到 next_action 的图验。**
+
+    为什么不用"看 trace 顺序"糊弄过去：顺序对了不代表节点里没有写 ——
+    有人哪天在 `next_action` 里顺手加一行 `store.append_state`，
+    trace 一点都不会变，而"落库不在最后一个节点"这条约束就破了。
+    → 所以这里真的跑一遍**去掉写库节点**的图，看业务表有没有变。
+    """
+    from graph.run_graph import run_inputs
+    from graph.state import RunState
+    from langgraph.graph import START, END, StateGraph
+    from graph import run_nodes
+
+    g = StateGraph(RunState)
+    g.add_node("record_execution", run_nodes.record_execution)
+    g.add_node("analyze_outcome", run_nodes.analyze_outcome)
+    g.add_node("next_action", run_nodes.next_action)
+    g.add_edge(START, "record_execution")
+    g.add_edge("record_execution", "analyze_outcome")
+    g.add_edge("analyze_outcome", "next_action")
+    g.add_edge("next_action", END)
+    g = g.compile()
+
+    before = _counts(conn, cid)
+    d = "2026-12-03"
+    g.invoke(run_inputs(conn, cid, d, [], no_llm=True))
+    check("★ 前三个节点跑完，业务表一行都没多",
+          _counts(conn, cid) == before, f"{before} → {_counts(conn, cid)}")
+
+
+def check_next_actions(conn, check) -> None:
+    """`next_action` 的四个取值。**纯 Python 判据，逐个判。**"""
+    from graph.run_nodes import _decide
+
+    # continue
+    a, why = _decide({"redflag_reports": [], "paused": False,
+                       "outcome_stats": {"refused": 0}}, [])
+    check("★ 没有异常 → continue", a == "continue", (a, why))
+
+    # escalate：今天新出的 urgent
+    a, why = _decide({
+        "redflag_reports": [{"source": "x", "report": {
+            "highest": "urgent", "hits": [{"code": "self_injury",
+                                            "severity": "urgent"}]}}],
+        "paused": True, "outcome_stats": {}}, [])
+    check("★ 今天新出的 urgent → escalate", a == "escalate", (a, why))
+    check("★ escalate 的理由带出命中的 code", "self_injury" in why, why)
+
+    # pause：有未关闭的 urgent（没有今天新出的）
+    a, why = _decide({"redflag_reports": [], "paused": True,
+                       "outcome_stats": {}}, [])
+    check("★ 有未关闭的 urgent → pause", a == "pause", (a, why))
+
+    # adjust：回退型转移
+    a, why = _decide({"redflag_reports": [], "paused": False,
+                       "outcome_stats": {"refused": 0}},
+                      [{"from_state": "practicing", "to_state": "entry",
+                        "skill_item": "共同注意"}])
+    check("★ 回退型转移 → adjust", a == "adjust", (a, why))
+
+    # ★ 升级型转移**不是** adjust
+    a, why = _decide({"redflag_reports": [], "paused": False,
+                       "outcome_stats": {"refused": 0}},
+                      [{"from_state": "entry", "to_state": "practicing",
+                        "skill_item": "共同注意"}])
+    check("★ 升级型转移不算 adjust（难度该往上调，不是调）",
+          a == "continue", (a, why))
 
 
 # ================================================================== [15-20] 计划链

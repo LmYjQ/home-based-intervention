@@ -52,6 +52,11 @@ from statemachine import SessionRecord
 
 Outcome = Literal["success", "partial", "refused", "skipped"]
 
+#: outcome 的四个合法取值。**刻意是一份可枚举的元组**：
+#: 它同时给 `Literal` 用、给构造时的校验用、给前端的选项用 ——
+#: 三处各写一遍字面量，迟早有一处落后，而落后的那一处不报错。
+OUTCOMES = ("success", "partial", "refused", "skipped")
+
 # 家长端的四个选项。★ 刻意与 SessionRecord 同词表（4 值，无 no_data）——
 # 家长"跳过这条"和"今天没做这条"是两件事：
 #   跳过 = 卡片发了没来得及做 → skipped
@@ -78,6 +83,15 @@ class ActivityFeedback:
             raise ValueError(
                 f"prompt_level 必须在 0-3 之间（{PROMPT_LEVELS}），"
                 f"实际 {self.prompt_level}")
+        # ★ Phase 4：outcome 也要在**构造时**就拒。
+        #   它以前是裸 str，非法值能一路走到 INSERT —— 于是库里躺着一行
+        #   outcome='succeess'，而状态机的统计只认四个词，
+        #   那行既不计入成功也不计入抗拒，**安静地不存在**。
+        #   判据放在构造里，是因为这里是唯一一处所有入口都必经的地方
+        #   （HTTP 的 Pydantic 校验它、图还原它时也校验它）。
+        if self.outcome not in OUTCOMES:
+            raise ValueError(
+                f"outcome 必须是 {OUTCOMES} 之一，实际 {self.outcome!r}")
 
 
 @dataclass
@@ -200,6 +214,12 @@ def plan_feedbacks(feedbacks: list[ActivityFeedback], *, date: str,
         plan.sessions.append(rec)
         plan.rows.append({
             "note": _session_note(fb),
+            # ★ 家长**原话**。与 note 并列存着，因为两者用途不同：
+            #   note 是给家长看的那句归纳（"家长选「不配合」"），
+            #   raw_note 是红旗扫描与回指校验的语料。
+            #   以前原话只活在 observations.source 里，而降级时连那里都没有 ——
+            #   于是"家长在补充描述里说了自伤"这件事在降级路径上永远看不见。
+            "raw_note": fb.note,
             "prompt_level": fb.prompt_level,
             "steps_done": fb.steps_done,
             "source": "parent",
@@ -294,10 +314,18 @@ def write_feedbacks(conn: psycopg.Connection, child_id: str, plan: FeedbackPlan,
     res.written_observations = len(res.observation_ids)
 
     # ---- ③ 桥接补记的 refused sessions ----
+    # 桥接的 hit 在两种形态下都出现过：对象（刚算出来时）
+    # 与 dict（从 state 还原时，checkpoint 里存的是纯 dict）。
+    # 两种都要认 —— 而 seq 必须在两种形态下都拿得到，
+    # 少了它两条桥接记录会撞成一行（DO UPDATE 覆盖掉一条）。
     for h in plan.refusal_hits:
+        if isinstance(h, dict):
+            sess, note, seq = h["session"], h["note"], int(h.get("seq", 1))
+        else:
+            sess, note, seq = h.session, h.note, int(getattr(h, "seq", 1))
         res.bridge_session_ids.append(store.log_session(
-            conn, child_id, h.session, h.note, run_id=run_id,
-            source="bridge", seq=getattr(h, "seq", 1)))
+            conn, child_id, sess, note, run_id=run_id,
+            source="bridge", seq=seq))
     return res
 
 
@@ -334,6 +362,89 @@ def _session_note(fb: ActivityFeedback) -> str:
         return f"家长选「部分做到」，做到第 {fb.steps_done} 步"
     lvl = PROMPT_LEVELS[fb.prompt_level]
     return f"家长选「独立做到」" if fb.prompt_level == 0 else f"家长选「{lvl}」"
+
+
+# ================================================================== 幂等守卫
+def feedback_digest(feedbacks: list[ActivityFeedback], date: str) -> str:
+    """这份输入的指纹（sha256）。**幂等守卫用。**
+
+    ★ 为什么要有它：家长（或前端的重复点击）会把**一模一样**的内容提交两次。
+      落库那半已经幂等了（`store.log_session` 的唯一键），
+      但图还会**重跑一遍** —— 里面有一次 LLM 调用（日结），
+      于是重复提交 = 白白等 20-60 秒。
+      → 指纹相同就直接返回上次存下来的结果，一次 LLM 都不付。
+
+    ★ 指纹变了（家长更正了某一条）就该重跑 —— 那时落库那半是幂等的，
+      于是更正会**覆盖**当天那一条，而不是多出一行。
+
+    刻意**不含**时间戳之类会变的东西：同样的内容必须得到同样的指纹，
+    否则这个守卫形同虚设（而它失效的方式是"静默地多付一次 LLM"）。
+    """
+    import hashlib
+    import json as _json
+
+    payload = [{
+        "activity_id": f.activity_id,
+        "outcome": f.outcome,
+        "prompt_level": f.prompt_level,
+        "steps_done": f.steps_done,
+        "note": f.note,
+    } for f in feedbacks]
+    # 排序：提交的**顺序**不该影响指纹 ——
+    # 家长把两条反馈调换一下顺序，内容没变，就不该重跑。
+    payload.sort(key=lambda x: (x["activity_id"], x["outcome"], x["note"]))
+    blob = _json.dumps({"date": date, "feedbacks": payload},
+                       ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+# ================================================================== state 还原
+def plan_from_state(*, date: str, sessions: list[dict], rows: list[dict],
+                     outcomes: list[dict], refusal_hits: list[dict]) -> FeedbackPlan:
+    """从 state（**纯 dict**）还原成 `FeedbackPlan`。
+
+    ★ 为什么 state 里存的是 dict 而不是对象：
+      checkpointer 用 msgpack 序列化，dataclass / Pydantic 属于未注册类型，
+      实测已经打出 "will be blocked in a future version" 的警告，
+      而 **checkpoint 的寿命比代码长** —— 今天能反序列化不代表明年能。
+      （与观察链存 `model_dump()`、计划链存 `request_to_dict` 同一条理由。）
+
+    还原时**重新过一遍校验**（`model_validate`）：
+    老 checkpoint 里缺字段会在这里炸，而不是在写库那一步炸 ——
+    那一步炸的话，症状是"落了一半库"，比这里炸难查得多。
+    """
+    import observe
+    from statemachine import SessionRecord
+
+    plan = FeedbackPlan(date=date)
+    for s in sessions:
+        plan.sessions.append(SessionRecord.model_validate(s))
+    plan.rows = [dict(r) for r in rows]
+    for o in outcomes:
+        plan.outcomes.append(observe.ObservationOutcome.model_validate(o))
+    for h in refusal_hits:
+        d = dict(h)
+        d["session"] = SessionRecord.model_validate(d["session"])
+        plan.refusal_hits.append(d)
+    plan.degraded = any(bool(getattr(o, "degraded", False)) for o in plan.outcomes)
+    return plan
+
+
+def plan_to_state(plan: FeedbackPlan) -> dict:
+    """`FeedbackPlan` → state 里那几项（**纯 dict**）。`plan_from_state` 的逆。"""
+    return {
+        "sessions": [s.model_dump() for s in plan.sessions],
+        "session_rows": [dict(r) for r in plan.rows],
+        "outcomes": [o.model_dump(mode="json") for o in plan.outcomes],
+        "refusal_hits": [{
+            "session": h.session.model_dump(),
+            "activity_id": h.activity_id,
+            "note": h.note,
+            "event_index": h.event_index,
+            "behavior": h.behavior,
+            "seq": getattr(h, "seq", 1),
+        } for h in plan.refusal_hits],
+    }
 
 
 # ================================================================== 自检

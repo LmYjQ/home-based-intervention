@@ -133,17 +133,13 @@ def extract_observation(state) -> dict:
 def _rf_dump(report) -> dict:
     """红旗报告 → **纯 dict**。
 
-    ★ 用 `redflag.dump_hit` 而不是 `h.__dict__.copy()`：`RedFlag` 现在带了一个
-      `Referral` 对象，dict() 会把它原样塞进 state，而 checkpoint 的寿命比代码长 ——
-      存对象会让老历史在重构后读不出来（与 `extract_observation` 存
-      `model_dump()` 而不是对象是同一条理由）。
+    ★ Phase 4：格式搬到了 `redflag.dump_report` —— 反馈链也要把扫描结果
+      带进 state，两处各写一遍必然漂移。
+      （原来这里用 `redflag.dump_hit` 而不是 `h.__dict__.copy()`：
+      `RedFlag` 带了一个 `Referral` 对象，dict() 会把它原样塞进 state，
+      而 checkpoint 的寿命比代码长 —— 存对象会让老历史在重构后读不出来。）
     """
-    return {
-        "triggered": report.triggered,
-        "highest": report.highest,
-        "blocking_codes": list(report.blocking_codes),
-        "hits": [redflag.dump_hit(h) for h in report.hits],
-    }
+    return redflag.dump_report(report)
 
 
 def _first_question(out) -> str:

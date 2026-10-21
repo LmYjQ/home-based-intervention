@@ -38,6 +38,7 @@ _LOCK = threading.Lock()
 _GRAPHS: dict[str, object] = {}        # schema 名 -> 观察链 CompiledStateGraph
 _DRAFTS: dict[str, object] = {}        # schema 名 -> 草稿图
 _PLANS: dict[str, object] = {}         # schema 名 -> 计划链 CompiledStateGraph
+_RUNS: dict[str, object] = {}          # schema 名 -> 反馈链 CompiledStateGraph
 
 
 def _key(path: str | None) -> str:
@@ -79,6 +80,21 @@ def get_plan_graph(path: str | None = None):
     return _cached(_PLANS, _key(path), _build)
 
 
+def get_run_graph(path: str | None = None):
+    """反馈链图（Phase 4）。与前两张**分开缓存**，理由同 `get_plan_graph`。
+
+    ★ 为什么必须分开而不是共用一个 dict：
+      三张图的 saver 用的是**同一个连接**（`saver_for` 按 schema 缓存），
+      而编译出来的 CompiledStateGraph 各自持有节点表。
+      共用一个 key 的话，第二张图会把第一张覆盖掉 ——
+      症状是"反馈端点返回了一个计划"，没有任何报错。
+    """
+    def _build(path=path):
+        from .run_graph import build_run_graph
+        return build_run_graph(saver_for(path))
+    return _cached(_RUNS, _key(path), _build)
+
+
 def close_all() -> None:
     """关掉本进程持有的 saver 连接 + 清缓存。**只给测试与关停用。**"""
     from .checkpointer import close_all as _close
@@ -86,6 +102,7 @@ def close_all() -> None:
         _GRAPHS.clear()
         _DRAFTS.clear()
         _PLANS.clear()
+        _RUNS.clear()
     _close()
 
 
@@ -101,4 +118,8 @@ if __name__ == "__main__":
     p1, p2 = get_plan_graph(), get_plan_graph()
     print(f"计划图同一实例= {p1 is p2}")
     print(f"计划图≠观察图 = {p1 is not g1}")
+    r1, r2 = get_run_graph(), get_run_graph()
+    print(f"反馈图同一实例= {r1 is r2}")
+    print(f"反馈图≠观察图 = {r1 is not g1}")
+    print(f"反馈图≠计划图 = {r1 is not p1}")
     close_all()

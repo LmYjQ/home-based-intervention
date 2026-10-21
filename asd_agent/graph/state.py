@@ -162,6 +162,88 @@ class PlanState(TypedDict, total=False):
     trace: list[str]
 
 
+# ================================================================== 反馈链 state
+class RunState(TypedDict, total=False):
+    """**第三张**图（反馈链）的 state。与观察链、计划链各自独立。
+
+    ★ 为什么又是独立的一张：
+      触发时机不同（观察链=家长写了一段话；计划链=打开今天/重新生成；
+      反馈链=家长填完今天的逐条反馈），而 thread_id 会打架 ——
+      同 thread 的 `invoke` 会**接着上一次跑**（LANGGRAPH.md ③ 的实测）。
+      所以三张图各有各的前缀：`{child}:{date}` / `plan:` / `run:`。
+
+    `total=False` 的理由同前两张：节点只写自己产出的那几项。
+    """
+
+    # ---- 身份与坐标 ----
+    child_id: str
+    date: str
+    no_llm: bool
+    #: ★ 「一天的执行」的身份 = thread_id = `store.day_run_id(child, date)`。
+    #:   它同时是落库三张表时幂等键的一半（sessions / skill_state /
+    #:   daily_summary），也是"重跑一次同一天"能被认出来的凭据。
+    run_id: str
+
+    # ---- 输入 ----
+    #: 家长点的那些条（每条一个 dict：activity_id / outcome /
+    #: prompt_level / steps_done / note）。
+    feedbacks: list[dict[str, Any]]
+    #: ★ 这份输入的指纹（sha256）。**幂等守卫用**：
+    #:   同一天提交**一模一样**的内容 → 指纹相同 → 直接返回已存的那次结果，
+    #:   不重跑图、不重付 LLM、不重写库。
+    #:   而内容改了（家长更正了）→ 指纹不同 → 重跑，落库那半是幂等的，
+    #:   于是更正会**覆盖**当天那一条，而不是多出一行。
+    input_digest: str
+
+    #: ★ 由图入口调 `store.plan_paused(conn, child_id)` 算好后传进来。
+    #:   反馈链里**只有这一个暂停口径**（LANGGRAPH.md 第四节之三），
+    #:   节点体不自己查库、也不自己判断 —— 见 run_nodes.next_action。
+    paused: bool
+
+    # ---- 计划关联 ----
+    #: 当天生效的那一版计划（`plans` 表）。练习记录挂在它下面 ——
+    #: "孩子做的是哪一版安排下的"这句话要有落点。
+    plan_id: int | None
+    plan_version: int
+
+    # ---- record_execution 的产物（纯计算，一行都没写）----
+    #: 家长点的那些条（SessionRecord 的 dump）。
+    sessions: list[dict[str, Any]]
+    #: 与 sessions 一一对应的元信息：note（落库用的那句）/
+    #: raw_note（家长原话，红旗扫描用）/ prompt_level / steps_done /
+    #: source / seq。
+    session_rows: list[dict[str, Any]]
+    #: 从每条 note 里抽出来的事件（ObservationOutcome 的 dump）。
+    outcomes: list[dict[str, Any]]
+    #: 从 note 里桥接出来的抗拒（RefusalHit 的 dump）。
+    refusal_hits: list[dict[str, Any]]
+    #: 逐条扫描家长原话得到的红旗报告：每项 {"source": 原话, "report": dump}。
+    redflag_reports: list[dict[str, Any]]
+
+    # ---- analyze_outcome 的产物 ----
+    #: 当天的结果统计（纯 Python 算的，不调模型）。
+    outcome_stats: dict[str, Any]
+    #: 日结（`summary.DailySummary` 的 dump）。降级时是兜底那份。
+    daily_summary: dict[str, Any]
+
+    # ---- next_action 的产物 ----
+    #: 状态转移（`statemachine.StateTransition` 的 dump）。
+    transitions: list[dict[str, Any]]
+    #: continue / adjust / pause / escalate —— **纯 Python 判的**。
+    next_action: str
+    #: 给家长看的那句人话。
+    action_reason: str
+
+    # ---- 落库结果（apply_transitions 节点产出）----
+    session_ids: list[int]
+    observation_ids: list[int]
+    red_flag_ids: list[int]
+    state_ids: list[int]
+    summary_id: int
+
+    trace: list[str]
+
+
 # ================================================================== state
 class InterventionState(TypedDict, total=False):
     """一天的干预流程。
@@ -299,3 +381,16 @@ def plan_thread_id(child_id: str, date: str) -> str:
 
 def plan_config(child_id: str, date: str) -> dict:
     return {"configurable": {"thread_id": plan_thread_id(child_id, date)}}
+
+
+#: 反馈链的 thread 前缀。**它就是 `store.day_run_id`** ——
+#: 「一天的执行」既住在 checkpoint 里（thread），也写在落库的行上（run_id），
+#: 让它们是同一个字符串，"重跑一次同一天"在两处就是同一个身份，
+#: 幂等键于是自然成立（见 store.day_run_id 的注释）。
+def run_thread_id(child_id: str, date: str) -> str:
+    import store
+    return store.day_run_id(child_id, date)
+
+
+def run_config(child_id: str, date: str) -> dict:
+    return {"configurable": {"thread_id": run_thread_id(child_id, date)}}

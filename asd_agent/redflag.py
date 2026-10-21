@@ -328,6 +328,22 @@ def dump_hit(h: RedFlag) -> dict:
     return h.dump()
 
 
+def dump_report(report: RedFlagReport) -> dict:
+    """一次扫描 → **纯 dict**（进 state / checkpoint 用）。
+
+    ★ Phase 4：观察链与反馈链都要把扫描结果带进 state，
+      而两处各写一遍 dump 格式必然漂移 —— 漂移的后果是
+      "反馈链还原不出观察链写的那份"，于是红旗的引用对不上。
+      所以格式定义在**规则这一层**（redflag.py），两处共用。
+    """
+    return {
+        "triggered": report.triggered,
+        "highest": report.highest,
+        "blocking_codes": list(report.blocking_codes),
+        "hits": [h.dump() for h in report.hits],
+    }
+
+
 def report_from_dump(dump: dict) -> RedFlagReport:
     """从 state / checkpoint 里的 dict 还原报告。
 
