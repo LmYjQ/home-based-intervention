@@ -798,7 +798,6 @@ def _cli() -> None:
     # 测试数据必须自己经得起交叉核对（statemachine.py 的 soc-004 教训）。
     req = PlanRequest(daily_minutes=30,
                       materials_at_home={"杯子", "绘本", "小汽车", "积木"},
-                      avoid_load_sensory=True,
                       refusal_counts=store.refusal_counts(conn, cid),
                       success_counts=store.success_counts(conn, cid),
                       recent_scenes=store.recent_scenes(conn, cid),

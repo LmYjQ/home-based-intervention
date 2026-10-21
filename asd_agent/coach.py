@@ -726,7 +726,6 @@ def _cli() -> None:
         priority_domains=prof.domains_of_interest(),
         daily_minutes=pc.daily_minutes_available,
         materials_at_home=set(pc.materials_at_home),
-        avoid_load_sensory=pc.avoid_load_sensory,
         preferences=pc.preferences,
     )
     cands = retrieve_candidates(req, top_k=5)

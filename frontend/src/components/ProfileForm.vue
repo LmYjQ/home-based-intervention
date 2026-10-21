@@ -6,6 +6,7 @@ import { ref } from 'vue'
 import { api, runJob } from '../api.js'
 import JobProgress from './JobProgress.vue'
 import RedFlagList from './RedFlagList.vue'
+import BirthDatePicker from './BirthDatePicker.vue'
 
 const props = defineProps({ childId: String })
 const emit = defineEmits(['done'])
@@ -19,10 +20,12 @@ const SAMPLE = `小宇，34个月，2026-09 由康复科评估。
 行为方面：他去咬自己的袖子，需要提醒，情绪激动时会用手推人。`
 
 const report = ref(SAMPLE)
-const age = ref(34)
+// ★ 年龄由出生日期算，**不再让家长手填月龄**。
+//   月龄是要人算的数，填错 6 个月就整体偏一级难度 —— 而偏一级在干预里
+//   不是"稍微不合适"，是练不到或练过头。出生日期只有一个正确值。
+const birthDate = ref('')
 const minutes = ref(30)
 const materials = ref('杯子,绘本,小汽车,积木')
-const avoid = ref(true)
 
 const steps = ref([])
 const running = ref(false)
@@ -30,15 +33,17 @@ const result = ref(null)
 const err = ref('')
 
 async function submit() {
+  // ★ 没填出生日期就不发 —— 后端会 422，但让它走到那里就是让家长
+  //   等一个必然失败的请求。组件已经把格式守住了，这里守"有没有填"。
+  if (!birthDate.value) { err.value = '还没填出生日期'; return }
   running.value = true; steps.value = []; result.value = null; err.value = ''
   try {
     const r = await runJob('/api/profile', {
       child_id: props.childId,
       report_text: report.value,
-      age_months: Number(age.value),
+      birth_date: birthDate.value,
       daily_minutes: Number(minutes.value),
       materials: materials.value.split(/[,，]/).map(s => s.trim()).filter(Boolean),
-      avoid_load_sensory: avoid.value,
     }, (d) => steps.value.push(d))
     result.value = r.result
     emit('done')
@@ -62,10 +67,11 @@ async function submit() {
     <textarea v-model="report" rows="10" placeholder="把报告贴进来"></textarea>
 
     <div class="row">
-      <label>月龄<input type="number" v-model="age" /></label>
+      <label>出生日期
+        <BirthDatePicker v-model="birthDate" :default-months="34" />
+      </label>
       <label>每天能挤出的时间（分钟）<input type="number" v-model="minutes" /></label>
       <label class="wide">家里现成的材料<input v-model="materials" placeholder="逗号分隔" /></label>
-      <label class="chk"><input type="checkbox" v-model="avoid" /> 近期感官负荷高，避开高感官活动</label>
     </div>
 
     <button :disabled="running || !report.trim()" @click="submit">
@@ -111,8 +117,8 @@ textarea { width: 100%; box-sizing: border-box; font-family: inherit; font-size:
 .row { display: flex; gap: 16px; flex-wrap: wrap; margin: 12px 0; }
 .row label { flex: 1; min-width: 140px; }
 .row .wide { flex: 2; }
-.row .chk { flex: 3; display: flex; align-items: center; gap: 6px; }
-input[type=number], input[type=text], input:not([type]) { width: 100%; box-sizing: border-box;
+.sub { display: block; font-size: 12px; color: #6b7280; margin-top: 3px; }
+input[type=number], input[type=text], input[type=date], input:not([type]) { width: 100%; box-sizing: border-box;
   padding: 6px 8px; border: 1px solid #d1d5db; border-radius: 6px; }
 button { background: #2563eb; color: #fff; border: 0; padding: 9px 20px;
   border-radius: 6px; cursor: pointer; font-size: 14px; }

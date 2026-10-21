@@ -241,7 +241,6 @@ def build_request(conn, child_id: str, prof: AbilityProfile, *,
         priority_domains=prof.domains_of_interest(),
         daily_minutes=pc.daily_minutes_available,
         materials_at_home=set(pc.materials_at_home),
-        avoid_load_sensory=pc.avoid_load_sensory,
         known_refusals=pc.known_refusals,
         refusal_counts=store.refusal_counts(conn, child_id),
         success_counts=store.success_counts(conn, child_id),
@@ -618,7 +617,6 @@ def run_loop(child_id: str, *, days: int = 5, no_llm: bool = False,
     constraints = ParentConstraints(
         daily_minutes_available=minutes,
         materials_at_home=[m for m in materials.split(",") if m],
-        avoid_load_sensory=True,
     )
 
     print("=" * 70)

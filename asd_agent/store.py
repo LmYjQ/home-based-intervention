@@ -181,6 +181,9 @@ def _init(c: psycopg.Connection) -> None:
         child_id      TEXT PRIMARY KEY,
         name          TEXT,
         age_months    INTEGER NOT NULL DEFAULT 0,
+        -- ★ 出生日期。家长填这个，月龄由系统算（child_age.age_months_from_birth）。
+        --   age_months 仍然保留 —— 它是"算出来的那一份"，画像与检索读的是它。
+        birth_date    TEXT,
         created_at    TEXT NOT NULL
     );
 
@@ -426,6 +429,14 @@ def _migrate(c: psycopg.Connection) -> None:
         "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS steps_done INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE skill_state ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE daily_summary ADD COLUMN IF NOT EXISTS run_id TEXT NOT NULL DEFAULT ''",
+        # ── 出生日期 ────────────────────────────────────────────────────
+        #   以前月龄是家长手填的，存在 children.age_months 里。
+        #   现在家长填出生日期，月龄由 child_age.age_months_from_birth 算。
+        #   两列都留着：age_months 是"算出来的那一份"（画像、检索都读它），
+        #   birth_date 是"唯一正确值的事实"（月龄会随时间变，事实不会）。
+        #   老库没有 birth_date —— 那就让 age_months 继续当唯一来源，
+        #   等下次建档时补上。
+        "ALTER TABLE children ADD COLUMN IF NOT EXISTS birth_date TEXT",
     ):
         c.execute(ddl)
     c.execute("CREATE INDEX IF NOT EXISTS idx_plan_active "
@@ -485,12 +496,29 @@ def _backfill_run_ids(c: psycopg.Connection) -> None:
 #   （我们全是单行 INSERT，不涉及行锁升级为表锁的经典死锁形状）。
 #   留着那把锁只会让并发写重新排队，把刚解决的问题请回来。
 def ensure_child(conn: psycopg.Connection, child_id: str, *, name: str = "",
-                 age_months: int = 0) -> None:
+                 age_months: int = 0, birth_date: str | None = None) -> None:
+    """登记一个孩子（幂等）。
+
+    ★ `birth_date` 用 COALESCE：没传就**保留**库里已有的那个。
+      原因：月龄是**会变的**（今天算的 34 个月，下个月就是 35），
+      而出生日期不会变 —— 所以"这次没填出生日期"绝不能把上一次填的抹掉。
+      反过来传了就以新传的为准（家长改口了就该改）。
+    """
     conn.execute(
-        "INSERT INTO children(child_id,name,age_months,created_at) VALUES(%s,%s,%s,%s) "
-        "ON CONFLICT(child_id) DO UPDATE SET age_months=excluded.age_months",
-        (child_id, name, age_months, date.today().isoformat()))
+        "INSERT INTO children(child_id,name,age_months,birth_date,created_at) "
+        "VALUES(%s,%s,%s,%s,%s) "
+        "ON CONFLICT(child_id) DO UPDATE SET age_months=excluded.age_months, "
+        "birth_date=COALESCE(excluded.birth_date, children.birth_date)",
+        (child_id, name, age_months, birth_date, date.today().isoformat()))
     conn.commit()
+
+
+def child(conn: psycopg.Connection, child_id: str) -> dict | None:
+    """取一个孩子那一行。读不到返回 None（**不抛** —— 调用方决定要不要降级）。"""
+    row = conn.execute(
+        "SELECT child_id, name, age_months, birth_date, created_at "
+        "FROM children WHERE child_id=%s", (child_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def save_profile(conn: psycopg.Connection, profile) -> int:

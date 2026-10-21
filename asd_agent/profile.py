@@ -180,8 +180,7 @@ def _user_prompt(report_text: str, child_id: str, age_months: int,
             "【家长已提供的现实条件（供你判断可行性，不影响你记录什么）】\n"
             f"  每天可支配时间：{parent_constraints.daily_minutes_available} 分钟\n"
             f"  家里现成材料：{'、'.join(parent_constraints.materials_at_home) or '未提供'}\n"
-            f"  是否只有一位家长能带：{'是' if parent_constraints.alone_only else '否'}\n"
-            f"  需避开高感官活动：{'是' if parent_constraints.avoid_load_sensory else '否'}")
+            f"  是否只有一位家长能带：{'是' if parent_constraints.alone_only else '否'}")
         lines.append("")
     lines.append("【评估报告原文】")
     lines.append(report_text)
@@ -390,7 +389,6 @@ def _cli() -> None:
                          parent_constraints=ParentConstraints(
                              daily_minutes_available=30,
                              materials_at_home=["杯子", "绘本", "积木", "小汽车"],
-                             avoid_load_sensory=True,
                          ))
     t = ex.trace
     if t:

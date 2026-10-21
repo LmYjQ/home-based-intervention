@@ -242,7 +242,6 @@ class PlanRequest:
     priority_domains: list[str] = field(default_factory=list)
     daily_minutes: int = 30
     materials_at_home: set[str] = field(default_factory=set)
-    avoid_load_sensory: bool = False
     known_refusals: list[str] = field(default_factory=list)       # 家长明说抗拒的标题/材料
     refusal_counts: dict[str, int] = field(default_factory=dict)  # activity_id -> 抗拒次数
     success_counts: dict[str, int] = field(default_factory=dict)
@@ -298,9 +297,6 @@ def _hard_filter(req: PlanRequest, a: Activity) -> str:
         lvl = req.levels.get(item)
         if lvl is not None and lvl < 2 and a.difficulty > 1:
             return f"当前水平（{item} {lvl}级）不适合难度{a.difficulty}的活动"
-
-    if req.avoid_load_sensory and a.sensory_load == "high":
-        return "感官负荷偏高，该孩子需要避开"
 
     if a.activity_id in req.recent_activity_ids:
         return "最近 3 天刚练过，避免重复"
@@ -759,7 +755,6 @@ def request_to_dict(req: PlanRequest) -> dict:
         "priority_domains": list(req.priority_domains),
         "daily_minutes": req.daily_minutes,
         "materials_at_home": sorted(req.materials_at_home),
-        "avoid_load_sensory": req.avoid_load_sensory,
         "known_refusals": list(req.known_refusals),
         "refusal_counts": dict(req.refusal_counts),
         "success_counts": dict(req.success_counts),
@@ -781,7 +776,6 @@ def request_from_dict(d: dict) -> PlanRequest:
         priority_domains=d.get("priority_domains") or [],
         daily_minutes=int(d.get("daily_minutes") or 30),
         materials_at_home=set(d.get("materials_at_home") or []),
-        avoid_load_sensory=bool(d.get("avoid_load_sensory")),
         known_refusals=list(d.get("known_refusals") or []),
         refusal_counts=d.get("refusal_counts") or {},
         success_counts=d.get("success_counts") or {},

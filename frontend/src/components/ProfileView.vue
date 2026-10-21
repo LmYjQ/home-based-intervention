@@ -81,10 +81,11 @@ const nStated = computed(() =>
     <details>
       <summary>家长约束（检索器硬过滤用的就是这三条）</summary>
       <ul class="pc">
+        <li>出生日期：<b>{{ state.birth_date || '（没填）' }}</b>
+          <span v-if="state.age_text"> · 月龄 {{ state.age_text }}</span></li>
         <li>每天可投入 <b>{{ pc.daily_minutes_available }}</b> 分钟</li>
         <li>家里现成的材料：{{ (pc.materials_at_home || []).join('、') || '（没填）' }}</li>
         <li>独自进行：{{ pc.alone_only ? '是' : '否' }}</li>
-        <li>近期感官负荷高：{{ pc.avoid_load_sensory ? '是（避开高感官活动）' : '否' }}</li>
       </ul>
     </details>
   </section>

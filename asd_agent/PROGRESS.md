@@ -14,7 +14,7 @@
 > - **LangGraph 全部关键行为的实测结论**（interrupt 恢复会重跑节点、分叉必须换 `thread_id`、
 >   `thread_id` 不可复用、`PostgresSaver` 没有 `schema=` 参数…）—— **别抄文档，1.x 与网上示例有出入**
 > - **Phase 0 / 1 / 2 / 3 / 4 均已完成**（2026-10-21 复核全绿）。图级验收 9 → **14 → 23 → 29 组**断言，
->   `http_selfcheck.py` **9 → 10 → 12 组**。Phase 1 的接线约束见第四节之二；
+>   `http_selfcheck.py` **9 → 10 → 12 → 13 组**。Phase 1 的接线约束见第四节之二；
 >   **Phase 4 开工必读 = 第四节之五**（图长什么样、幂等的两层、run_id 是什么、
 >   next_action 的判据、六个坑；带 ⚠️ 的没重新验证过）。
 > - **★ 下一步 = Phase 5（time travel）**。**开工前必读 LANGGRAPH.md 顶部的
@@ -153,6 +153,32 @@
 >   （`out_prev = []` 把历史扔掉 + 类型传错）。
 >   12 个离线回归一个都不碰 live 路径，所以没人发现。
 >   **已修，但 live 路径本轮未实跑**（没有 replay fixture）。
+>
+> **★ 产品侧改动（2026-10-21，用户要求，与 LangGraph 无关）**：
+> - **建档页的「近期感官负荷高，避开高感官活动」入口下线，相关逻辑一并撤掉**：
+>   `ParentConstraints.avoid_load_sensory`（字段本身没了）、
+>   检索器的硬过滤「感官负荷偏高，该孩子需要避开」、
+>   抽取 prompt 里的那一行、前端表单与画像展示。
+>   **老画像仍然读得出来** —— `ParentConstraints` 是 `extra="forbid"`，
+>   老 payload 里带着那个键，不显式丢就**整份画像 ValidationError**
+>   （= 那个孩子当天没有计划）。丢在 `model_validator(mode="before")` 里。
+>   ★ **教练那套「ABC 判定孩子在获取感觉刺激 → 换掉高感官活动」没动**：
+>   它来自**当天观察到的行为功能**，与这个开关无关（方向还相反：
+>   那个是"他要感觉"，这个是"他受够了"）。别顺手一起删。
+> - **「月龄」改成「出生日期」，月龄由系统算**：
+>   新模块 `asd_agent/child_age.py`（`age_months_from_birth`，纯函数、有自检），
+>   `children` 表加 `birth_date` 列（`age_months` 仍存算出来的那一份）。
+>   `POST /api/profile` 的 `birth_date` **必填**、格式不对 **422**
+>   （不猜、不回退到默认月龄 —— 回退 = 按错的年龄选活动而家长毫不知情）。
+>   **旧的手填 `age_months` 入口彻底删掉**（不是留着兼容 —— 留着就有第二个口径）。
+> - **前端用组件收出生日期**：`frontend/src/components/BirthDatePicker.vue`
+>   （非法值不往外 emit，所以上层拿到的一定是能用的 `YYYY-MM-DD`；
+>   不能选未来日期；旁边显示换算出来的月龄）+
+>   `frontend/src/childAge.js`（校验与月龄换算，**只用于显示**，
+>   判定用的那份永远在后端）。
+> - **验证**：12 个离线回归全绿（图级 29 组、checkpointer、HTTP **12 → 13 组**）、
+>   `vite build` 通过、**真起服务打接口**（出生日期 → 月龄 → 落库 → `/api/state` 读回）、
+>   **浏览器里点了一遍**（建档页默认值、非法值报红、未来日期报红、点建档跑通到出卡片）。
 
 **✅ 工作区已提交**（2026-10-21，分支 `pg-langgraph-baseline`）：
 ```
@@ -230,7 +256,7 @@ cd frontend && npm run dev        # ⚠️ 5173 被占时自动退到 5174
 cd asd_agent
 ASD_DB_PATH=/tmp/graph_selfcheck.db  ../.venv/bin/python -m graph.selfcheck    # 29 组
 ASD_DB_PATH=/tmp/graph_ckpt_check.db ../.venv/bin/python -m graph.checkpointer
-ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 12 组
+ASD_DB_PATH=/tmp/http_selfcheck.db   ../.venv/bin/python http_selfcheck.py     # 13 组
 ```
 
 **⚠️ 本项目 venv 是 uv 建的，没有 pip** —— 装包用

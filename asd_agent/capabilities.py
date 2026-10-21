@@ -25,7 +25,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -155,14 +155,29 @@ class ParentConstraints(BaseModel):
         default_factory=list, max_length=10,
         description="家长明说孩子抗拒的东西（活动名或材料名）",
     )
-    avoid_load_sensory: bool = Field(
-        default=False, description="孩子近期感官负荷高，需避开高感官活动",
-    )
     preferences: PreferenceSet = Field(
         default_factory=PreferenceSet,
         description="孩子近期喜好。刻意不并进 assessments —— 那是医生评估出来的能力，"
                     "喜好是家长这周观察到的偏好，来源和可变性都不同",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_sensory(cls, data: Any) -> Any:
+        """丢掉老画像里的 `avoid_load_sensory`（这条约束已下线）。
+
+        ★ 为什么必须显式丢，而不是"留着字段但不用它"：
+          `ParentConstraints` 是 `extra="forbid"`，而老画像的 payload 里
+          带着这个键 —— 不丢的话，**整份画像读不出来**（ValidationError），
+          而画像读不出来意味着这个孩子当天没有计划、没有卡片。
+          一个下线的功能不该有能力把老数据变成不可读。
+
+        丢在**校验之前**而不是之后：Pydantic 的 extra 判定在字段解析前，
+          到不了"字段不存在就跳过"那一步。
+        """
+        if isinstance(data, dict) and "avoid_load_sensory" in data:
+            data = {k: v for k, v in data.items() if k != "avoid_load_sensory"}
+        return data
 
 
 class AbilityProfile(BaseModel):
@@ -308,6 +323,20 @@ def _cli() -> None:
         print("  ✗ level=9 竟然通过了")
     except Exception as e:
         print(f"  ✓ level 越界被拒：{str(e).splitlines()[1].strip()[:60]}")
+
+    # E. ★ 老画像 payload 里带着已下线的 avoid_load_sensory —— 仍要读得出来。
+    #    `extra="forbid"` 会让整份画像 ValidationError，而画像读不出来
+    #    = 这个孩子当天没有计划 —— 一个下线的功能不该有能力把老数据变成不可读。
+    legacy = json.loads(p.model_dump_json())
+    legacy["parent_constraints"] = {"daily_minutes_available": 30,
+                                     "materials_at_home": ["杯子"],
+                                     "avoid_load_sensory": True}
+    try:
+        back = AbilityProfile.model_validate(legacy)
+        print("  ✓ ★ 老画像（带已下线的 avoid_load_sensory）仍能读出来："
+              f"constraints={back.parent_constraints.model_dump()}")
+    except Exception as e:
+        print(f"  ✗ 老画像读不出来：{str(e).splitlines()[1].strip()[:70]}")
 
 
 if __name__ == "__main__":

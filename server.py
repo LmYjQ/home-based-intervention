@@ -66,6 +66,7 @@ import observe
 import vocab
 import redflag
 import store
+import child_age
 import summary as summary_mod
 from activities import PlanRequest, ScoredActivity, candidates as retrieve_candidates
 from activities import explain_retrieval, retrieve
@@ -255,11 +256,29 @@ def _candidate_payload(req: PlanRequest, cands: list[ScoredActivity],
 class ProfileIn(BaseModel):
     child_id: str = "demo-001"
     report_text: str = Field(min_length=1)
-    age_months: int = Field(default=34, ge=0, le=240)
+    # ★ 出生日期取代"手填月龄"。**必填** —— 月龄由系统算，家长只提供事实。
+    #   旧接口那个手填的 age_months 已彻底下线：留着它就留着第二个口径，
+    #   而月龄偏一个月就是活动难度偏一级（偏一级在干预里不是"不合适"，
+    #   是练不到或练过头）。
+    birth_date: str = Field(
+        min_length=10, max_length=10,
+        description="出生日期 YYYY-MM-DD。月龄由系统按它换算。",
+    )
     daily_minutes: int = Field(default=30, ge=5, le=180)
     materials: list[str] = Field(default_factory=lambda: ["杯子", "绘本", "小汽车", "积木"])
-    avoid_load_sensory: bool = True
     no_llm: bool | None = None       # 不传 = 跟随全局开关
+
+
+def _resolve_age_months(birth_date: str) -> int:
+    """出生日期 → 月龄。
+
+    格式不对直接 422 —— 不猜、不静默回退到默认值，
+    因为回退到某个默认月龄意味着**按错的年龄选活动**，而家长毫不知情。
+    """
+    try:
+        return child_age.age_months_from_birth(birth_date)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 class CardIn(BaseModel):
@@ -381,10 +400,13 @@ class RedFlagStatusIn(BaseModel):
 def api_profile(inp: ProfileIn):
     """建档：报告 → 画像。**18-47s，必须走 job**，同步等必然超时。"""
     no_llm = _NO_LLM if inp.no_llm is None else inp.no_llm
+    # ★ 月龄在这里就定下来：出生日期 → 月龄。放在 job **外面**，
+    #   是为了让"出生日期填错"立刻 422，而不是让家长等 40 秒
+    #   才在 job 里面炸掉。
+    age_months = _resolve_age_months(inp.birth_date)
     constraints = ParentConstraints(
         daily_minutes_available=inp.daily_minutes,
         materials_at_home=inp.materials,
-        avoid_load_sensory=inp.avoid_load_sensory,
     )
 
     def work(step):
@@ -394,19 +416,20 @@ def api_profile(inp: ProfileIn):
         if no_llm:
             step("离线模式：用确定性降级画像（可信度 0.1，状态机会冻结全部升级）")
             from profile import _fallback_profile
-            prof = _fallback_profile(inp.child_id, inp.age_months, constraints)
+            prof = _fallback_profile(inp.child_id, age_months, constraints)
             ex = ProfileExtraction(
                 profile=prof, redflags=scan(inp.report_text), degraded=True,
                 note="降级画像：可信度 0.1 —— 低于升级闸门 0.5，状态机将冻结所有升级")
         else:
             step(f"读取报告 {len(inp.report_text)} 字，先跑红旗规则扫描（零 token）")
-            ex = extract_profile(inp.report_text, inp.child_id, inp.age_months,
+            ex = extract_profile(inp.report_text, inp.child_id, age_months,
                                  parent_constraints=constraints, on_step=step)
         step(f"回指校验完成，未通过 {len(ex.unverified)} 条；写库")
         # 顺序不变量：先 ensure_child 再 save_profile —— 后者有外键指向前者。
         # 迁移前这里靠 _IO_LOCK 串行化，迁移后每请求一个独立连接 + 单事务，
         # 由 PostgreSQL 自己保证顺序。
-        store.ensure_child(conn, inp.child_id, age_months=inp.age_months)
+        store.ensure_child(conn, inp.child_id, age_months=age_months,
+                           birth_date=inp.birth_date)
         store.save_profile(conn, ex.profile)
         # ★ 红旗落库（Phase 2）。**放在 ensure_child 之后** ——
         #   red_flags.child_id 有外键指向前者，而 scan() 是更早就跑完的。
@@ -422,6 +445,9 @@ def api_profile(inp: ProfileIn):
             source_kind="report")
         return {
             "profile": _jsonable(ex.profile),
+            "age_months": age_months,
+            "age_text": child_age.age_text(age_months),
+            "birth_date": inp.birth_date,
             "redflags": _jsonable(ex.redflags),
             "red_flag_ids": rf_ids,
             "report_summary": ex.report_summary,
@@ -675,10 +701,16 @@ def api_state(child_id: str):
     conn = _conn()
     prof = store.latest_profile(conn, child_id)
     states = store.current_states(conn, child_id)
+    kid = store.child(conn, child_id) or {}
     return {
         "child_id": child_id,
         "has_profile": prof is not None,
         "profile_confidence": prof.overall_confidence if prof else None,
+        # ★ 年龄：出生日期是事实，月龄是算出来的。
+        #   两者都给前端 —— 前端显示"出生日期"，家长核对的是自己填的那一栏。
+        "birth_date": kid.get("birth_date"),
+        "age_months": kid.get("age_months") if kid else None,
+        "age_text": child_age.age_text(kid["age_months"]) if kid and kid.get("age_months") else None,
         "levels": prof.levels() if prof else {},
         "priority_domains": prof.domains_of_interest() if prof else [],
         "constraints": _jsonable(prof.parent_constraints) if prof else None,

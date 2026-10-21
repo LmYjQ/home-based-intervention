@@ -210,8 +210,91 @@ def main() -> int:
     print("\n[12] 卡片读已生效的那一版计划")
     check_card_follows_plan(c, check)
 
+    # =============================================== 13. 出生日期 → 月龄
+    print("\n[13] 出生日期 → 月龄（建档页不再手填月龄）")
+    check_birth_date(c, check)
+
     print("\n" + ("✓ HTTP 层自检全绿" if ok else "✗ 有失败项，见上"))
     return 0 if ok else 1
+
+
+def check_birth_date(c, check) -> None:
+    """建档页的「月龄」改成「出生日期」，月龄由系统算。
+
+    这一组守三件事：
+      1. 给了出生日期 → 月龄算出来、存下去、**读得回来**（/api/state）
+      2. 出生日期填错 → **立刻 422**，不是静默回退到默认值
+         （回退 = 按错的年龄选活动，而家长毫不知情）
+      3. 旧客户端只传 `age_months` 仍然能用（不把老前端打死）
+
+    另加一条**老数据可读**：`avoid_load_sensory` 这条约束已下线，
+    而老画像的 payload 里带着它 —— 画像读不出来 = 那个孩子当天没有计划。
+    """
+    import store as store_mod
+
+    cid = "http-check-birth"
+    conn = store_mod.connect(DB)
+
+    # ---- 1. 出生日期 → 月龄 ----
+    r = c.post("/api/profile", json={"child_id": cid, "birth_date": "2024-01-15",
+                                     "report_text": "他会说妈妈，要杯子。",
+                                     "daily_minutes": 30, "materials": ["杯子"],
+                                     "no_llm": True})
+    check("/api/profile 200", r.status_code == 200, r.text[:200])
+    res = _await(c, r.json()["job_id"])
+    out = (res or {}).get("result") or {}
+    check("★ 响应里带着算出来的月龄",
+          isinstance(out.get("age_months"), int) and out["age_months"] > 0,
+          out.get("age_months"))
+    check("★ 月龄也给成家长读得懂的说法",
+          isinstance(out.get("age_text"), str) and "岁" in out["age_text"],
+          out.get("age_text"))
+    row = conn.execute("SELECT birth_date, age_months FROM children WHERE child_id=%s",
+                        (cid,)).fetchone()
+    check("★ 出生日期与月龄都落库了",
+          row and row["birth_date"] == "2024-01-15" and row["age_months"] == out["age_months"],
+          dict(row) if row else None)
+    st = c.get(f"/api/state/{cid}").json()
+    check("★ /api/state 读得到出生日期与月龄",
+          st.get("birth_date") == "2024-01-15" and st.get("age_months") == out["age_months"],
+          (st.get("birth_date"), st.get("age_months")))
+    check("★ 画像里的月龄就是算出来的那一份",
+          (st.get("assessments") is not None) and st.get("age_months") == out["age_months"],
+          st.get("age_months"))
+
+    # ---- 2. 出生日期填错 → 立刻 422 ----
+    for bad in ("2026/01/15", "不是日期", "2026-13-01", "2026-02-31"):
+        r = c.post("/api/profile", json={"child_id": cid, "birth_date": bad,
+                                         "report_text": "x", "no_llm": True})
+        check(f"★ 出生日期 {bad!r} → 422（不是静默回退）", r.status_code == 422, r.status_code)
+
+    # ---- 3. 干脆不填 → 422（不猜，也不回退到默认月龄）----
+    r = c.post("/api/profile", json={"child_id": cid, "report_text": "x", "no_llm": True})
+    check("★ 没填出生日期 → 422（没有「默认月龄」这条退路）", r.status_code == 422, r.status_code)
+
+    # ---- 4. ★ 老画像（带已下线的 avoid_load_sensory）仍要读得出来 ----
+    cid3 = "http-check-legacy"
+    store_mod.ensure_child(conn, cid3, name="老画像自检娃", age_months=34)
+    from capabilities import AbilityProfile
+    legacy = AbilityProfile(
+        child_id=cid3, child_age_months=34,
+        assessments=[{"domain": "language", "skill_item": "听懂单词", "level": 3,
+                      "source": "report_stated", "confidence": 0.8}],
+        overall_confidence=0.8,
+    ).model_dump(mode="json")
+    legacy["parent_constraints"]["avoid_load_sensory"] = True      # ★ 老 payload 的那个键
+    conn.execute(
+        "INSERT INTO ability_profile(child_id, created_at, report_date, "
+        "overall_confidence, payload) VALUES(%s, '2026-01-01', NULL, 0.8, %s)",
+        (cid3, json.dumps(legacy, ensure_ascii=False)))
+    conn.commit()
+    r = c.get(f"/api/state/{cid3}")
+    check("★ 老画像（带已下线的 avoid_load_sensory）读得出来",
+          r.status_code == 200 and r.json().get("has_profile") is True, r.status_code)
+    check("★ 老画像里的家长约束照常给前端",
+          r.status_code == 200 and "avoid_load_sensory" not in
+          json.dumps(r.json().get("constraints") or {}, ensure_ascii=False),
+          (r.json().get("constraints") if r.status_code == 200 else None))
 
 
 def check_card_follows_plan(c, check) -> None:
@@ -516,14 +599,17 @@ def check_redflags(c, check) -> None:
 
     # 先建档 —— /api/observe/run 会 `_profile_or_400`，没有画像的孩子走不到观察链。
     # 报告里就带一句自伤，顺带把"第二个写入口"这条一起验了。
-    r = c.post("/api/profile", json={"child_id": cid, "age_months": 34,
+    r = c.post("/api/profile", json={"child_id": cid, "birth_date": "2024-01-15",
                                      "report_text": "他会咬自己的手，最近整夜哭闹。",
                                      "daily_minutes": 30, "materials": ["杯子"],
-                                     "avoid_load_sensory": False, "no_llm": True})
+                                     "no_llm": True})
     res = _await(c, r.json()["job_id"])
     out = (res or {}).get("result") or {}
     check("★ /api/profile 也落红旗（第二个写入口走同一条路）",
           len(out.get("red_flag_ids") or []) == 2, out.get("red_flag_ids"))
+    check("★ 出生日期换算成月龄（2024-01-15 → 今天）",
+          isinstance(out.get("age_months"), int) and out["age_months"] >= 30,
+          out.get("age_months"))
 
     r = c.post("/api/observe/run", json={"child_id": cid, "date": d,
                                          "text": urgent, "no_llm": True})
