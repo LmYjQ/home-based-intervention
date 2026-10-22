@@ -151,31 +151,29 @@ async def _vector_candidates(
 async def expand_with_concepts(query: str) -> list[str]:
     """中文查询桥接到书里的英文术语。
 
-    家长说"引导式参与"，书里写 "guided participation"。术语表就是干这个的：
-    查到中文别名就把英文规范名一起丢进 FTS 查询。
+    家长说"引导式参与"，书里写 "guided participation"。术语表就是干这个的。
 
-    桥接是**加**不是**替**：原文词保留，术语是补充。
+    **桥接逻辑只有一份**，在 :mod:`rdi_agent.rag.query_rewrite` 里。
+    这里保留这个函数是为了兼容旧调用方，但内部转发过去 ——
+    曾经这里和 query_rewrite 各有一份实现，两份的过滤规则还不一样
+    （这里没看 ``is_explicit_in_source``，会把书里不存在的词也桥进去）。
+    """
+    from rdi_agent.rag.query_rewrite import _bridge_concepts
 
-    过滤放在 SQL 里做，不把整张术语表拉回内存再逐条扫 —— 表会随术语增加
-    变大，而每次检索只需要"别名出现在查询里的"那几条。
-    """
-    sql = """
-        SELECT DISTINCT canonical_name_en
-        FROM concept_aliases c
-        WHERE EXISTS (
-            SELECT 1
-            FROM jsonb_array_elements_text(c.aliases_zh_json) AS alias
-            WHERE :q ILIKE '%' || alias || '%'
-        )
-    """
-    async with session_scope() as session:
-        rows = (await session.execute(text(sql), {"q": query})).scalars().all()
-    return [str(r) for r in rows]
+    hits = await _bridge_concepts(query)
+    return [h["canonical_name_en"] for h in hits]
 
 
 async def _fts_candidates(
     query: str, top_k: int, section_code: str | None
 ) -> list[_Candidate]:
+    """关键词召回。
+
+    ``query`` 是**已经改写好的**关键词查询（``query_rewrite`` 负责桥接）。
+    这里**不再自己桥一次** —— 曾经两处各桥一遍，结果是同一个查询被桥接
+    两次，而且两处的过滤规则还不一样（旧的没看 ``is_explicit_in_source``，
+    会把书里不存在的词也塞进去）。
+    """
     sql = (
         _SELECT_COLUMNS
         + """
@@ -183,10 +181,7 @@ async def _fts_candidates(
           AND """
         + REVIEW_FILTER
     )
-    # 中文词先桥接到英文术语，再拼成一个 OR 查询
-    concepts = await expand_with_concepts(query)
-    tsquery = " OR ".join([query, *concepts]) if concepts else query
-    params: dict[str, Any] = {"tsquery": tsquery}
+    params: dict[str, Any] = {"tsquery": query}
     if section_code:
         sql += " AND s.section_code = :section_code"
         params["section_code"] = section_code
@@ -235,11 +230,15 @@ async def search(
     ``kind`` 默认只回子块：子块是召回单元，父块是它的上下文。父块和它的
     子块同时出现在结果里，等于同一段话显示两遍。
     """
+    # 查询改写只做一次：语义路用原话，关键词路用桥接后的
+    from rdi_agent.rag.query_rewrite import rewrite_query
+
+    queries = await rewrite_query(query)
     vector_hits: list[_Candidate] = []
     if use_vector:
-        query_vector = await embeddings.embed_query(query)
+        query_vector = await embeddings.embed_query(queries.semantic_query)
         vector_hits = await _vector_candidates(query_vector, candidate_k, section_code)
-    fts_hits = await _fts_candidates(query, candidate_k, section_code)
+    fts_hits = await _fts_candidates(queries.keyword_query, candidate_k, section_code)
 
     merged = _rrf_merge(vector_hits, fts_hits)
     if kind == "child":

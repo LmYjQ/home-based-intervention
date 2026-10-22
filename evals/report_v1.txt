@@ -1,0 +1,718 @@
+==============================================================================
+检索评测报告
+==============================================================================
+用例 27 条（相关 25 / 无关 2）　错误 0
+
+  Recall@5        88.00%   (目标 >= 0.80)
+  MRR             0.7400
+  页码可定位率    100.00%   (目标 100%)
+  无命中率        0.00%
+  必含术语命中率  56.00%
+  硬凑率(无关题)  100.00%   (目标接近 0)
+
+------------------------------------------------------------------------------
+[OK ] greeting_stranger  (社交退缩)
+  查询：孩子不敢跟人打招呼，看到陌生人就躲
+  [1] 改写   语义=孩子不敢跟人打招呼，看到陌生人就躲
+              关键词=孩子不敢跟人打招呼，看到陌生人就躲 OR greeting
+              桥接=['不敢跟人打招呼 -> greeting']  概念=['greeting']
+  [2] 向量   30 条
+      1. p389 [028_footnotes] 39 This type of behavior may require additional professional
+      2. p177 [010_the_breaking_point] ents to help him master several foundational areas, without 
+      3. p20 [001_introduction] Vivian Vivian is a product of over eight years of intensive 
+  [3] 关键词 6 条
+      1. p33 [003_dynamic_brains] Dynamic Brains The brain is also dynamic, meaning that it is
+      2. p153 [009_guided_participation_t] Pete has Emma positioned in a vertical position between his 
+      3. p238 [014_apprenticeship] I stop just short of the object being within their reach and
+  [4] RRF    合并去重后 21 条
+      1. score=0.01639 向量1/关键词- p389 39 This type of behavior may require additional pr
+      2. score=0.01613 向量2/关键词- p177 ents to help him master several foundational areas
+      3. score=0.01562 向量4/关键词- p166 According to Dr. Peter Hobson, this vignette illus
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p389 [028_footnotes] 向量第1名
+       2. p177 [010_the_breaking_point] 向量第2名
+      *3. p166 [009_guided_participation_t] 向量第4名
+       4. p33 [003_dynamic_brains]  / 关键词第4名
+      *5. p153 [009_guided_participation_t]  / 关键词第5名
+  判定：命中　首个命中排名=3　RR=0.333　期望章节=['013_readiness', '009_guided_participation_the_apprentice', '006_dynamic_departures']
+------------------------------------------------------------------------------
+[OK ] crying_upset  (情绪调节)
+  查询：孩子无缘无故就哭，情绪来了收不住
+  [1] 改写   语义=孩子无缘无故就哭，情绪来了收不住
+              关键词=孩子无缘无故就哭，情绪来了收不住 OR crying
+              桥接=['哭 -> crying']  概念=['crying']
+  [2] 向量   30 条
+      1. p211 [013_readiness] tive feedback loop, where parental anxiety triggers more str
+      2. p212 [013_readiness] ’s distress, extreme passivity, protests, angry words, odd a
+      3. p211 [013_readiness] Some parents may have become unconsciously conditioned to re
+  [3] 关键词 14 条
+      1. p278 [015_guiding] Paulie, now six-years-old, is outside playing with his neigh
+      2. p209 [013_readiness] Often, for what seems like no reason whatsoever, he will get
+      3. p212 [013_readiness] Unless we eliminate this underlying anxiety and avoidance, i
+  [4] RRF    合并去重后 23 条
+      1. score=0.03110 向量1/关键词8 p211 tive feedback loop, where parental anxiety trigger
+      2. score=0.03062 向量2/关键词9 p212 ’s distress, extreme passivity, protests, angry wo
+      3. score=0.02985 向量7/关键词7 p209 My whole life seems to revolve around keeping him 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p211 [013_readiness] 向量第1名 / 关键词第8名
+      *2. p212 [013_readiness] 向量第2名 / 关键词第9名
+      *3. p209 [013_readiness] 向量第7名 / 关键词第7名
+      *4. p209 [013_readiness] 向量第12名 / 关键词第6名
+       5. p24 [001_introduction] 向量第15名 / 关键词第5名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '009_guided_participation_the_apprentice', '010_the_breaking_point']
+------------------------------------------------------------------------------
+[OK ] tantrum_frustration  (情绪调节)
+  查询：孩子发脾气，摔东西尖叫
+  [1] 改写   语义=孩子发脾气，摔东西尖叫
+              关键词=孩子发脾气，摔东西尖叫 OR tantrum
+              桥接=['发脾气 -> tantrum']  概念=['tantrum']
+  [2] 向量   30 条
+      1. p211 [013_readiness] tive feedback loop, where parental anxiety triggers more str
+      2. p177 [010_the_breaking_point] successfully utilizes, hundreds of opportunities that foster
+      3. p166 [009_guided_participation_t] scientists had fifteen-month-olds watch an adult model move 
+  [3] 关键词 13 条
+      1. p211 [013_readiness] Quieting I use the term “quieting” to represent the lifestyl
+      2. p211 [013_readiness] tive feedback loop, where parental anxiety triggers more str
+      3. p209 [013_readiness] Often, for what seems like no reason whatsoever, he will get
+  [4] RRF    合并去重后 21 条
+      1. score=0.03252 向量1/关键词2 p211 tive feedback loop, where parental anxiety trigger
+      2. score=0.02578 向量27/关键词10 p214 a strong signal for the child to stop and monitor 
+      3. score=0.01562 向量4/关键词- p211 Some parents may have become unconsciously conditi
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p211 [013_readiness] 向量第1名 / 关键词第2名
+      *2. p214 [013_readiness] 向量第27名 / 关键词第10名
+      *3. p211 [013_readiness] 向量第4名
+       4. p389 [028_footnotes] 向量第5名
+       5. p124 [008_guided_participation_t]  / 关键词第6名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '010_the_breaking_point', '023_specific_rdi_goals', '009_guided_participation_the_apprentice']
+------------------------------------------------------------------------------
+[OK ] over_prompting  (家长行为)
+  查询：我总是忍不住替他把话说完，帮他把每件事都做了
+  [1] 改写   语义=我总是忍不住替他把话说完，帮他把每件事都做了
+              关键词=我总是忍不住替他把话说完，帮他把每件事都做了
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p209 [013_readiness] Often, for what seems like no reason whatsoever, he will get
+      2. p295 [016_internalizing] tennis partner. Now imagine that the first tennis partner I 
+      3. p235 [014_apprenticeship] relationship as they journey within the task, not whether a 
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 24 条
+      1. score=0.01639 向量1/关键词- p209 Often, for what seems like no reason whatsoever, h
+      2. score=0.01587 向量3/关键词- p235 relationship as they journey within the task, not 
+      3. score=0.01562 向量4/关键词- p185 He cannot soothe himself. His words are empty and 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p209 [013_readiness] 向量第1名
+       2. p234 [014_apprenticeship] 向量第3名
+       3. p185 [010_the_breaking_point] 向量第4名
+       4. p236 [014_apprenticeship] 向量第5名
+       5. p18 [001_introduction] 向量第6名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '008_guided_participation_the_guide', '015_guiding', '022_mental_processes']
+------------------------------------------------------------------------------
+[OK ] no_initiative  (家长行为)
+  查询：孩子不会自己主动做，等着我安排才动
+  [1] 改写   语义=孩子不会自己主动做，等着我安排才动
+              关键词=孩子不会自己主动做，等着我安排才动 OR initiative
+              桥接=['主动 -> initiative']  概念=['initiative']
+  [2] 向量   30 条
+      1. p255 [014_apprenticeship] ched closer and repeated her request within Ben’s zone of co
+      2. p252 [014_apprenticeship] Co-regulatory turn-taking is not like taking turns on a slid
+      3. p390 [028_footnotes] 41 However, with younger children who are determining themse
+  [3] 关键词 30 条
+      1. p252 [014_apprenticeship] In the earliest co-regulatory encounters, we want parent and
+      2. p220 [013_readiness] Sit on the old porch swing. Hang out on the sofa together, l
+      3. p219 [013_readiness] Both hitter and pitcher are re-evaluating and making continu
+  [4] RRF    合并去重后 28 条
+      1. score=0.02863 向量20/关键词2 p220 Sit on the old porch swing. Hang out on the sofa t
+      2. score=0.02814 向量17/关键词6 p252 ts needn’t fit a specific sequence or pattern, but
+      3. score=0.01639 向量1/关键词- p255 ched closer and repeated her request within Ben’s 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p219 [013_readiness] 向量第20名 / 关键词第2名
+      *2. p252 [014_apprenticeship] 向量第17名 / 关键词第6名
+      *3. p255 [014_apprenticeship] 向量第1名
+      *4. p251 [014_apprenticeship] 向量第2名
+       5. p390 [028_footnotes] 向量第3名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['014_apprenticeship', '008_guided_participation_the_guide', '013_readiness']
+------------------------------------------------------------------------------
+[OK ] not_sharing  (同伴互动)
+  查询：孩子抢玩具，不肯跟别的小朋友一起玩
+  [1] 改写   语义=孩子抢玩具，不肯跟别的小朋友一起玩
+              关键词=孩子抢玩具，不肯跟别的小朋友一起玩 OR sharing
+              桥接=['抢玩具 -> sharing']  概念=['sharing']
+  [2] 向量   30 条
+      1. p177 [010_the_breaking_point] successfully utilizes, hundreds of opportunities that foster
+      2. p278 [015_guiding] Paulie, now six-years-old, is outside playing with his neigh
+      3. p295 [016_internalizing] We also do not want to create a match with a child who is mu
+  [3] 关键词 30 条
+      1. p76 [005_dynamic_communication] Experience sharing communication requires a good deal of neu
+      2. p87 [005_dynamic_communication] Dr. Michael Tomasello works at the Max Plank Institute in Ge
+      3. p250 [014_apprenticeship] Internal and External Dialogues Another unique attribute of 
+  [4] RRF    合并去重后 28 条
+      1. score=0.01613 向量2/关键词- p278 Paulie, now six-years-old, is outside playing with
+      2. score=0.01587 向量3/关键词- p295 We also do not want to create a match with a child
+      3. score=0.01562 向量4/关键词- p182 He cannot separate the object from the actions he 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p278 [015_guiding] 向量第2名
+      *2. p295 [016_internalizing] 向量第3名
+       3. p181 [010_the_breaking_point] 向量第4名
+       4. p177 [010_the_breaking_point] 向量第6名
+       5. p370 [023_specific_rdi_goals]  / 关键词第6名
+  判定：命中　首个命中排名=2　RR=0.500　期望章节=['005_dynamic_communication', '014_apprenticeship', '016_internalizing', '009_guided_participation_the_apprentice']
+------------------------------------------------------------------------------
+[OK ] unresponsive  (社交退缩)
+  查询：叫他名字没反应，也不看我
+  [1] 改写   语义=叫他名字没反应，也不看我
+              关键词=叫他名字没反应，也不看我 OR responsiveness
+              桥接=['没反应 -> responsiveness']  概念=['responsiveness']
+  [2] 向量   30 条
+      1. p21 [001_introduction] to obtain desired results—although at times his actions can 
+      2. p180 [010_the_breaking_point] Jackie chuckles and says, “He took a bite! Uhm, yum. Brian. 
+      3. p184 [010_the_breaking_point] Nancy says, “What’s your name?” He answers, “Paulie!” using 
+  [3] 关键词 30 条
+      1. p58 [004_dynamic_intelligence] I refer to the key elements of dynamic intelligence as menta
+      2. p269 [015_guiding] When activities are framed, new challenges introduced by the
+      3. p137 [008_guided_participation_t] Transferring Responsibility Scaffolding describes the manner
+  [4] RRF    合并去重后 31 条
+      1. score=0.01639 向量1/关键词- p21 to obtain desired results—although at times his ac
+      2. score=0.01613 向量2/关键词- p180 Jackie chuckles and says, “He took a bite! Uhm, yu
+      3. score=0.01587 向量3/关键词- p184 Nancy says, “What’s your name?” He answers, “Pauli
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p20 [001_introduction] 向量第1名
+      *2. p179 [010_the_breaking_point] 向量第2名
+      *3. p184 [010_the_breaking_point] 向量第3名
+      *4. p134 [008_guided_participation_t] 向量第4名
+      *5. p177 [010_the_breaking_point] 向量第5名
+  判定：命中　首个命中排名=2　RR=0.500　期望章节=['010_the_breaking_point', '004_dynamic_intelligence', '008_guided_participation_the_guide']
+------------------------------------------------------------------------------
+[MISS] sensory_sensitive  (感觉)
+  查询：孩子怕吵，一点点声音就受不了，也不让人碰
+  [1] 改写   语义=孩子怕吵，一点点声音就受不了，也不让人碰
+              关键词=孩子怕吵，一点点声音就受不了，也不让人碰 OR sensory integration OR fear
+              桥接=['怕吵 -> sensory integration', '怕 -> fear']  概念=['sensory_integration', 'fear']
+  [2] 向量   30 条
+      1. p211 [013_readiness] Quieting I use the term “quieting” to represent the lifestyl
+      2. p214 [013_readiness] at that moment in time, without any directive about how to r
+      3. p211 [013_readiness] tive feedback loop, where parental anxiety triggers more str
+  [3] 关键词 30 条
+      1. p210 [013_readiness] their young child. Sometimes I respond by asking the parent 
+      2. p210 [013_readiness] their young child. Sometimes I respond by asking the parent 
+      3. p37 [003_dynamic_brains] Let’s return for a moment to the vignette I used to begin th
+  [4] RRF    合并去重后 32 条
+      1. score=0.02830 向量24/关键词1 p210 their young child. Sometimes I respond by asking t
+      2. score=0.01587 向量3/关键词- p211 tive feedback loop, where parental anxiety trigger
+      3. score=0.01562 向量4/关键词- p389 39 This type of behavior may require additional pr
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p210 [013_readiness] 向量第24名 / 关键词第1名
+       2. p211 [013_readiness] 向量第3名
+       3. p389 [028_footnotes] 向量第4名
+       4. p213 [013_readiness] 向量第5名
+       5. p216 [013_readiness] 向量第6名
+  判定：未命中　首个命中排名=-　RR=0.000　期望章节=['009_guided_participation_the_apprentice', '014_apprenticeship', '008_guided_participation_the_guide', '003_dynamic_brains']
+------------------------------------------------------------------------------
+[OK ] no_eye_contact  (社交退缩)
+  查询：孩子从不看我的眼睛，眼神总是飘走
+  [1] 改写   语义=孩子从不看我的眼睛，眼神总是飘走
+              关键词=孩子从不看我的眼睛，眼神总是飘走
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p260 [014_apprenticeship] However, I always received A’s in conduct, because I taught 
+      2. p389 [028_footnotes] 39 This type of behavior may require additional professional
+      3. p20 [001_introduction] Vivian gazes over, laughs and holds out her hand to help me 
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 21 条
+      1. score=0.01639 向量1/关键词- p260 However, I always received A’s in conduct, because
+      2. score=0.01613 向量2/关键词- p389 39 This type of behavior may require additional pr
+      3. score=0.01587 向量3/关键词- p20 Vivian gazes over, laughs and holds out her hand t
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p260 [014_apprenticeship] 向量第1名
+       2. p389 [028_footnotes] 向量第2名
+       3. p20 [001_introduction] 向量第3名
+       4. p181 [010_the_breaking_point] 向量第4名
+      *5. p155 [009_guided_participation_t] 向量第5名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['014_apprenticeship', '008_guided_participation_the_guide', '009_guided_participation_the_apprentice']
+------------------------------------------------------------------------------
+[OK ] attention_span  (注意)
+  查询：孩子注意力特别短，玩两分钟就走开
+  [1] 改写   语义=孩子注意力特别短，玩两分钟就走开
+              关键词=孩子注意力特别短，玩两分钟就走开 OR attention
+              桥接=['注意力 -> attention']  概念=['attention']
+  [2] 向量   30 条
+      1. p177 [010_the_breaking_point] successfully utilizes, hundreds of opportunities that foster
+      2. p256 [014_apprenticeship] m becoming mindless or boring, try some of the following: • 
+      3. p181 [010_the_breaking_point] examines a thin package that was placed in his hands. After 
+  [3] 关键词 30 条
+      1. p176 [010_the_breaking_point] Defining Joint Attention Joint attention is a dynamic proces
+      2. p173 [010_the_breaking_point] disorder, why is it that on one day cancer cells that have b
+      3. p326 [019_references_by_chapter] Tomasello, M. (1995). Joint attention as social cognition. I
+  [4] RRF    合并去重后 26 条
+      1. score=0.02624 向量21/关键词12 p267 e child has acquired self-regulatory proficiency, 
+      2. score=0.02402 向量28/关键词19 p176 ited by definition in this way, we would measure s
+      3. score=0.01613 向量2/关键词- p256 m becoming mindless or boring, try some of the fol
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p267 [015_guiding] 向量第21名 / 关键词第12名
+      *2. p176 [010_the_breaking_point] 向量第28名 / 关键词第19名
+      *3. p256 [014_apprenticeship] 向量第2名
+      *4. p176 [010_the_breaking_point]  / 关键词第4名
+       5. p390 [028_footnotes] 向量第6名
+  判定：命中　首个命中排名=2　RR=0.500　期望章节=['008_guided_participation_the_guide', '010_the_breaking_point', '014_apprenticeship']
+------------------------------------------------------------------------------
+[OK ] not_imitating  (学习)
+  查询：孩子从来不模仿我做什么
+  [1] 改写   语义=孩子从来不模仿我做什么
+              关键词=孩子从来不模仿我做什么 OR imitation OR imitating
+              桥接=['模仿 -> imitation', '模仿 -> imitating']  概念=['imitation', 'imitating']
+  [2] 向量   30 条
+      1. p268 [015_guiding] for legible handwriting. This allowed me to concentrate on t
+      2. p182 [010_the_breaking_point] He cannot separate the object from the actions he has learne
+      3. p271 [015_guiding] the car he must pick up a pretend phone, call his mother and
+  [3] 关键词 30 条
+      1. p338 [020_references_by_author] Camaioni, L. (1997). The emergence of intentional communicat
+      2. p323 [019_references_by_chapter] Baldwin, D., Moses, L. (1996). The ontogeny of social inform
+      3. p391 [028_footnotes] 51 Guides make sure that their actions are not predictable, 
+  [4] RRF    合并去重后 35 条
+      1. score=0.01639 向量1/关键词- p268 for legible handwriting. This allowed me to concen
+      2. score=0.01613 向量2/关键词- p182 He cannot separate the object from the actions he 
+      3. score=0.01562 向量4/关键词- p255 ched closer and repeated her request within Ben’s 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p268 [015_guiding] 向量第1名
+       2. p181 [010_the_breaking_point] 向量第2名
+       3. p255 [014_apprenticeship] 向量第4名
+       4. p256 [014_apprenticeship] 向量第5名
+       5. p216 [013_readiness] 向量第6名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['009_guided_participation_the_apprentice', '008_guided_participation_the_guide', '015_guiding']
+------------------------------------------------------------------------------
+[OK ] when_to_intervene  (家长行为)
+  查询：我到底该什么时候介入？等还是马上帮？
+  [1] 改写   语义=我到底该什么时候介入？等还是马上帮？
+              关键词=我到底该什么时候介入？等还是马上帮？
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p208 [013_readiness] The Readiness Stage requires a good deal of care and thought
+      2. p388 [028_footnotes] 25 Reliable pointing for joint attention is not firmly in pl
+      3. p222 [013_readiness] parent each week. Next, think about how much time you are us
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 22 条
+      1. score=0.01639 向量1/关键词- p208 The Readiness Stage requires a good deal of care a
+      2. score=0.01613 向量2/关键词- p388 25 Reliable pointing for joint attention is not fi
+      3. score=0.01587 向量3/关键词- p222 parent each week. Next, think about how much time 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p208 [013_readiness] 向量第1名
+       2. p388 [028_footnotes] 向量第2名
+      *3. p222 [013_readiness] 向量第3名
+       4. p389 [028_footnotes] 向量第4名
+      *5. p221 [013_readiness] 向量第6名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '008_guided_participation_the_guide', '009_guided_participation_the_apprentice', '015_guiding']
+------------------------------------------------------------------------------
+[OK ] generalization  (学习)
+  查询：在家会做的事，换到外面就不会了
+  [1] 改写   语义=在家会做的事，换到外面就不会了
+              关键词=在家会做的事，换到外面就不会了
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p220 [013_readiness] Sit on the old porch swing. Hang out on the sofa together, l
+      2. p223 [013_readiness] He who refuses to embrace a unique opportunity loses the pri
+      3. p94 [006_dynamic_departures] There are very few jobs, if any, that are repetitive, allowi
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 19 条
+      1. score=0.01639 向量1/关键词- p220 Sit on the old porch swing. Hang out on the sofa t
+      2. score=0.01613 向量2/关键词- p223 He who refuses to embrace a unique opportunity los
+      3. score=0.01587 向量3/关键词- p94 There are very few jobs, if any, that are repetiti
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p219 [013_readiness] 向量第1名
+       2. p223 [013_readiness] 向量第2名
+      *3. p94 [006_dynamic_departures] 向量第3名
+       4. p224 [013_readiness] 向量第5名
+       5. p112 [008_guided_participation_t] 向量第6名
+  判定：命中　首个命中排名=3　RR=0.333　期望章节=['022_mental_processes', '014_apprenticeship', '003_dynamic_brains', '006_dynamic_departures']
+------------------------------------------------------------------------------
+[OK ] practice_hours  (家长行为)
+  查询：每天要陪孩子练多久？在家里怎么安排？
+  [1] 改写   语义=每天要陪孩子练多久？在家里怎么安排？
+              关键词=每天要陪孩子练多久？在家里怎么安排？
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p221 [013_readiness] Quieting the Environment While it would be ideal to require 
+      2. p221 [013_readiness] A critical step is learning to stay “in the moment” with the
+      3. p222 [013_readiness] parent each week. Next, think about how much time you are us
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 20 条
+      1. score=0.01613 向量2/关键词- p221 A critical step is learning to stay “in the moment
+      2. score=0.01562 向量4/关键词- p258 Finally, parents are encouraged to engage in regul
+      3. score=0.01538 向量5/关键词- p131 r objective is for the child to coordinate his mov
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p221 [013_readiness] 向量第2名
+       2. p257 [014_apprenticeship] 向量第4名
+      *3. p131 [008_guided_participation_t] 向量第5名
+      *4. p222 [013_readiness] 向量第6名
+      *5. p221 [013_readiness] 向量第7名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '008_guided_participation_the_guide', '004_dynamic_intelligence']
+------------------------------------------------------------------------------
+[MISS] what_is_asd  (背景知识)
+  查询：自闭症谱系障碍的孩子跟别的孩子有什么不一样
+  [1] 改写   语义=自闭症谱系障碍的孩子跟别的孩子有什么不一样
+              关键词=自闭症谱系障碍的孩子跟别的孩子有什么不一样 OR autism spectrum disorder OR peer
+              桥接=['自闭症谱系障碍 -> autism spectrum disorder', '跟别的孩子 -> peer']  概念=['autism_spectrum_disorder', 'peer']
+  [2] 向量   30 条
+      1. p228 [013_readiness] take responsibility for regulating his actions. On the other
+      2. p227 [013_readiness] A listing of potential child obstacles is presented in Appen
+      3. p300 [017_conclusion] underway at the world renowned Tavistock Institute in London
+  [3] 关键词 30 条
+      1. p294 [016_internalizing] “Oh, no” perfectly. (It is important to note that the tone o
+      2. p333 [019_references_by_chapter] Warreyn, P., Roeyers, H., De Groote, I. (2005). Early social
+      3. p342 [020_references_by_author] Giedd, J. (2004). Structural magnetic resonance imaging of t
+  [4] RRF    合并去重后 37 条
+      1. score=0.01613 向量2/关键词- p227 A listing of potential child obstacles is presente
+      2. score=0.01562 向量4/关键词- p228 take responsibility for regulating his actions. On
+      3. score=0.01562 向量-/关键词4 p343 : Developing a treatment program to address the un
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p225 [013_readiness] 向量第2名
+       2. p228 [013_readiness] 向量第4名
+       3. p342 [020_references_by_author]  / 关键词第4名
+       4. p294 [016_internalizing]  / 关键词第5名
+       5. p303 [017_conclusion] 向量第6名
+  判定：未命中　首个命中排名=-　RR=0.000　期望章节=['001_introduction', '004_dynamic_intelligence', '003_dynamic_brains']
+------------------------------------------------------------------------------
+[OK ] what_is_apprenticeship  (背景知识)
+  查询：书里说的学徒期是什么意思
+  [1] 改写   语义=书里说的学徒期是什么意思
+              关键词=书里说的学徒期是什么意思 OR apprenticeship
+              桥接=['学徒期 -> apprenticeship']  概念=['apprenticeship']
+  [2] 向量   30 条
+      1. p149 [009_guided_participation_t] The apprentice role I have been referring to should not be c
+      2. p234 [014_apprenticeship] Apprenticeship Parents of a typically developing child never
+      3. p388 [028_footnotes] 21 Psychologists love to make up their own idiosyncratic nam
+  [3] 关键词 30 条
+      1. p320 [019_references_by_chapter] Rajendran, G., Mitchell, P. (2007). Cognitive theories of au
+      2. p321 [019_references_by_chapter] A: Harvard University Press. Chapter 6: Guided Participation
+      3. p230 [013_readiness] Along with removing obstacles to apprenticeship, we want to 
+  [4] RRF    合并去重后 38 条
+      1. score=0.02778 向量12/关键词12 p104 The Guided Participation Relationship Children’s c
+      2. score=0.02743 向量7/关键词20 p151 Competence Generalized “studying” approach to mana
+      3. score=0.02615 向量17/关键词16 p105 • There is no age limit to apprenticeship. For exa
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p104 [007_the_guided_participati] 向量第12名 / 关键词第12名
+      *2. p150 [009_guided_participation_t] 向量第7名 / 关键词第20名
+      *3. p105 [007_the_guided_participati] 向量第17名 / 关键词第16名
+      *4. p148 [009_guided_participation_t] 向量第28名 / 关键词第19名
+      *5. p149 [009_guided_participation_t] 向量第1名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['007_the_guided_participation_relationship', '014_apprenticeship', '009_guided_participation_the_apprentice']
+------------------------------------------------------------------------------
+[OK ] what_is_readiness  (背景知识)
+  查询：准备期是做什么的？孩子要先达到什么才适合下一阶段
+  [1] 改写   语义=准备期是做什么的？孩子要先达到什么才适合下一阶段
+              关键词=准备期是做什么的？孩子要先达到什么才适合下一阶段
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p208 [013_readiness] Readiness The Readiness Stage provides a systematic, but cus
+      2. p208 [013_readiness] Readiness The Readiness Stage provides a systematic, but cus
+      3. p221 [013_readiness] fore, rather than asking about time for guided participation
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 21 条
+      1. score=0.01639 向量1/关键词- p208 Readiness The Readiness Stage provides a systemati
+      2. score=0.01587 向量3/关键词- p221 fore, rather than asking about time for guided par
+      3. score=0.01538 向量5/关键词- p225 I say to him, “The lawn hasn’t been mowed and you 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p208 [013_readiness] 向量第1名
+      *2. p221 [013_readiness] 向量第3名
+      *3. p225 [013_readiness] 向量第5名
+      *4. p208 [013_readiness] 向量第7名
+      *5. p236 [014_apprenticeship] 向量第8名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['013_readiness', '014_apprenticeship']
+------------------------------------------------------------------------------
+[OK ] what_is_guided_participation  (背景知识)
+  查询：引导式参与到底是什么意思
+  [1] 改写   语义=引导式参与到底是什么意思
+              关键词=引导式参与到底是什么意思 OR guided participation OR guiding OR engagement
+              桥接=['引导式参与 -> guided participation', '引导 -> guiding', '参与 -> engagement']  概念=['guided_participation', 'guiding', 'engagement']
+  [2] 向量   30 条
+      1. p234 [014_apprenticeship] What feelings did you experience when you were working along
+      2. p119 [008_guided_participation_t] Staging Guided Participation Staging is the larger context i
+      3. p104 [007_the_guided_participati] The Guided Participation Relationship Children’s cognitive d
+  [3] 关键词 30 条
+      1. p121 [008_guided_participation_t] All moments of learning are not considered to be equally val
+      2. p124 [008_guided_participation_t] Intrepid soul that he is, Matthew gets right back on the tra
+      3. p105 [007_the_guided_participati] • There is no age limit to apprenticeship. For example, Dr. 
+  [4] RRF    合并去重后 22 条
+      1. score=0.02899 向量8/关键词10 p124 He returns to his mother and opens negotiations: s
+      2. score=0.02369 向量27/关键词22 p221 Quieting the Environment While it would be ideal t
+      3. score=0.01639 向量1/关键词- p234 What feelings did you experience when you were wor
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p124 [008_guided_participation_t] 向量第8名 / 关键词第10名
+       2. p221 [013_readiness] 向量第27名 / 关键词第22名
+       3. p234 [014_apprenticeship] 向量第1名
+      *4. p108 [008_guided_participation_t] 向量第4名
+      *5. p119 [008_guided_participation_t] 向量第5名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['007_the_guided_participation_relationship', '008_guided_participation_the_guide', '001_introduction']
+------------------------------------------------------------------------------
+[OK ] what_is_joint_attention  (背景知识)
+  查询：共同注意是什么概念
+  [1] 改写   语义=共同注意是什么概念
+              关键词=共同注意是什么概念 OR joint attention
+              桥接=['共同注意 -> joint attention']  概念=['joint_attention']
+  [2] 向量   30 条
+      1. p176 [010_the_breaking_point] Defining Joint Attention Joint attention is a dynamic proces
+      2. p176 [010_the_breaking_point] Defining Joint Attention Joint attention is a dynamic proces
+      3. p176 [010_the_breaking_point] ited by definition in this way, we would measure successful 
+  [3] 关键词 30 条
+      1. p176 [010_the_breaking_point] Defining Joint Attention Joint attention is a dynamic proces
+      2. p173 [010_the_breaking_point] disorder, why is it that on one day cancer cells that have b
+      3. p174 [010_the_breaking_point] I believe that if these segments could have been supplemente
+  [4] RRF    合并去重后 24 条
+      1. score=0.03202 向量1/关键词4 p176 Defining Joint Attention Joint attention is a dyna
+      2. score=0.03126 向量5/关键词3 p174 I believe that if these segments could have been s
+      3. score=0.03037 向量3/关键词9 p176 ited by definition in this way, we would measure s
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p176 [010_the_breaking_point] 向量第1名 / 关键词第4名
+      *2. p173 [010_the_breaking_point] 向量第5名 / 关键词第3名
+      *3. p176 [010_the_breaking_point] 向量第3名 / 关键词第9名
+       4. p353 [020_references_by_author] 向量第9名 / 关键词第10名
+       5. p326 [019_references_by_chapter] 向量第10名 / 关键词第11名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['010_the_breaking_point']
+------------------------------------------------------------------------------
+[OK ] what_is_scaffolding  (背景知识)
+  查询：脚手架是什么意思？跟过度提示有什么区别
+  [1] 改写   语义=脚手架是什么意思？跟过度提示有什么区别
+              关键词=脚手架是什么意思？跟过度提示有什么区别 OR over-prompting OR scaffolding
+              桥接=['过度提示 -> over-prompting', '脚手架 -> scaffolding']  概念=['over_prompting', 'scaffolding']
+  [2] 向量   30 条
+      1. p128 [008_guided_participation_t] parked cars, maneuvering to places where he couldn’t reach m
+      2. p272 [015_guiding] Bridging is the process of temporarily taking joint responsi
+      3. p269 [015_guiding] When activities are framed, new challenges introduced by the
+  [3] 关键词 30 条
+      1. p276 [015_guiding] Yeah, but that wasn’t Cheryl’s birthday. Paulie’s face is cu
+      2. p252 [014_apprenticeship] In the earliest co-regulatory encounters, we want parent and
+      3. p269 [015_guiding] When activities are framed, new challenges introduced by the
+  [4] RRF    合并去重后 26 条
+      1. score=0.02921 向量3/关键词15 p269 When activities are framed, new challenges introdu
+      2. score=0.02879 向量8/关键词11 p277 At the restaurant I think we had jello too! This s
+      3. score=0.01562 向量4/关键词- p129 However, proficiency in the activity itself and re
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p269 [015_guiding] 向量第3名 / 关键词第15名
+      *2. p276 [015_guiding] 向量第8名 / 关键词第11名
+      *3. p128 [008_guided_participation_t] 向量第4名
+      *4. p276 [015_guiding]  / 关键词第4名
+       5. p225 [013_readiness] 向量第6名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['008_guided_participation_the_guide', '015_guiding']
+------------------------------------------------------------------------------
+[OK ] what_is_guide  (背景知识)
+  查询：引导者（guide）具体该做什么，不该做什么
+  [1] 改写   语义=引导者（guide）具体该做什么，不该做什么
+              关键词=引导者（guide）具体该做什么，不该做什么 OR guiding
+              桥接=['引导 -> guiding']  概念=['guiding']
+  [2] 向量   30 条
+      1. p114 [008_guided_participation_t] They do not use the term guide interchangeably with teacher,
+      2. p124 [008_guided_participation_t] He returns to his mother and opens negotiations: she will ha
+      3. p119 [008_guided_participation_t] At the edge you see all kinds of things you can’t see from t
+  [3] 关键词 30 条
+      1. p121 [008_guided_participation_t] All moments of learning are not considered to be equally val
+      2. p124 [008_guided_participation_t] Intrepid soul that he is, Matthew gets right back on the tra
+      3. p145 [008_guided_participation_t] How does the dance start? The Guided Participation Relations
+  [4] RRF    合并去重后 25 条
+      1. score=0.03021 向量2/关键词11 p124 He returns to his mother and opens negotiations: s
+      2. score=0.02854 向量16/关键词5 p122 de and apprentice are active co-participants in th
+      3. score=0.02381 向量23/关键词25 p113 What differences stand out when you compare the gu
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p124 [008_guided_participation_t] 向量第2名 / 关键词第11名
+      *2. p121 [008_guided_participation_t] 向量第16名 / 关键词第5名
+      *3. p113 [008_guided_participation_t] 向量第23名 / 关键词第25名
+      *4. p113 [008_guided_participation_t] 向量第1名
+      *5. p119 [008_guided_participation_t] 向量第3名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['008_guided_participation_the_guide', '014_apprenticeship', '013_readiness', '015_guiding']
+------------------------------------------------------------------------------
+[OK ] breaking_point_theory  (背景知识)
+  查询：崩溃点这个说法在书里指什么理论
+  [1] 改写   语义=崩溃点这个说法在书里指什么理论
+              关键词=崩溃点这个说法在书里指什么理论 OR breaking point OR frustration
+              桥接=['崩溃点 -> breaking point', '崩溃 -> frustration']  概念=['breaking_point', 'frustration']
+  [2] 向量   30 条
+      1. p280 [015_guiding] Spotlighting is defined as setting psychological boundaries 
+      2. p172 [010_the_breaking_point] The Breaking Point Parents of a typically developing four-mo
+      3. p71 [004_dynamic_intelligence] 3. You have to finish a book report in two weeks. It will pr
+  [3] 关键词 30 条
+      1. p373 [023_specific_rdi_goals] 7. Responsibility Acting with honesty, integrity and mutuali
+      2. p374 [023_specific_rdi_goals] , to review prior events and extract personally meaningful i
+      3. p362 [022_mental_processes] This is similar to “trying on” their point of view, their su
+  [4] RRF    合并去重后 28 条
+      1. score=0.02896 向量4/关键词15 p360 Evolving is a specific type of expansion, where a 
+      2. score=0.02879 向量8/关键词11 p237 Learning opportunities will become available at un
+      3. score=0.02663 向量21/关键词10 p172 The Breaking Point Parents of a typically developi
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p360 [022_mental_processes] 向量第4名 / 关键词第15名
+       2. p236 [014_apprenticeship] 向量第8名 / 关键词第11名
+      *3. p172 [010_the_breaking_point] 向量第21名 / 关键词第10名
+       4. p373 [023_specific_rdi_goals]  / 关键词第2名
+       5. p362 [022_mental_processes]  / 关键词第3名
+  判定：命中　首个命中排名=3　RR=0.333　期望章节=['010_the_breaking_point']
+------------------------------------------------------------------------------
+[OK ] static_dynamic_brain  (背景知识)
+  查询：静态神经和动态神经有什么区别
+  [1] 改写   语义=静态神经和动态神经有什么区别
+              关键词=静态神经和动态神经有什么区别 OR dynamic neural OR static neural
+              桥接=['动态神经 -> dynamic neural', '静态神经 -> static neural']  概念=['dynamic_neural', 'static_neural']
+  [2] 向量   30 条
+      1. p33 [003_dynamic_brains] These represent two different pathways of neural functioning
+      2. p45 [003_dynamic_brains] Dynamic Neural Functions Neural Function Description Pre-fro
+      3. p53 [004_dynamic_intelligence] Dynamic Intelligence Some readers may have already inferred 
+  [3] 关键词 30 条
+      1. p53 [004_dynamic_intelligence] Dynamic Intelligence Some readers may have already inferred 
+      2. p53 [004_dynamic_intelligence] Dynamic Intelligence Some readers may have already inferred 
+      3. p45 [003_dynamic_brains] Dynamic Neural Functions Neural Function Description Pre-fro
+  [4] RRF    合并去重后 31 条
+      1. score=0.03077 向量5/关键词5 p53 Similarly, the external representation of static n
+      2. score=0.02848 向量21/关键词2 p53 Dynamic Intelligence Some readers may have already
+      3. score=0.02744 向量10/关键词16 p25 time and energy and continues to this day. Neverth
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p53 [004_dynamic_intelligence] 向量第5名 / 关键词第5名
+      *2. p53 [004_dynamic_intelligence] 向量第21名 / 关键词第2名
+       3. p25 [001_introduction] 向量第10名 / 关键词第16名
+      *4. p100 [006_dynamic_departures] 向量第13名 / 关键词第14名
+      *5. p45 [003_dynamic_brains] 向量第12名 / 关键词第19名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['003_dynamic_brains', '004_dynamic_intelligence', '006_dynamic_departures']
+------------------------------------------------------------------------------
+[MISS] emotional_regulation  (情绪调节)
+  查询：孩子情绪调节不好，一点事就崩溃
+  [1] 改写   语义=孩子情绪调节不好，一点事就崩溃
+              关键词=孩子情绪调节不好，一点事就崩溃 OR regulation OR frustration
+              桥接=['情绪调节 -> regulation', '崩溃 -> frustration']  概念=['regulation', 'frustration']
+  [2] 向量   30 条
+      1. p210 [013_readiness] their young child. Sometimes I respond by asking the parent 
+      2. p209 [013_readiness] My whole life seems to revolve around keeping him happy by n
+      3. p209 [013_readiness] Often, for what seems like no reason whatsoever, he will get
+  [3] 关键词 30 条
+      1. p45 [003_dynamic_brains] Dynamic Neural Functions Neural Function Description Pre-fro
+      2. p325 [019_references_by_chapter] Morales, M., Mundy, P., Delgado, C. E. F., Yale, M., Messing
+      3. p165 [009_guided_participation_t] At twelve months Emma possesses what psychologists refer to 
+  [4] RRF    合并去重后 29 条
+      1. score=0.01613 向量2/关键词- p209 My whole life seems to revolve around keeping him 
+      2. score=0.01562 向量4/关键词- p218 Modifying the Contract With Yourself: Expecting to
+      3. score=0.01538 向量5/关键词- p229 he impact of medical conditions, so that the child
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p209 [013_readiness] 向量第2名
+       2. p218 [013_readiness] 向量第4名
+       3. p229 [013_readiness] 向量第5名
+       4. p373 [023_specific_rdi_goals]  / 关键词第5名
+       5. p211 [013_readiness] 向量第6名
+  判定：未命中　首个命中排名=-　RR=0.000　期望章节=['010_the_breaking_point', '003_dynamic_brains', '014_apprenticeship', '012_education']
+------------------------------------------------------------------------------
+[OK ] generalization_detail  (学习)
+  查询：书里讲的泛化（generalization）具体指什么
+  [1] 改写   语义=书里讲的泛化（generalization）具体指什么
+              关键词=书里讲的泛化（generalization）具体指什么 OR generalization
+              桥接=['泛化 -> generalization']  概念=['generalization']
+  [2] 向量   30 条
+      1. p198 [012_education] Progressive Generalization As we move to higher stages in th
+      2. p289 [016_internalizing] Internalizing Although we treat Guiding and Internalizing as
+      3. p129 [008_guided_participation_t] Each tool will be briefly discussed in the next section with
+  [3] 关键词 30 条
+      1. p360 [022_mental_processes] Evolving is a specific type of expansion, where a simpler pr
+      2. p360 [022_mental_processes] Examples of black-and-white thinking are: If it’s not sure h
+      3. p36 [003_dynamic_brains] Dr. Just’s team concludes that, “Individuals with ASD demons
+  [4] RRF    合并去重后 27 条
+      1. score=0.02773 向量21/关键词5 p360 a general conclusion from specific instances, or d
+      2. score=0.01639 向量1/关键词- p198 Progressive Generalization As we move to higher st
+      3. score=0.01613 向量-/关键词2 p360 Examples of black-and-white thinking are: If it’s 
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+      *1. p360 [022_mental_processes] 向量第21名 / 关键词第5名
+       2. p198 [012_education] 向量第1名
+      *3. p360 [022_mental_processes]  / 关键词第2名
+       4. p128 [008_guided_participation_t] 向量第3名
+       5. p284 [015_guiding] 向量第4名
+  判定：命中　首个命中排名=1　RR=1.000　期望章节=['022_mental_processes', '003_dynamic_brains', '006_dynamic_departures', '001_introduction']
+------------------------------------------------------------------------------
+[-- ] irrelevant_cooking  (无关问题)
+  查询：红烧肉怎么做才好吃
+  [1] 改写   语义=红烧肉怎么做才好吃
+              关键词=红烧肉怎么做才好吃
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p275 [015_guiding] last year’s birthday. We did! (Dad laughs) I remember you li
+      2. p274 [015_guiding] place. Well it was a Chinese place, but it still had Sushi. 
+      3. p273 [015_guiding] Right. This year she’s going to be three years old. Last yea
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 22 条
+      1. score=0.01639 向量1/关键词- p275 last year’s birthday. We did! (Dad laughs) I remem
+      2. score=0.01613 向量2/关键词- p274 place. Well it was a Chinese place, but it still h
+      3. score=0.01562 向量4/关键词- p276 ght? Dave realizes that he has to increase his sca
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p273 [015_guiding] 向量第1名
+       2. p273 [015_guiding] 向量第2名
+       3. p276 [015_guiding] 向量第4名
+       4. p273 [015_guiding] 向量第5名
+       5. p110 [008_guided_participation_t] 向量第7名
+  判定：无关问题 —— !! 硬凑了结果（应该返回空）
+------------------------------------------------------------------------------
+[-- ] irrelevant_weather  (无关问题)
+  查询：明天上海天气怎么样
+  [1] 改写   语义=明天上海天气怎么样
+              关键词=明天上海天气怎么样
+              桥接=无  概念=无
+  [2] 向量   30 条
+      1. p225 [013_readiness] 2. We are sitting at the dinner table and there are four Fre
+      2. p133 [008_guided_participation_t] interact in increasingly knowledgeable ways with people who 
+      3. p37 [003_dynamic_brains] Let’s return for a moment to the vignette I used to begin th
+  [3] 关键词 0 条
+  [4] RRF    合并去重后 23 条
+      1. score=0.01639 向量1/关键词- p225 2. We are sitting at the dinner table and there ar
+      2. score=0.01613 向量2/关键词- p133 interact in increasingly knowledgeable ways with p
+      3. score=0.01587 向量3/关键词- p37 Let’s return for a moment to the vignette I used t
+  [5] 重排   未启用（本轮评测未启用重排（--no-rerank））
+  [6] 父块   扩展 5 条
+  [7] 证据   5 条
+       1. p225 [013_readiness] 向量第1名
+       2. p133 [008_guided_participation_t] 向量第2名
+       3. p37 [003_dynamic_brains] 向量第3名
+       4. p276 [015_guiding] 向量第4名
+       5. p273 [015_guiding] 向量第6名
+  判定：无关问题 —— !! 硬凑了结果（应该返回空）
+==============================================================================
