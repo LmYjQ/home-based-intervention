@@ -173,6 +173,14 @@ START -> capture_feedback -> analyze_feedback -> propose_memory_updates
 
 **为什么不用 LangChain Retriever 全家桶**：只使用 Chat Model 和结构化输出。检索、合并、重排、父块扩展全部自己实现，逻辑透明，便于解释和调试。
 
+> **2026-10-22 复核（阶段 2A 落地后）**：重算了一遍行数，结论不变，但补充了实测依据。
+>
+> - 检索相关的代码实际只有 `rag/search.py`（约 310 行），RAG 目录其余约 1980 行是**入库**（解析 / 清洗 / 章节树 / 切块 / embedding / 术语表 / 审核标记）—— 这部分没有框架能替：它由这本书的具体毛病决定（calibre 重排、目录嵌套与页序打架、印刷页码丢失、中文别名表）。
+> - 能被框架替掉的那 310 行，恰好是项目规则最密的地方：Postgres `ts_rank_cd` + pgvector 双路 RRF、52 条中文别名桥接、`parent_chunk_id` 父子扩展、`review_status != needs_correction` 过滤、**每条命中必须带 PDF 页码**。这些在 LangChain / LlamaIndex 里都要覆写，等于拿"看得懂的代码"换"框架胶水 + 平行 schema"。
+> - 2B 的验收是数值目标（Recall@5 ≥ 0.80、页码可定位率 100%），要能解释"某个片段为什么排第 7"，这一点偏向可读的 SQL。
+>
+> **同时纠正一处计划与代码不一致**：本节原写"只使用 Chat Model 和结构化输出"，但实测 `rdi_agent/llm.py` 用的是裸 `openai.AsyncOpenAI`，**全项目没有任何一处 import langchain**。`pyproject.toml` 里的 `langchain-core` / `langchain-openai` 是无效声明（`langchain-core` 会被 langgraph 传递安装，`langchain-openai` 纯属多余）。已改为：保留裸 openai SDK（`json_schema` 约束解码的 A/B 实测是 12/12 合规，而 `json_object` 是 0/12 —— 换框架有把这个结论推翻的风险），并从 `pyproject.toml` 删掉两个 langchain 声明。
+
 ### 3.4 推荐目录
 
 ```text
@@ -1075,7 +1083,12 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 - [ ] 可选：`KEYWORD_BACKEND=paradedb_bm25` 时，安装 ParadeDB `pg_search` 并建 BM25 索引；默认关闭。
 - [x] 建 `concept_aliases`，52 个核心术语（英文规范名 + 中文别名 + 来源 chunk），全部实测在书里出现过。
 - [x] 生成 `ingest_report.json`：页数、成功页、跳过页、父子块数、模型版本、内容哈希、索引版本。
-- [ ] 对评测集和演示会用到的约 50 个片段做人工核对，标记 `review_status='reviewed'`（**待办**）。
+- [x] 人工抽查标记的**机制**（`rag/ingest/review.py`）：标记存 `data/index/chunk_reviews.json`，
+      以**内容哈希**为键，入库重建时回填 —— 否则 `make ingest` 的"先删后建"会把手改的标记全冲掉。
+      提供 `make review-export / review-mark / review-apply / review-list`。
+- [ ] 对评测集和演示会用到的约 50 个片段做**实际人工核对**，标记 `review_status='reviewed'`（**内容仍待办**；
+      机制已就位，`make review-export` 导出候选 -> 人工读 -> `make review-mark` 标记 -> `make review-apply` 写回）。
+      另：检索默认排除 `review_status='needs_correction'`（§5.4 的过滤要求，已实现）。
 - [x] 实现 `python -m rdi_agent.rag.search "查询" --top-k 8`，输出章节、PDF 页码、摘要和相似度。
 
 #### 验收

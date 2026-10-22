@@ -32,6 +32,10 @@ from rdi_agent.rag.ingest import embeddings
 # RRF 的平滑常数。60 是原论文的经验值，对我们这个量级（几百条候选）够用。
 RRF_K = 60
 
+# 召回过滤（计划 §5.4）：标了 needs_correction 的片段不进召回。
+# 两路 SQL 共用这一句 —— 漏了其中一路，坏片段还是会从另一路冒出来。
+REVIEW_FILTER = "c.review_status <> 'needs_correction'"
+
 
 @dataclass
 class SearchHit:
@@ -80,18 +84,57 @@ def _snippet(text_value: str) -> str:
     return text_value[:_SNIPPET_LEN].rstrip() + "…"
 
 
-async def _vector_candidates(
-    query_vector: list[float], top_k: int, section_code: str | None
-) -> list[_Candidate]:
-    sql = """
+# 两路召回共用的列。写两遍就容易改漏一处 —— 上次加 review_status 过滤
+# 就差点只加到一路。
+_SELECT_COLUMNS = """
         SELECT c.id, c.chunk_index, s.section_code, s.title_original,
                c.pdf_page_start, c.pdf_page_end, c.content_original,
                (c.parent_chunk_id IS NULL) AS is_parent,
                c.knowledge_type, c.review_status
         FROM knowledge_chunks c
         JOIN book_sections s ON s.id = c.section_id
-        WHERE c.embedding IS NOT NULL
+"""
+
+
+def _row_to_candidate(row: Any) -> _Candidate:
+    return _Candidate(
+        chunk_id=str(row["id"]),
+        chunk_index=row["chunk_index"],
+        section_code=row["section_code"],
+        section_title=row["title_original"],
+        pdf_page_start=row["pdf_page_start"],
+        pdf_page_end=row["pdf_page_end"],
+        snippet=_snippet(row["content_original"]),
+        is_parent=bool(row["is_parent"]),
+        knowledge_type=row["knowledge_type"],
+        review_status=row["review_status"],
+    )
+
+
+async def _run_candidate_query(
+    sql: str, params: dict[str, Any]
+) -> list[_Candidate]:
+    """跑一路召回的 SQL，返回候选。
+
+    两路（向量 / 关键词）共用：列一样、过滤一样、行转候选的逻辑一样。
     """
+    async with session_scope() as session:
+        rows = (
+            await session.execute(text(sql), params)
+        ).mappings().all()
+    return [_row_to_candidate(row) for row in rows]
+
+
+async def _vector_candidates(
+    query_vector: list[float], top_k: int, section_code: str | None
+) -> list[_Candidate]:
+    sql = (
+        _SELECT_COLUMNS
+        + """
+        WHERE c.embedding IS NOT NULL
+          AND """
+        + REVIEW_FILTER
+    )
     params: dict[str, Any] = {"qv": str(query_vector)}
     if section_code:
         sql += " AND s.section_code = :section_code"
@@ -99,26 +142,7 @@ async def _vector_candidates(
     sql += " ORDER BY c.embedding <=> :qv LIMIT :k"
     params["k"] = top_k
 
-    async with session_scope() as session:
-        rows = (
-            await session.execute(text(sql), params)
-        ).mappings().all()
-    out = []
-    for row in rows:
-        out.append(
-            _Candidate(
-                chunk_id=str(row["id"]),
-                chunk_index=row["chunk_index"],
-                section_code=row["section_code"],
-                section_title=row["title_original"],
-                pdf_page_start=row["pdf_page_start"],
-                pdf_page_end=row["pdf_page_end"],
-                snippet=_snippet(row["content_original"]),
-                is_parent=bool(row["is_parent"]),
-                knowledge_type=row["knowledge_type"],
-                review_status=row["review_status"],
-            )
-        )
+    out = await _run_candidate_query(sql, params)
     for rank, candidate in enumerate(out, start=1):
         candidate.vector_rank = rank
     return out
@@ -131,34 +155,34 @@ async def expand_with_concepts(query: str) -> list[str]:
     查到中文别名就把英文规范名一起丢进 FTS 查询。
 
     桥接是**加**不是**替**：原文词保留，术语是补充。
+
+    过滤放在 SQL 里做，不把整张术语表拉回内存再逐条扫 —— 表会随术语增加
+    变大，而每次检索只需要"别名出现在查询里的"那几条。
+    """
+    sql = """
+        SELECT DISTINCT canonical_name_en
+        FROM concept_aliases c
+        WHERE EXISTS (
+            SELECT 1
+            FROM jsonb_array_elements_text(c.aliases_zh_json) AS alias
+            WHERE :q ILIKE '%' || alias || '%'
+        )
     """
     async with session_scope() as session:
-        rows = (
-            await session.execute(text("SELECT concept_id, canonical_name_en, aliases_zh_json FROM concept_aliases"))
-        ).all()
-    added: list[str] = []
-    lowered = query.lower()
-    for _cid, canonical, aliases in rows:
-        for alias in aliases or []:
-            if not alias:
-                continue
-            if alias.lower() in lowered and canonical not in added:
-                added.append(canonical)
-    return added
+        rows = (await session.execute(text(sql), {"q": query})).scalars().all()
+    return [str(r) for r in rows]
 
 
 async def _fts_candidates(
     query: str, top_k: int, section_code: str | None
 ) -> list[_Candidate]:
-    sql = """
-        SELECT c.id, c.chunk_index, s.section_code, s.title_original,
-               c.pdf_page_start, c.pdf_page_end, c.content_original,
-               (c.parent_chunk_id IS NULL) AS is_parent,
-               c.knowledge_type, c.review_status
-        FROM knowledge_chunks c
-        JOIN book_sections s ON s.id = c.section_id
+    sql = (
+        _SELECT_COLUMNS
+        + """
         WHERE c.content_tsv @@ websearch_to_tsquery('english', :tsquery)
-    """
+          AND """
+        + REVIEW_FILTER
+    )
     # 中文词先桥接到英文术语，再拼成一个 OR 查询
     concepts = await expand_with_concepts(query)
     tsquery = " OR ".join([query, *concepts]) if concepts else query
@@ -169,26 +193,7 @@ async def _fts_candidates(
     sql += " ORDER BY ts_rank_cd(c.content_tsv, websearch_to_tsquery('english', :tsquery)) DESC LIMIT :k"
     params["k"] = top_k
 
-    async with session_scope() as session:
-        rows = (
-            await session.execute(text(sql), params)
-        ).mappings().all()
-    out = []
-    for row in rows:
-        out.append(
-            _Candidate(
-                chunk_id=str(row["id"]),
-                chunk_index=row["chunk_index"],
-                section_code=row["section_code"],
-                section_title=row["title_original"],
-                pdf_page_start=row["pdf_page_start"],
-                pdf_page_end=row["pdf_page_end"],
-                snippet=_snippet(row["content_original"]),
-                is_parent=bool(row["is_parent"]),
-                knowledge_type=row["knowledge_type"],
-                review_status=row["review_status"],
-            )
-        )
+    out = await _run_candidate_query(sql, params)
     for rank, candidate in enumerate(out, start=1):
         candidate.fts_rank = rank
     return out

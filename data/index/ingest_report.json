@@ -5,7 +5,7 @@
   "index_version": "v1",
   "embedding_model": "BAAI/bge-m3",
   "embedding_dim": 1024,
-  "generated_at": "2026-10-22T08:15:26+08:00",
+  "generated_at": "2026-10-22T09:13:54+08:00",
   "pages": {
     "total_pages": 392,
     "parsed_pages": 355,
@@ -72,6 +72,12 @@
   },
   "cleaning": {
     "header_footer_lines_dropped": []
+  },
+  "review": {
+    "file": "chunk_reviews.json",
+    "marked_total": 0,
+    "applied": 0,
+    "stale": []
   },
   "chunker": {
     "parent_target_chars": 2400,

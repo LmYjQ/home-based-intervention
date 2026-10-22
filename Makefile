@@ -1,5 +1,6 @@
 .PHONY: install db-up db-down migrate test dev demo feedback ingest ingest-no-embed \
-        ingest-sections concepts search eval health clean
+        ingest-sections concepts search eval health clean \
+        review-export review-mark review-apply review-list
 
 PY := .venv/bin/python
 PIP := .venv/bin/pip
@@ -53,6 +54,32 @@ ingest-sections:
 # 写入核心术语表（中文别名 -> 书里的英文术语）
 concepts:
 	$(PY) -m rdi_agent.rag.ingest.concepts
+
+# ---- 人工抽查标记（计划 §9.1 第 11 步）----
+# 标记存在 data/index/chunk_reviews.json（进版本库），入库时按内容哈希回填，
+# 所以 make ingest 重建不会把人工核对的结果冲掉。
+
+# 导出待核对的候选片段（默认均匀取样 50 个，覆盖全书各章）
+review-export:
+	$(PY) -m rdi_agent.rag.ingest.review export --limit $(or $(LIMIT),50)
+
+# 标记：make review-mark KEY=sha256:xxx STATUS=reviewed
+#       或 make review-mark CANDIDATES=data/index/review_candidates.jsonl
+review-mark:
+	$(PY) -m rdi_agent.rag.ingest.review mark \
+		$(if $(KEY),--key $(KEY),) \
+		$(if $(CANDIDATES),--candidate-file $(CANDIDATES),) \
+		$(if $(STATUS),--status $(STATUS),) \
+		$(if $(REVIEWER),--reviewer $(REVIEWER),) \
+		$(if $(NOTE),--note $(NOTE),)
+
+# 把标记写回数据库（只 UPDATE review_status，不重新入库、不重算向量）
+review-apply:
+	$(PY) -m rdi_agent.rag.ingest.review apply
+
+# 看标记统计
+review-list:
+	$(PY) -m rdi_agent.rag.ingest.review list
 
 # 检索：make search Q="引导式参与" [TOPK=8] [NOVECTOR=1]
 search:

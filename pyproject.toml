@@ -8,8 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "langgraph>=0.2",
     "langgraph-checkpoint-postgres>=2.0",
-    "langchain-core>=0.3",
-    "langchain-openai>=0.2",
+    # langchain-core 是 langgraph 的硬依赖，会被自动装上；这里不重复声明
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "sqlalchemy[asyncio]>=2.0",

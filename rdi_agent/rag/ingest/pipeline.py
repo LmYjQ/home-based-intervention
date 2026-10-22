@@ -30,7 +30,7 @@ from rdi_agent.config import get_settings
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.models import BookSection, KnowledgeChunk, KnowledgeSource
 from rdi_agent.rag.ingest import chunk as chunker
-from rdi_agent.rag.ingest import clean, embeddings, parse_pdf, sections
+from rdi_agent.rag.ingest import clean, embeddings, parse_pdf, review, sections
 
 SOURCE_ID = "the_rdi_book_2009"
 SOURCE_TITLE = "The RDI Book: Forging New Pathways for Autism, Asperger's and PDD"
@@ -86,8 +86,16 @@ async def write_to_db(
     section_map: sections.SectionMap,
     chunks: list[chunker.Chunk],
     vectors: list[list[float]] | None,
+    marks: dict[int, str] | None = None,
 ) -> dict[str, int]:
-    """把章节和块写进库。父块和子块一起写，子块用 ``parent_chunk_id`` 指回去。"""
+    """把章节和块写进库。父块和子块一起写，子块用 ``parent_chunk_id`` 指回去。
+
+    ``marks`` 是人工抽查标记，{chunk_index: status}（见
+    :mod:`rdi_agent.rag.ingest.review`）。重建会删掉旧行，所以标记必须在
+    重建时**回填** —— 否则人工核对的结果会被下一次入库冲掉。
+    没命中的块一律 ``unreviewed``。
+    """
+    marks = marks or {}
     async with session_scope() as session:
         # 先删干净：重建必须得到同样的条目数
         old_source = (
@@ -159,7 +167,7 @@ async def write_to_db(
                 pdf_page_start=item.pdf_page_start,
                 pdf_page_end=item.pdf_page_end,
                 parse_confidence=1.0,
-                review_status="unreviewed",
+                review_status=marks.get(item.chunk_index, review.STATUS_UNREVIEWED),
                 embedding_model=embeddings_model(),
                 embedding_version=INDEX_VERSION,
             )
@@ -183,7 +191,7 @@ async def write_to_db(
                 pdf_page_start=item.pdf_page_start,
                 pdf_page_end=item.pdf_page_end,
                 parse_confidence=1.0,
-                review_status="unreviewed",
+                review_status=marks.get(item.chunk_index, review.STATUS_UNREVIEWED),
                 embedding_model=embeddings_model(),
                 embedding_version=INDEX_VERSION,
             )
@@ -266,6 +274,10 @@ async def run(
         embedded = len(vectors)
 
     # ---- 6. 写库 ----
+    # 人工抽查标记：重建会删旧行，所以标记在这里回填
+    review_file = review.load_review_file(index_dir / review.REVIEW_FILE_NAME)
+    marks_applied = review.apply_marks_to_chunks(chunks, review_file)
+    stale_marks = review.unmatched_marks(chunks, review_file)
     source = KnowledgeSource(
         source_id=source_id,
         source_type="book",
@@ -279,7 +291,11 @@ async def run(
         version=INDEX_VERSION,
     )
     counts = await write_to_db(
-        source=source, section_map=section_map, chunks=chunks, vectors=vectors
+        source=source,
+        section_map=section_map,
+        chunks=chunks,
+        vectors=vectors,
+        marks=marks_applied,
     )
 
     # ---- 7. 入库报告 ----
@@ -307,6 +323,12 @@ async def run(
         },
         "cleaning": {
             "header_footer_lines_dropped": sorted(drop_lines),
+        },
+        "review": {
+            "file": review.REVIEW_FILE_NAME,
+            "marked_total": len(review_file.marks),
+            "applied": len(marks_applied),
+            "stale": stale_marks,
         },
         "chunker": {
             "parent_target_chars": chunker.PARENT_TARGET_CHARS,
