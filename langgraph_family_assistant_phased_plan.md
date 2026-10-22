@@ -1116,30 +1116,42 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 
 #### 任务
 
-- [ ] `query_rewrite.py`：输入原始问题和 `CaseSummary`，输出 `RetrievalQueries`（语义查询、英文关键词、概念 ID、过滤器）。
-- [ ] `concept_aliases` 扩展：中文“引导式参与” -> `guided participation`，中文“互动复杂度” -> `interaction complexity` 等。
-- [ ] 向量检索：pgvector Top-30，带元数据过滤。
-- [ ] 关键词检索：PostgreSQL 全文检索 Top-30（`websearch_to_tsquery` + `ts_rank_cd`）。
+- [x] `query_rewrite.py`：输入原始问题，输出 `RetrievalQueries`（语义查询、英文关键词、概念 ID、过滤器）。**纯规则 + DB 查询，不调 LLM** —— 评测集要可复现。
+- [x] `concept_aliases` 扩展：补 18 条**日常说法**（打招呼/哭闹/发脾气/不听话/抢玩具/感觉敏感…）。原来的术语表只覆盖术语不覆盖口语。
+- [x] 向量检索：pgvector Top-30，带元数据过滤。
+- [x] 关键词检索：PostgreSQL 全文检索 Top-30（`websearch_to_tsquery` + `ts_rank_cd`）。
 - [ ] 实现 `KeywordSearchBackend` 切换；`paradedb_bm25` 作为可选后端，评测时对比 `postgres_fts` 与 BM25。
-- [ ] RRF 合并去重：`score = sum(1 / (60 + rank))`。
-- [ ] 可选重排：`BAAI/bge-reranker-v2-m3`，失败自动回退 RRF，并记录降级。
-- [ ] 父块扩展：命中子块后加载父块或相邻上下文。
-- [ ] 构建 `EvidenceItem` / `EvidenceBundle`；`summary_zh` 按需生成并缓存。
-- [ ] 建立 `evals/retrieval_cases.jsonl`，至少 25 条中文问题，人工标注期望章节、页码、必含术语、禁止结论。
-- [ ] `evals/run_retrieval.py` 输出 Recall@5、MRR、页码可定位率、无命中率，以及每条失败案例。
+      **本轮未做**：评测显示关键词路**从未单独命中过**（要么和向量路重合，要么为 0），
+      换 BM25 改不了这个瓶颈。待重排收益量化后再判断要不要投入。
+- [x] RRF 合并去重：`score = sum(1 / (60 + rank))`。
+- [x] 可选重排：`BAAI/bge-reranker-v2-m3`，失败自动回退 RRF，并记录降级。
+- [x] 父块扩展：命中子块后加载父块或相邻上下文。
+- [x] 构建 `EvidenceItem` / `EvidenceBundle`；`summary_zh` 按需生成并缓存。
+- [x] 建立 `evals/retrieval_cases.jsonl`，至少 25 条中文问题，人工标注期望章节、必含术语。
+      **27 条**（25 相关 + 2 无关）。标注按**章节**不按页码 —— 这本书讲一个主题会散在好几章。
+- [x] `evals/run_retrieval.py` 输出 Recall@5、MRR、页码可定位率、无命中率，以及每条失败案例。
 - [ ] 调参记录：chunk 大小、overlap、Top-K、是否重排，每次只改一个变量。
+      **基线已存**（`evals/REPORT_v1.md`），后续每次改一个变量重跑一次做对比。
 
-#### 验收
+#### 验收（2026-10-22 实测）
 
-- 25 条评测问题中，Recall@5 达到 0.80 以上（初始目标，记录实际值）。
-- 抽检 20 条返回证据，章节 + PDF 页码可定位率达到 100%。
-- 每条证据都有 `relevance_reason`，不能只有相似度分数。
-- 明显无关的问题返回空证据或低相关标记，不硬凑结果。
-- 关闭 reranker 时仍有可接受的召回，系统能明确显示当前是否降级。
+| 验收项 | 目标 | 实测 | 结论 |
+|---|---|---|---|
+| Recall@5 | ≥ 0.80 | **0.88**（22/25） | 达标 |
+| 章节 + PDF 页码可定位率 | 100% | **100%** | 达标 |
+| 每条证据有 `relevance_reason` | 必须 | 有（含两路名次 + 术语桥接） | 达标 |
+| 明显无关的问题不硬凑 | 接近 0 | **1.00**（2/2 都硬凑了） | **不达标** |
+| 关闭 reranker 仍可接受 | 是 | Recall@5 = 0.88，且降级状态可见 | 达标 |
+
+**不达标项的根因**（详见 `evals/REPORT_v1.md` §5.1）：
+向量检索**永远能返回"最像的"若干条**，哪怕完全不相关 ——
+`ts_rank_cd` 有天然下限，向量路没有。实测相关查询最近邻距离 0.375–0.446、
+无关查询 0.535–0.572，0.50 是分界；但英文问句落在 0.46（同语言导致），
+所以还要靠关键词路配合判断。**阈值需要更多标定点重新标定，不能拍脑袋。**
 
 #### 交付物
 
-可量化、可复现的检索管线 + 25 条检索评测集 + 评测报告。
+可量化、可复现的检索管线 + 27 条检索评测集 + 评测报告（`evals/REPORT_v1.md`）。
 
 ---
 
