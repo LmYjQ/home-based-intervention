@@ -1126,7 +1126,12 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 - [x] RRF 合并去重：`score = sum(1 / (60 + rank))`。
 - [x] 可选重排：`BAAI/bge-reranker-v2-m3`，失败自动回退 RRF，并记录降级。
 - [x] 父块扩展：命中子块后加载父块或相邻上下文。
-- [x] 构建 `EvidenceItem` / `EvidenceBundle`；`summary_zh` 按需生成并缓存。
+- [x] 构建 `EvidenceItem` / `EvidenceBundle`。
+- [ ] `summary_zh` 按需生成并缓存。
+      **未做**（2026-10-22 更正：之前误勾了）。字段 `knowledge_chunks.summary_zh`
+      已在 schema 里，但生成与缓存逻辑没写。计划 §5.3 的策略是"只为进入证据包的
+      6–8 块生成中文摘要"，需要调 LLM，涉及版权边界（摘要是转述，不是原文引用）
+      和缓存失效策略（重新入库后摘要要重算），2C 一起做更合适。
 - [x] 建立 `evals/retrieval_cases.jsonl`，至少 25 条中文问题，人工标注期望章节、必含术语。
       **27 条**（25 相关 + 2 无关）。标注按**章节**不按页码 —— 这本书讲一个主题会散在好几章。
 - [x] `evals/run_retrieval.py` 输出 Recall@5、MRR、页码可定位率、无命中率，以及每条失败案例。
