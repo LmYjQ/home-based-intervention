@@ -202,16 +202,22 @@ async def _fts_candidates(
 def _rrf_merge(
     vector: list[_Candidate], fts: list[_Candidate]
 ) -> list[_Candidate]:
-    """RRF：只看名次，不看分数。两路分数本来就不可比。"""
+    """RRF：只看名次，不看分数。两路分数本来就不可比。
+
+    两路都命中的块要把两边的名次都记下来。注意 ``setdefault`` 返回的是
+    **先放进去的那份**（向量路的），所以名次要显式写回去 —— 只累加分数
+    的话，FTS 路的 ``fts_rank`` 会跟着被丢弃的那份对象一起丢掉，
+    排查召回时就看不出这条是哪路捞上来的。
+    """
     merged: dict[str, _Candidate] = {}
     for candidate in vector:
-        merged.setdefault(candidate.chunk_id, candidate).score += 1.0 / (
-            RRF_K + (candidate.vector_rank or 0)
-        )
+        kept = merged.setdefault(candidate.chunk_id, candidate)
+        kept.vector_rank = candidate.vector_rank
+        kept.score += 1.0 / (RRF_K + (candidate.vector_rank or 0))
     for candidate in fts:
-        merged.setdefault(candidate.chunk_id, candidate).score += 1.0 / (
-            RRF_K + (candidate.fts_rank or 0)
-        )
+        kept = merged.setdefault(candidate.chunk_id, candidate)
+        kept.fts_rank = candidate.fts_rank
+        kept.score += 1.0 / (RRF_K + (candidate.fts_rank or 0))
     return sorted(merged.values(), key=lambda c: c.score, reverse=True)
 
 

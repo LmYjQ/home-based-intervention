@@ -140,3 +140,62 @@ class TestSearchFilter:
         src = inspect.getsource(search)
         # 两处 SQL 都要拼上过滤常量
         assert src.count("REVIEW_FILTER") >= 3  # 1 处定义 + 2 处使用
+
+
+class TestRrfMerge:
+    """RRF 合并的行为。
+
+    回归测试：``setdefault`` 返回的是先放进去的那份（向量路的对象），
+    所以只累加分数的话，FTS 路的 ``fts_rank`` 会跟着被丢弃的那份对象
+    一起丢掉 —— 结果里两路都命中的块只显示向量名次，看不出它是哪路
+    捞上来的。排查召回问题时会误导人。
+    """
+
+    def _candidate(self, chunk_id, vector_rank=None, fts_rank=None):
+        from rdi_agent.rag import search
+
+        return search._Candidate(
+            chunk_id=chunk_id,
+            chunk_index=0,
+            section_code="000",
+            section_title="T",
+            pdf_page_start=1,
+            pdf_page_end=1,
+            snippet="s",
+            is_parent=False,
+            knowledge_type="narrative",
+            review_status="unreviewed",
+            vector_rank=vector_rank,
+            fts_rank=fts_rank,
+        )
+
+    def test_keeps_both_ranks_when_both_paths_hit(self):
+        from rdi_agent.rag import search
+
+        vec = [self._candidate("a", vector_rank=1)]
+        fts = [self._candidate("a", fts_rank=3)]
+        merged = search._rrf_merge(vec, fts)
+        assert len(merged) == 1
+        assert merged[0].vector_rank == 1
+        assert merged[0].fts_rank == 3
+
+    def test_score_sums_both_paths(self):
+        from rdi_agent.rag import search
+
+        vec = [self._candidate("a", vector_rank=1)]
+        fts = [self._candidate("a", fts_rank=3)]
+        merged = search._rrf_merge(vec, fts)
+        expected = 1.0 / (search.RRF_K + 1) + 1.0 / (search.RRF_K + 3)
+        assert merged[0].score == pytest.approx(expected)
+
+    def test_single_path_keeps_its_rank(self):
+        from rdi_agent.rag import search
+
+        merged = search._rrf_merge(
+            [self._candidate("a", vector_rank=2)], [self._candidate("b", fts_rank=1)]
+        )
+        by_id = {c.chunk_id: c for c in merged}
+        assert by_id["a"].vector_rank == 2
+        assert by_id["a"].fts_rank is None
+        assert by_id["b"].fts_rank == 1
+        assert by_id["b"].vector_rank is None
