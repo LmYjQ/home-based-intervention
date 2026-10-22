@@ -196,6 +196,146 @@ async def test_interactions_idempotency_constraint(db):
         )
 
 
+async def test_first_parent_children_link_to_their_parent(db):
+    """第一章子块的 parent_chunk_id 不能丢。
+
+    回归测试：曾经写成 ``chunk_ids.get(item.parent_chunk_index or -1)``，
+    而 ``0 or -1`` 在 Python 里是 -1 —— 第一章的子块（父块序号就是 0）
+    找不到父块 id，parent_chunk_id 变成 NULL。
+
+    后果是双重的：
+    1. 检索里 ``is_parent`` 靠 ``parent_chunk_id IS NULL`` 判定，
+       这些**子块**被当成父块，默认只回子块时就被过滤掉了；
+    2. 父块扩展找不到它们的父块。
+    """
+    from rdi_agent.rag.ingest import chunk as chunker
+    from rdi_agent.rag.ingest import sections
+    from rdi_agent.db.models import KnowledgeSource
+    from rdi_agent.rag.ingest.pipeline import write_to_db
+
+    source_id = "test_first_parent_tmp"
+    source = KnowledgeSource(
+        source_id=source_id,
+        source_type="book",
+        title="Test First Parent",
+        language="en",
+        rights_status="internal_review_only",
+    )
+    section_map = sections.SectionMap(
+        source_id=source_id,
+        pdf="test.pdf",
+        total_pages=10,
+        sections=[
+            sections.Section(
+                section_code="000_test",
+                title="Test Chapter",
+                toc_level=2,
+                pdf_page_start=1,
+                pdf_page_end=5,
+                order=0,
+            )
+        ],
+    )
+    # 一个父块（chunk_index=0）+ 三个子块（parent_chunk_index=0）
+    chunks = [
+        chunker.Chunk(
+            content_original="parent body",
+            content_normalized="parent body",
+            pdf_page_start=1,
+            pdf_page_end=1,
+            chunk_index=0,
+            parent_index=0,
+            is_parent=True,
+            section_code="000_test",
+        )
+    ] + [
+        chunker.Chunk(
+            content_original=f"child body {i}",
+            content_normalized=f"child body {i}",
+            pdf_page_start=2,
+            pdf_page_end=2,
+            chunk_index=i + 1,
+            parent_index=0,
+            is_parent=False,
+            section_code="000_test",
+            parent_chunk_index=0,  # 关键：父块序号是 0
+        )
+        for i in range(3)
+    ]
+
+    await write_to_db(
+        source=source, section_map=section_map, chunks=chunks, vectors=None, marks={}
+    )
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT c.chunk_index, c.parent_chunk_id, p.chunk_index
+                    FROM knowledge_chunks c
+                    JOIN knowledge_sources s ON s.id = c.source_id
+                    LEFT JOIN knowledge_chunks p ON p.id = c.parent_chunk_id
+                    WHERE s.source_id = :sid
+                    ORDER BY c.chunk_index
+                    """
+                ),
+                {"sid": source_id},
+            )
+        ).all()
+
+    # 父块自己没有父；三个子块都必须指向 chunk_index=0 的那个父块
+    assert rows[0][1] is None
+    assert rows[0][2] is None
+    for idx, parent_id, parent_idx in rows[1:]:
+        assert parent_id is not None, f"子块 {idx} 的 parent_chunk_id 丢了"
+        assert parent_idx == 0, f"子块 {idx} 指错了父块（指到 {parent_idx}）"
+
+    # 统计口径：必须是 1 父 3 子
+    async with session_scope() as session:
+        counts = (
+            await session.execute(
+                text(
+                    """
+                    SELECT (c.parent_chunk_id IS NULL) AS is_parent, count(*)
+                    FROM knowledge_chunks c
+                    JOIN knowledge_sources s ON s.id = c.source_id
+                    WHERE s.source_id = :sid
+                    GROUP BY 1
+                    """
+                ),
+                {"sid": source_id},
+            )
+        ).all()
+    assert counts == [(False, 3), (True, 1)]
+
+    # 清理
+    async with session_scope() as session:
+        await session.execute(
+            text(
+                """
+                DELETE FROM knowledge_chunks WHERE source_id IN (
+                    SELECT id FROM knowledge_sources WHERE source_id = :sid
+                )
+                """
+            ),
+            {"sid": source_id},
+        )
+        await session.execute(
+            text(
+                """
+                DELETE FROM book_sections WHERE source_id IN (
+                    SELECT id FROM knowledge_sources WHERE source_id = :sid
+                )
+                """
+            ),
+            {"sid": source_id},
+        )
+        await session.execute(
+            text("DELETE FROM knowledge_sources WHERE source_id = :sid"), {"sid": source_id}
+        )
+
+
 async def test_review_marks_survive_rebuild(db):
     """人工标记在入库重建后必须还在。
 

@@ -181,7 +181,16 @@ async def write_to_db(
             row = KnowledgeChunk(
                 source_id=source.id,
                 section_id=rows[item.section_code].id if item.section_code in rows else None,
-                parent_chunk_id=chunk_ids.get(item.parent_chunk_index or -1),
+                # 注意：不能用 `item.parent_chunk_index or -1`。
+                # `or` 把 0 当假值 —— 第一章的子块（父块序号就是 0）会被
+                # 算成 -1，父块 id 找不到，parent_chunk_id 变成 NULL。
+                # 那样这些子块在检索里会被当成父块（is_parent 靠
+                # parent_chunk_id IS NULL 判定），父块扩展也找不到它们的父块。
+                parent_chunk_id=chunk_ids.get(
+                    item.parent_chunk_index
+                    if item.parent_chunk_index is not None
+                    else -1
+                ),
                 chunk_index=item.chunk_index,
                 content_original=item.content_original,
                 content_normalized=item.content_normalized,

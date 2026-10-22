@@ -174,6 +174,8 @@ START -> capture_feedback -> analyze_feedback -> propose_memory_updates
 **为什么不用 LangChain Retriever 全家桶**：只使用 Chat Model 和结构化输出。检索、合并、重排、父块扩展全部自己实现，逻辑透明，便于解释和调试。
 
 > **2026-10-22 复核（阶段 2A 落地后）**：重算了一遍行数，结论不变，但补充了实测依据。
+> 逐项对照表见 **`docs/RAG_自建vs框架_逐项对照.md`**（11 项自定义 vs 框架的对照，
+> 含"什么情况下这个结论会变"的触发条件，以及每个结论是怎么核对的）。
 >
 > - 检索相关的代码实际只有 `rag/search.py`（约 310 行），RAG 目录其余约 1980 行是**入库**（解析 / 清洗 / 章节树 / 切块 / embedding / 术语表 / 审核标记）—— 这部分没有框架能替：它由这本书的具体毛病决定（calibre 重排、目录嵌套与页序打架、印刷页码丢失、中文别名表）。
 > - 能被框架替掉的那 310 行，恰好是项目规则最密的地方：Postgres `ts_rank_cd` + pgvector 双路 RRF、52 条中文别名桥接、`parent_chunk_id` 父子扩展、`review_status != needs_correction` 过滤、**每条命中必须带 PDF 页码**。这些在 LangChain / LlamaIndex 里都要覆写，等于拿"看得懂的代码"换"框架胶水 + 平行 schema"。
