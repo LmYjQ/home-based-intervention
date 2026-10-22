@@ -86,7 +86,7 @@ search:
 	$(PY) -m rdi_agent.rag.search "$(Q)" --top-k $(or $(TOPK),8) $(if $(NOVECTOR),--no-vector,)
 
 eval:
-	$(PY) -m evals.run_retrieval --cases evals/retrieval_cases.jsonl --report data/index/eval_report.json
+	$(PY) -m evals.run_retrieval --cases evals/retrieval_cases.jsonl --json data/index/eval_report.json
 
 health:
 	curl -s localhost:8000/health | python -m json.tool
