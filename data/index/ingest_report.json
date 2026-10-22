@@ -5,7 +5,7 @@
   "index_version": "v1",
   "embedding_model": "BAAI/bge-m3",
   "embedding_dim": 1024,
-  "generated_at": "2026-10-22T09:47:24+08:00",
+  "generated_at": "2026-10-22T10:05:43+08:00",
   "pages": {
     "total_pages": 392,
     "parsed_pages": 355,
@@ -68,7 +68,7 @@
     "total": 1049,
     "parents": 251,
     "children": 798,
-    "embedded": 0
+    "embedded": 1049
   },
   "cleaning": {
     "header_footer_lines_dropped": []
