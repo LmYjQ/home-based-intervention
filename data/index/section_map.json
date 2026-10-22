@@ -1,0 +1,330 @@
+{
+  "source_id": "the_rdi_book_2009",
+  "pdf": "data/documents/the_rdi_book.pdf",
+  "total_pages": 392,
+  "notes": [
+    "APPENDICIES(p356) 与下一条同页，区间按 1 页计",
+    "起始页(p17)在父级 PART ONE: Setting the Stage for RDI(p31) 之前 —— 目录页码与嵌套不一致，父级按目录保留，待人工确认"
+  ],
+  "sections": [
+    {
+      "section_code": "000_preface",
+      "title": "Preface",
+      "toc_level": 1,
+      "pdf_page_start": 13,
+      "pdf_page_end": 16,
+      "order": 0,
+      "parent_code": null,
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "001_introduction",
+      "title": "Introduction",
+      "toc_level": 2,
+      "pdf_page_start": 17,
+      "pdf_page_end": 30,
+      "order": 1,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": "起始页(p17)在父级 PART ONE: Setting the Stage for RDI(p31) 之前 —— 目录页码与嵌套不一致，父级按目录保留，待人工确认",
+      "title_zh": null
+    },
+    {
+      "section_code": "002_part_one_setting_the_stage_for_rdi",
+      "title": "PART ONE: Setting the Stage for RDI",
+      "toc_level": 1,
+      "pdf_page_start": 31,
+      "pdf_page_end": 31,
+      "order": 2,
+      "parent_code": null,
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "003_dynamic_brains",
+      "title": "Dynamic Brains",
+      "toc_level": 2,
+      "pdf_page_start": 32,
+      "pdf_page_end": 51,
+      "order": 3,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "004_dynamic_intelligence",
+      "title": "Dynamic Intelligence",
+      "toc_level": 2,
+      "pdf_page_start": 52,
+      "pdf_page_end": 73,
+      "order": 4,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "005_dynamic_communication",
+      "title": "Dynamic Communication",
+      "toc_level": 2,
+      "pdf_page_start": 74,
+      "pdf_page_end": 90,
+      "order": 5,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "006_dynamic_departures",
+      "title": "Dynamic Departures",
+      "toc_level": 2,
+      "pdf_page_start": 91,
+      "pdf_page_end": 102,
+      "order": 6,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "007_the_guided_participation_relationship",
+      "title": "The Guided Participation Relationship",
+      "toc_level": 2,
+      "pdf_page_start": 103,
+      "pdf_page_end": 106,
+      "order": 7,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "008_guided_participation_the_guide",
+      "title": "Guided Participation: The Guide",
+      "toc_level": 2,
+      "pdf_page_start": 107,
+      "pdf_page_end": 146,
+      "order": 8,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "009_guided_participation_the_apprentice",
+      "title": "Guided Participation: The Apprentice",
+      "toc_level": 2,
+      "pdf_page_start": 147,
+      "pdf_page_end": 170,
+      "order": 9,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "010_the_breaking_point",
+      "title": "The Breaking Point",
+      "toc_level": 2,
+      "pdf_page_start": 171,
+      "pdf_page_end": 188,
+      "order": 10,
+      "parent_code": "002_part_one_setting_the_stage_for_rdi",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "011_part_two_the_rdi_program",
+      "title": "PART TWO: The RDI® Program",
+      "toc_level": 1,
+      "pdf_page_start": 189,
+      "pdf_page_end": 189,
+      "order": 11,
+      "parent_code": null,
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "012_education",
+      "title": "Education",
+      "toc_level": 2,
+      "pdf_page_start": 190,
+      "pdf_page_end": 206,
+      "order": 12,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "013_readiness",
+      "title": "Readiness",
+      "toc_level": 2,
+      "pdf_page_start": 207,
+      "pdf_page_end": 232,
+      "order": 13,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "014_apprenticeship",
+      "title": "Apprenticeship",
+      "toc_level": 2,
+      "pdf_page_start": 233,
+      "pdf_page_end": 264,
+      "order": 14,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "015_guiding",
+      "title": "Guiding",
+      "toc_level": 2,
+      "pdf_page_start": 265,
+      "pdf_page_end": 287,
+      "order": 15,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "016_internalizing",
+      "title": "Internalizing",
+      "toc_level": 2,
+      "pdf_page_start": 288,
+      "pdf_page_end": 297,
+      "order": 16,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "017_conclusion",
+      "title": "Conclusion",
+      "toc_level": 2,
+      "pdf_page_start": 298,
+      "pdf_page_end": 304,
+      "order": 17,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "018_recommended_reading",
+      "title": "Recommended Reading",
+      "toc_level": 2,
+      "pdf_page_start": 305,
+      "pdf_page_end": 307,
+      "order": 18,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "019_references_by_chapter",
+      "title": "References by Chapter",
+      "toc_level": 2,
+      "pdf_page_start": 308,
+      "pdf_page_end": 334,
+      "order": 19,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "020_references_by_author",
+      "title": "References By Author",
+      "toc_level": 2,
+      "pdf_page_start": 335,
+      "pdf_page_end": 355,
+      "order": 20,
+      "parent_code": "011_part_two_the_rdi_program",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "021_appendicies",
+      "title": "APPENDICIES",
+      "toc_level": 1,
+      "pdf_page_start": 356,
+      "pdf_page_end": 356,
+      "order": 21,
+      "parent_code": null,
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "022_mental_processes",
+      "title": "Mental Processes",
+      "toc_level": 2,
+      "pdf_page_start": 356,
+      "pdf_page_end": 364,
+      "order": 22,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "023_specific_rdi_goals",
+      "title": "Specific RDI Goals",
+      "toc_level": 2,
+      "pdf_page_start": 365,
+      "pdf_page_end": 374,
+      "order": 23,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "024_some_potential_child_obstacles_to_appren",
+      "title": "Some Potential Child Obstacles to Apprenticeship",
+      "toc_level": 2,
+      "pdf_page_start": 375,
+      "pdf_page_end": 377,
+      "order": 24,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "025_sample_early_dynamic_intelligence_discov",
+      "title": "Sample Early Dynamic Intelligence Discoveries that Parallel the Parent Guiding Stage",
+      "toc_level": 2,
+      "pdf_page_start": 378,
+      "pdf_page_end": 380,
+      "order": 25,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "026_sample_elaborations",
+      "title": "Sample Elaborations",
+      "toc_level": 2,
+      "pdf_page_start": 381,
+      "pdf_page_end": 382,
+      "order": 26,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "027_about_dr_gutstein",
+      "title": "About Dr. Gutstein",
+      "toc_level": 2,
+      "pdf_page_start": 383,
+      "pdf_page_end": 384,
+      "order": 27,
+      "parent_code": "021_appendicies",
+      "note": null,
+      "title_zh": null
+    },
+    {
+      "section_code": "028_footnotes",
+      "title": "FOOTNOTES",
+      "toc_level": 1,
+      "pdf_page_start": 385,
+      "pdf_page_end": 392,
+      "order": 28,
+      "parent_code": null,
+      "note": null,
+      "title_zh": null
+    }
+  ]
+}

@@ -30,7 +30,11 @@ frontend/dist/
 
 # ---------------------------------------------------------------- RDI Agent 重建
 data/documents/
-data/index/
+# data/index/ 下大部分是中间产物（pages.jsonl 等），不进版本库；
+# 但章节树和入库报告是半人工的交付物 —— 人工改过的边界不能丢
+data/index/*
+!data/index/section_map.json
+!data/index/ingest_report.json
 *.pdf
 *.mobi
 /*.png

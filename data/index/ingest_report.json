@@ -1,0 +1,82 @@
+{
+  "source_id": "the_rdi_book_2009",
+  "pdf": "data/documents/the_rdi_book.pdf",
+  "content_hash": "9ee67b02c567bd3465cafcbf1d2db908f21e12488f215adf4d28d072eeede287",
+  "index_version": "v1",
+  "embedding_model": "BAAI/bge-m3",
+  "embedding_dim": 1024,
+  "generated_at": "2026-10-22T08:15:26+08:00",
+  "pages": {
+    "total_pages": 392,
+    "parsed_pages": 355,
+    "skipped_pages": 37,
+    "skipped_detail": {
+      "no_text_layer": [
+        1,
+        4,
+        5,
+        8,
+        11,
+        13,
+        17,
+        31,
+        44,
+        47,
+        189,
+        226,
+        305,
+        308,
+        335,
+        383,
+        385
+      ],
+      "section_label_page": [
+        32,
+        52,
+        74,
+        91,
+        103,
+        107,
+        147,
+        171,
+        190,
+        207,
+        233,
+        265,
+        288,
+        298,
+        356,
+        365,
+        375,
+        378,
+        381
+      ],
+      "too_short": [
+        366
+      ]
+    },
+    "total_chars": 635873
+  },
+  "sections": {
+    "count": 29,
+    "notes": [
+      "APPENDICIES(p356) 与下一条同页，区间按 1 页计",
+      "起始页(p17)在父级 PART ONE: Setting the Stage for RDI(p31) 之前 —— 目录页码与嵌套不一致，父级按目录保留，待人工确认"
+    ]
+  },
+  "chunks": {
+    "total": 1049,
+    "parents": 251,
+    "children": 798,
+    "embedded": 0
+  },
+  "cleaning": {
+    "header_footer_lines_dropped": []
+  },
+  "chunker": {
+    "parent_target_chars": 2400,
+    "child_target_chars": 500,
+    "child_overlap_chars": 150
+  },
+  "rights_status": "internal_review_only"
+}

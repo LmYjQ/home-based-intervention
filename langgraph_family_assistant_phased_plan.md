@@ -988,6 +988,45 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
    换成了 **async 替身**而全绿 —— 测的根本不是线上那个函数。
    结论：替身必须和真身同签名（同步的别写成 async，async 的别写成同步）。
 
+#### 2A 落地记录（2026-10-22）
+
+实测数字：392 页 → 解析 355 / 跳过 37（17 页无文字层、20 页是
+"Chapter One" 这种章节标签页）；29 个章节；父块 251（均 2485 字符）、
+子块 798（均 1310 字符）。重跑两次条目数完全一致，重建可复现。
+
+**踩到并解决的坑**：
+
+1. **印刷页码拿不到**。calibre 重排时把原书页码丢了 —— 全书 392 页里只有
+   1 行是纯数字（315 页的 "287"），不足以反推。`print_page_*` 一律置空，
+   检索结果只承诺"能按 PDF 页码翻回去"。
+2. **章节树的页码和嵌套对不上**。目录把 `Introduction`(p17) 挂在
+   `PART ONE`(p31) 下面，页码比父级还小。规则拆成两套：**页序**定页区间
+   （Part 因此只覆盖自己那页分隔页），**目录嵌套**定父子，不一致的写进
+   `section_map.json` 的 `notes` 等人工确认。
+3. **术语表按书里的真实用词重建**。原先照抄 RDI 通用词汇，结果
+   `affective perspective`、`unit of attention`、`engagement cycle`、
+   `functional play` 在这本书里**一次都没出现**；书里实际说的是
+   `parent-child engagement`、`over-prompting`、`participation relationship`。
+   拿全书词频统计 + 上下文核对后重建 52 条，**每条都实测在正文里出现过**
+   （`is_explicit_in_source` 是算出来的，不是人工断言）。
+   把书里没有的词塞进查询扩展，只会把检索带偏。
+4. **ORM 撞生成列**。`content_tsv` 在库里是 `GENERATED ALWAYS AS ... STORED`，
+   ORM 当普通列插值直接被 PG 拒。ORM 侧改成 `Computed` 才写得进去。
+5. **硬换行**。calibre 重排后正文每 70~80 字符换行，句子被拦腰截断。
+   清洗按"空行分段、块内接回"处理；行尾连字符全书只有 96 处，逐条看过
+   全是真连字符（`hyper-` / `seven-year-olds`），所以保留连字符不补空格。
+
+**卡住的一步（需要人拍板）**：`make ingest` 里的 embedding 环节要把书的
+正文发给 SiliconFlow（`BAAI/bge-m3`）。计划 §9.1 自己要求写这个模型的
+向量，配置里 `llm_base_url` 也指向 SiliconFlow，所以这是既定设计；但计划
+§2.1 又写了"书籍只在本地使用"。自动化权限按版权风险拦了这一步，本地
+已跑通的是 `--no-embed` 版本（解析 + 切块 + 关键词索引 + 术语表），
+FTS 检索可用，向量路要等人决定后补跑。
+
+**关于"书里没有的词"的一处提醒**：检索走 FTS 时用的是 `to_tsvector('english')`，
+所以中文查询必须先经术语表桥接成英文词，否则命中不了 —— `rag/search.py` 里
+的 `expand_with_concepts()` 就是干这个的。
+
 #### 怎么手动测
 
 ```bash
@@ -1023,19 +1062,21 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 
 #### 任务
 
-- [ ] 登记 `knowledge_sources`：`the_rdi_book_2009`，`rights_status='internal_review_only'`。
-- [ ] `parse_pdf.py`：逐页抽取，保存 PDF 页码、原始文本、字符数；字符数异常低的页面记录到 `skipped_pages`。
-- [ ] `sections.py`：用目录 + 标题样式生成章节树，输出 `data/index/section_map.json`。
-- [ ] 人工抽查章节边界：Part、Chapter、附录、案例是否被拆错；修正 `section_map.json`。
-- [ ] `chunk.py`：父子块切分，写 `knowledge_chunks`；子块保留 `parent_chunk_id`。
-- [ ] 清洗文本：断词、页眉页脚、页码、连字符；原文和规范化文本分开。
-- [ ] 建立 `content_tsv` 生成列 + GIN 索引，写入 `content_normalized` 和章节标题。
+- [x] 登记 `knowledge_sources`：`the_rdi_book_2009`，`rights_status='internal_review_only'`。
+- [x] `parse_pdf.py`：逐页抽取，保存 PDF 页码、原始文本、字符数；字符数异常低的页面记录到 `skipped_pages`。
+- [x] `sections.py`：用目录生成章节树，输出 `data/index/section_map.json`。
+- [ ] 人工抽查章节边界（程序已核对：29 个区间的页码连续无缺口；**人工过一遍 `section_map.json` 仍待办**）。
+- [x] `chunk.py`：父子块切分，写 `knowledge_chunks`；子块保留 `parent_chunk_id`。
+- [x] 清洗文本：断词、页眉页脚、页码、连字符；原文和规范化文本分开。
+- [x] 建立 `content_tsv` 生成列 + GIN 索引（阶段 0 的 001 迁移已建；ORM 侧改成 `Computed` 才能正常 INSERT）。
 - [ ] 建立 pgvector `embedding vector(1024)` + HNSW 索引，写入 `BAAI/bge-m3` 向量和元数据。
+      **卡在授权**：这一步要把书的正文发给 SiliconFlow 做向量化，
+      自动化权限按版权风险拦下了 —— 见下面「2A 落地记录」。
 - [ ] 可选：`KEYWORD_BACKEND=paradedb_bm25` 时，安装 ParadeDB `pg_search` 并建 BM25 索引；默认关闭。
-- [ ] 建 `concept_aliases`，先整理 30–50 个核心术语（英文规范名 + 中文别名 + 来源 chunk）。
-- [ ] 生成 `ingest_report.json`：页数、成功页、跳过页、父子块数、模型版本、内容哈希、索引版本。
-- [ ] 对评测集和演示会用到的约 50 个片段做人工核对，标记 `review_status='reviewed'`。
-- [ ] 实现 `python -m rdi_agent.rag.search "查询" --top-k 8`，输出章节、PDF 页码、摘要和相似度。
+- [x] 建 `concept_aliases`，52 个核心术语（英文规范名 + 中文别名 + 来源 chunk），全部实测在书里出现过。
+- [x] 生成 `ingest_report.json`：页数、成功页、跳过页、父子块数、模型版本、内容哈希、索引版本。
+- [ ] 对评测集和演示会用到的约 50 个片段做人工核对，标记 `review_status='reviewed'`（**待办**）。
+- [x] 实现 `python -m rdi_agent.rag.search "查询" --top-k 8`，输出章节、PDF 页码、摘要和相似度。
 
 #### 验收
 

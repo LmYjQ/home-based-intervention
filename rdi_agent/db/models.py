@@ -17,6 +17,7 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Computed,
     DateTime,
     ForeignKey,
     Index,
@@ -120,7 +121,13 @@ class KnowledgeChunk(Base):
     chunk_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     content_original: Mapped[str] = mapped_column(Text, nullable=False)
     content_normalized: Mapped[str] = mapped_column(Text, nullable=False)
-    content_tsv: Mapped[Any] = mapped_column(TSVECTOR)
+    # 生成列：值由 Postgres 算，不能也不能往里写。
+    # 必须声明成 Computed，否则 SQLAlchemy 会把它塞进 INSERT，PG 直接报错
+    # "cannot insert a non-DEFAULT value into column content_tsv"。
+    content_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        Computed("to_tsvector('english', coalesce(content_normalized, ''))", persisted=True),
+    )
     embedding: Mapped[Any] = mapped_column(Vector(1024))
     summary_zh: Mapped[str | None] = mapped_column(Text)
     knowledge_type: Mapped[str] = mapped_column(String(32), default="unknown")
