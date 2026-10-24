@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from rdi_agent.rag.ingest.clean import normalize
+from rdi_agent.rag.ingest.clean import _CJK_CHAR, normalize, normalize_zh
 
 # 父块目标长度（字符）
 PARENT_TARGET_CHARS = 2400
@@ -44,6 +44,14 @@ _PARAGRAPH_SEP = "\n\n"
 
 # 句子边界：句号后跟空格、问号、叹号
 _SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+# 中文句末标点。中文**没有**"句号后跟空格"这个模式 ——
+# 句号紧跟着下一个句子，所以英文那套 ``(?<=[.!?])\s+`` 对中文一句都切不开。
+#
+# 中文句末标点：。！？；以及右括号（条目编号结束）。
+# 分号也算句末 —— 指南里"前因干预。通过…；替代行为训练。通过…"这种
+# 分号分句很常见，不切的话超长段落只能按硬长度切，切点落在句中间。
+_CJK_SENTENCE_END = re.compile(r"(?<=[。！？；])(?![”』」）)])")
 
 
 @dataclass
@@ -81,16 +89,40 @@ def split_paragraphs(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _split_sentences(text: str) -> list[str]:
+    """按句子边界切。
+
+    **中英文分别处理**：英文靠"句号后跟空格"，中文靠句末标点。
+    两套正则不能合并成一个 —— 中文句号后面**没有空格**，
+    英文句号后面**有空格**，混在一起会切出一堆空串。
+
+    句末标点本身留在句子的**末尾**（不切掉），所以拼回去的时候
+    标点不会丢。
+    """
+    if not text:
+        return []
+    sentences = _SENTENCE_END.split(text)
+    out: list[str] = []
+    for part in sentences:
+        if not part:
+            continue
+        out.extend(s for s in _CJK_SENTENCE_END.split(part) if s)
+    return out
+
+
 def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
     """超长段落按句子边界拆开。拆不动就按硬长度切。"""
     if len(text) <= max_chars:
         return [text]
     pieces: list[str] = []
     buffer = ""
-    for sentence in _SENTENCE_END.split(text):
+    for sentence in _split_sentences(text):
         if not sentence:
             continue
-        candidate = f"{buffer} {sentence}".strip() if buffer else sentence
+        # 中文句子之间**不能补空格** —— 补了会在正文中插进无意义的空格，
+        # 而且和分词后的内容对不上（分词结果里也没有这个空格）。
+        joiner = "" if _is_cjk(sentence) else " "
+        candidate = f"{buffer}{joiner}{sentence}" if buffer else sentence
         if len(candidate) <= max_chars:
             buffer = candidate
             continue
@@ -103,6 +135,12 @@ def _split_long_paragraph(text: str, max_chars: int) -> list[str]:
     if buffer:
         pieces.append(buffer)
     return pieces
+
+
+def _is_cjk(text: str) -> bool:
+    """文本里有没有汉字。用来决定句子之间要不要补空格。"""
+    return bool(_CJK_CHAR.search(text))
+
 
 
 def _group(items: list[_Item], target: int, max_chars: int) -> list[list[_Item]]:
@@ -190,7 +228,11 @@ def _overlap_of(group: list[_Item], max_chars: int) -> list[_Item]:
     # 开头对齐到句子边界：找第一个句末标点，在它后面切
     if picked:
         head = picked[0]
-        match = next(_SENTENCE_END.finditer(head.text), None)
+        # 中英文的句末边界不一样，先试中文的（中文句末标点是零宽的，
+        # ``finditer`` 匹配到的是标点**后面**的位置），再试英文的。
+        match = next(_CJK_SENTENCE_END.finditer(head.text), None)
+        if match is None:
+            match = next(_SENTENCE_END.finditer(head.text), None)
         if match is not None and match.end() <= len(head.text) // 2:
             head = _Item(page=head.page, text=head.text[match.end():])
             picked[0] = head
@@ -255,13 +297,90 @@ def classify(
 ) -> str:
     """给块标一个知识类型。检索侧可以据此调整权重。"""
     lowered = text[:400].lower()
-    if "references by" in section_title.lower() or section_title.lower().startswith("references"):
+    title = section_title.lower()
+    if "references by" in title or title.startswith("references"):
         return "reference"
+    # 中文指南没有参考文献章节，但"名词解释"这一节是定义性的 ——
+    # 标成 definition，检索时家长问"什么是挑战性行为"能优先命中。
+    if "名词解释" in section_title:
+        return "definition"
     if in_appendix:
         return "appendix"
     if "reflection question" in lowered:
         return "reflection"
     return "narrative"
+
+
+def _chunk_atomic(
+    items: list[_Item],
+    *,
+    section_code: str,
+    section_title: str,
+    in_appendix: bool,
+    start_index: int,
+    normalizer,
+) -> list[Chunk]:
+    """每个 item 一个块，不合并。
+
+    **父块怎么办**：这里**不生成父块** —— 表格行本身就是完整语义，
+    父块只是"把这些行拼起来"，对召回没有增量价值，还会占掉候选位。
+
+    但父块是**引用给家长看**的载体（父块扩展会拿它当原文），
+    所以保留一个父块，把所有行拼起来，子块都指回它。
+
+    **重叠怎么办**：不重叠。表格行是并列关系（不同的策略），
+    不是承接关系 —— 前一行不是后一行的上下文。重叠在这里只有坏处：
+    每一行都会带上上一行的内容，向量被污染，关键词路命中也会串。
+
+    **超长的行怎么办**：太长的行（比如附件 3 里那段几百字的
+    "获得具体实物或机会的问题行为"）按句子拆开，拆出来的每一段
+    仍然是一个独立块 —— 但它们共享同一个父块。
+    """
+    chunks: list[Chunk] = []
+    index = start_index
+
+    # ---- 父块：整个章节的行拼起来 ----
+    parent_text, p_start, p_end = _join(items)
+    parent_chunk = Chunk(
+        content_original=parent_text,
+        content_normalized=normalizer(parent_text),
+        pdf_page_start=p_start,
+        pdf_page_end=p_end,
+        chunk_index=index,
+        parent_index=0,
+        is_parent=True,
+        knowledge_type=classify(parent_text, section_title, in_appendix),
+        section_code=section_code,
+    )
+    chunks.append(parent_chunk)
+    parent_index_global = index
+    index += 1
+
+    # ---- 子块：每行一个 ----
+    for item in items:
+        pieces = (
+            [item.text]
+            if len(item.text) <= CHILD_MAX_CHARS
+            else _split_long_paragraph(item.text, CHILD_MAX_CHARS)
+        )
+        for piece in pieces:
+            chunks.append(
+                Chunk(
+                    content_original=piece,
+                    content_normalized=normalizer(piece),
+                    pdf_page_start=item.page,
+                    pdf_page_end=item.page,
+                    chunk_index=index,
+                    parent_index=0,
+                    is_parent=False,
+                    knowledge_type=classify(piece, section_title, in_appendix),
+                    section_code=section_code,
+                    parent_chunk_index=parent_index_global,
+                )
+            )
+            index += 1
+
+    return chunks
 
 
 def chunk_section(
@@ -271,11 +390,31 @@ def chunk_section(
     pages: list[tuple[int, str]],
     in_appendix: bool = False,
     start_index: int = 0,
+    language: str = "en",
+    atomic_items: bool = False,
 ) -> list[Chunk]:
     """把一个章节切成父块和子块。
 
     ``pages`` 是 [(PDF 页码, 清洗后的正文)]，按页序。
     返回的块里父块在前、子块在后，``chunk_index`` 全书连续。
+
+    ``language`` 决定两件事：句子怎么切、规范化怎么做。
+
+    - ``en``（默认）：英文书的路径，NFKC 规范化 + 英文句末边界。
+    - ``zh``：中文指南的路径，NFC 规范化 + **jieba 分词**。
+
+    中文路径必须分词，否则 ``content_normalized`` 是一整段连写的中文，
+    ``to_tsvector('simple', ...)`` 只能切出一个词 —— 关键词路等于没有。
+
+    ``atomic_items``：**每个输入项单独成一个块，不合并**。
+
+    **什么时候要开**：指南附件 1–4 全是宽表格，一行就是一条完整的
+    干预要点（"正强化：xxx" / "0~18 月龄：xxx"）。子块如果按
+    ``CHILD_TARGET_CHARS`` 攒，会把 7 条策略挤进一个 543 字的块 ——
+    问"孩子做对了要怎么奖励"（正强化）时，这个大块和讲挑战性行为的
+    块竞争，正确答案挤不进前 5 名。
+
+    开了之后每行一个块，召回粒度直接对上"针对某一条策略的干预"。
     """
     items: list[_Item] = []
     for page, text in pages:
@@ -285,6 +424,18 @@ def chunk_section(
     if not items:
         return []
 
+    normalizer = normalize_zh if language == "zh" else normalize
+
+    if atomic_items:
+        return _chunk_atomic(
+            items,
+            section_code=section_code,
+            section_title=section_title,
+            in_appendix=in_appendix,
+            start_index=start_index,
+            normalizer=normalizer,
+        )
+
     parents = _group(items, PARENT_TARGET_CHARS, PARENT_MAX_CHARS)
     chunks: list[Chunk] = []
     index = start_index
@@ -293,7 +444,7 @@ def chunk_section(
         parent_text, p_start, p_end = _join(parent_items)
         parent_chunk = Chunk(
             content_original=parent_text,
-            content_normalized=normalize(parent_text),
+            content_normalized=normalizer(parent_text),
             pdf_page_start=p_start,
             pdf_page_end=p_end,
             chunk_index=index,
@@ -317,7 +468,7 @@ def chunk_section(
             chunks.append(
                 Chunk(
                     content_original=text,
-                    content_normalized=normalize(text),
+                    content_normalized=normalizer(text),
                     pdf_page_start=c_start,
                     pdf_page_end=c_end,
                     chunk_index=index,

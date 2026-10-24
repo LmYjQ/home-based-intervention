@@ -78,7 +78,8 @@ class CaseResult:
     term_hit: bool = False
     no_hit: bool = False
     is_irrelevant: bool = False
-    forced_answer: bool = False  # 无关问题却返回了证据
+    forced_answer: bool = False  # 无关问题却返回了证据（检索层口径）
+    forced_answer_usable: bool = False  # 无关问题却返回了**可用作依据**的证据
     error: str = ""
 
 
@@ -92,6 +93,21 @@ def load_cases(path: Path = CASES_PATH) -> list[dict[str, Any]]:
     return cases
 
 
+def _is_usable(c: search_mod._Candidate) -> bool:
+    """这条证据能不能当"直接依据"。
+
+    规则和门控层一致（``rdi_agent/graph/nodes/retrieval_nodes.py``）：
+    关键词路命中（精确术语）**或者** 向量相似度不低于 DIRECT_MAX_DISTANCE。
+    只有距离信号时，"崩溃点理论"和"红烧肉"分不开（0.5341 vs 0.5345），
+    必须配上 FTS 命中这个第二信号。
+    """
+    if c.fts_rank is not None:
+        return True
+    if c.similarity is None:
+        return False
+    return c.similarity >= (1.0 - search_mod.DIRECT_MAX_DISTANCE)
+
+
 def _cand_to_dict(c: search_mod._Candidate) -> dict[str, Any]:
     return {
         "chunk_id": c.chunk_id,
@@ -102,6 +118,7 @@ def _cand_to_dict(c: search_mod._Candidate) -> dict[str, Any]:
         "vector_rank": c.vector_rank,
         "fts_rank": c.fts_rank,
         "score": round(c.score, 6),
+        "similarity": c.similarity,
         "snippet": c.snippet[:SNIPPET_CHARS],
     }
 
@@ -135,7 +152,7 @@ async def run_case(
                 "keyword_query": queries.keyword_query,
                 "concept_ids": queries.concept_ids,
                 "bridged_terms": [
-                    f"{b['matched_alias']} -> {b['canonical_name_en']}"
+                    f"{b['matched_alias']} -> {b['canonical_name']}"
                     for b in queries.bridged_terms
                 ],
             },
@@ -156,6 +173,14 @@ async def run_case(
         }
 
         # ---- 3. 关键词召回 ----
+        #
+        # **必须先加载高频词表**：``_fts_candidates`` 的排序要用
+        # ``_discriminative_terms`` 剔掉高频词，而高频词表是模块级缓存，
+        # 只有 ``ensure_high_freq_terms()`` 会去数据库里算。
+        # 不调这一句的话，评测跑的是"没剔高频词"的排序，
+        # 和生产（``rag/retrieval.py`` 里调了）**不是同一套** ——
+        # 评测数字就不能代表线上表现。
+        await search_mod.ensure_high_freq_terms()
         fts_cands = await search_mod._fts_candidates(queries.keyword_query, candidate_k, None)
         result.step_fts = {
             "input": {"keyword_query": queries.keyword_query, "top_k": candidate_k},
@@ -261,6 +286,11 @@ async def run_case(
                     "rrf_score": round(c.score, 6),
                     "rerank_score": rerank_scores.get(c.chunk_id),
                     "review_status": c.review_status,
+                    "similarity": c.similarity,
+                    "fts_matched": c.fts_rank is not None,
+                    # 能不能当"直接依据"：关键词路命中，或者向量相似度够高。
+                    # 和门控层用同一把尺子（search.DIRECT_MAX_DISTANCE）。
+                    "usable": _is_usable(c),
                     "snippet": c.snippet[:SNIPPET_CHARS],
                     "relevance_reason": (
                         f"向量第{c.vector_rank}名"
@@ -289,6 +319,8 @@ async def run_case(
         result.no_hit = not evidence
         if result.is_irrelevant and evidence:
             result.forced_answer = True
+        if result.is_irrelevant and any(e["usable"] for e in evidence):
+            result.forced_answer_usable = True
         if result.must_include_terms:
             blob = " ".join(item["snippet"].lower() for item in evidence)
             result.term_hit = any(t.lower() in blob for t in result.must_include_terms)
@@ -324,6 +356,15 @@ def summarize(results: list[CaseResult]) -> dict[str, Any]:
         "forced_answer_rate": pct(
             sum(1 for r in irrelevant if r.forced_answer), len(irrelevant)
         ),
+        # 可用作依据的口径：这才是"家长会不会被硬凑的答案糊弄"真正的度量
+        "forced_answer_usable_rate": pct(
+            sum(1 for r in irrelevant if r.forced_answer_usable), len(irrelevant)
+        ),
+        # 有多少条证据达到了"可作直接依据"的门槛
+        "usable_evidence_rate": pct(
+            sum(1 for r in relevant if any(e["usable"] for e in r.step_final)),
+            len(relevant),
+        ),
     }
 
 
@@ -342,6 +383,14 @@ def print_report(results: list[CaseResult], summary: dict[str, Any]) -> None:
     print(f"  无命中率        {summary['no_hit_rate']:.2%}")
     print(f"  必含术语命中率  {summary['term_hit_rate']:.2%}")
     print(f"  硬凑率(无关题)  {summary['forced_answer_rate']:.2%}   (目标接近 0)")
+    print(
+        f"  硬凑率(可作依据) {summary.get('forced_answer_usable_rate', 0):.2%}"
+        f"   (目标 0 —— 这才是家长真正看到的口径)"
+    )
+    print(
+        f"  证据可用率      {summary.get('usable_evidence_rate', 0):.2%}"
+        f"   (相关题里至少有一条能作直接依据)"
+    )
     print()
 
     for r in results:
@@ -412,17 +461,172 @@ def print_report(results: list[CaseResult], summary: dict[str, Any]) -> None:
     print("=" * 78)
 
 
+async def run_embed_input_ab(cases: list[dict[str, Any]]) -> None:
+    """A/B：向量化用「jieba 分词文本」还是「自然原文」。
+
+    **要回答的问题**：入库时向量是按 ``content_normalized`` 算的，
+    而中文路径的 ``content_normalized`` 是分词后的文本。bge-m3 是在
+    **自然中文**上训的 —— 喂分好词的文本，它拿到的不是训练时见过的分布。
+    换自然原文会不会更准？
+
+    **怎么测**：同一批块，两种输入各算一遍向量，各自跑**向量路**，
+    看期望章节排第几名。再各自跑**全链路**（向量 + 关键词 + RRF），
+    因为线上是两路合并 —— 只看向量路可能得出错的结论。
+
+    **关键词路两种输入完全一样**：``content_tsv`` 是
+    ``to_tsvector('simple', content_normalized)`` 的生成列，
+    分词文本是 FTS 需要的，改不了也不该改。
+
+    **会外发知识库正文到外部 embedding API**（用户已批准 2026-10-23）。
+    """
+    from sqlalchemy import text
+
+    from rdi_agent.db.engine import session_scope
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT c.id::text AS chunk_id,
+                           c.content_original,
+                           c.content_normalized,
+                           s.section_code
+                    FROM knowledge_chunks c
+                    JOIN book_sections s ON s.id = c.section_id
+                    WHERE c.parent_chunk_id IS NOT NULL
+                    """
+                )
+            )
+        ).mappings().all()
+    chunks = [dict(r) for r in rows]
+    relevant = [c for c in cases if c.get("expected_sections")]
+    print(f"块数 {len(chunks)}，相关用例 {len(relevant)}")
+
+    natural = [" ".join(c["content_original"].split()) for c in chunks]
+    segmented = [c["content_normalized"] for c in chunks]
+
+    # 两种向量算一次，落盘缓存 —— 重跑这个对比不用重新外发语料。
+    cache_path = Path("data/index/ab_embed_input_cache.json")
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache: dict[str, list[list[float]]] = {}
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        # 缓存要对得上当前语料 —— 块顺序变了就不能复用
+        if cached.get("chunk_ids") == [c["chunk_id"] for c in chunks]:
+            cache = cached
+            print("用缓存里的向量（没重新外发）", file=sys.stderr)
+
+    if "seg" not in cache:
+        print("算向量（分词文本）…", file=sys.stderr)
+        cache["seg"] = await embeddings.embed_texts(segmented)
+    if "nat" not in cache:
+        print("算向量（自然文本）…", file=sys.stderr)
+        cache["nat"] = await embeddings.embed_texts(natural)
+
+    cache["chunk_ids"] = [c["chunk_id"] for c in chunks]
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+
+    vec_seg = cache["seg"]
+    vec_nat = cache["nat"]
+
+    await search_mod.ensure_high_freq_terms()
+
+    def _cos(a: list[float], b: list[float]) -> float:
+        return sum(x * y for x, y in zip(a, b))
+
+    async def _vector_only(vectors: list[list[float]], case: dict) -> int:
+        qv = await embeddings.embed_query(case["query"])
+        scored = sorted(
+            ((_cos(qv, v), c["section_code"]) for v, c in zip(vectors, chunks)),
+            reverse=True,
+        )
+        expected = set(case["expected_sections"])
+        for i, (_, section) in enumerate(scored, 1):
+            if section in expected:
+                return i
+        return 99
+
+    async def _full_pipeline(vectors: list[list[float]], case: dict) -> int:
+        queries = await rewrite_query(case["query"])
+        qv = await embeddings.embed_query(queries.semantic_query)
+        fts = await search_mod._fts_candidates(queries.keyword_query, 30, None)
+        scored = sorted(
+            ((_cos(qv, v), c) for v, c in zip(vectors, chunks)), reverse=True
+        )
+        vector_hits = []
+        for rank, (sim, c) in enumerate(scored, 1):
+            if (1 - sim) > search_mod.MAX_VECTOR_DISTANCE:
+                continue
+            cand = search_mod._Candidate(
+                chunk_id=c["chunk_id"],
+                chunk_index=0,
+                section_code=c["section_code"],
+                section_title=c["section_code"],
+                pdf_page_start=None,
+                pdf_page_end=None,
+                snippet="",
+                is_parent=False,
+                knowledge_type="paragraph",
+                review_status="unreviewed",
+            )
+            cand.vector_rank = rank
+            cand.similarity = sim
+            vector_hits.append(cand)
+        merged = search_mod._rrf_merge(vector_hits, fts)
+        merged = [c for c in merged if not c.is_parent]
+        expected = set(case["expected_sections"])
+        for i, c in enumerate(merged[:5], 1):
+            if c.section_code in expected:
+                return i
+        return 99
+
+    def _report(tag: str, ranks: list[int]) -> float:
+        recall = sum(1 for r in ranks if r <= 5) / len(ranks)
+        mrr = sum(1 / r if r < 99 else 0 for r in ranks) / len(ranks)
+        print(f"  {tag:4s} recall@5={recall:.4f}  MRR={mrr:.4f}")
+        return mrr
+
+    print("\n=== 只走向量路 ===")
+    seg_v = [await _vector_only(vec_seg, c) for c in relevant]
+    nat_v = [await _vector_only(vec_nat, c) for c in relevant]
+    _report("seg", seg_v)
+    _report("nat", nat_v)
+
+    print("\n=== 全链路（向量 + 关键词 + RRF）===")
+    seg_f = [await _full_pipeline(vec_seg, c) for c in relevant]
+    nat_f = [await _full_pipeline(vec_nat, c) for c in relevant]
+    _report("seg", seg_f)
+    _report("nat", nat_f)
+
+    print("\n逐条对比（全链路，只看有变化的）：")
+    for case, rs, rn in zip(relevant, seg_f, nat_f):
+        if rs == rn:
+            continue
+        better = "自然更好" if rn < rs else "分词更好"
+        print(f"  {case['case_id']:42s} seg={rs:3d}  nat={rn:3d}  {better}")
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="检索评测")
     parser.add_argument("--cases", default=str(CASES_PATH))
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--candidate-k", type=int, default=30)
     parser.add_argument("--no-vector", action="store_true")
-    parser.add_argument("--no-rerank", action="store_true", default=True)
+    # 重排默认**关**（要发外部 API），但 ``--no-rerank`` 必须真的能关掉。
+    # 原来 ``--no-rerank`` 带 ``default=True``，于是 ``args.no_rerank``
+    # 永远是 True，``--rerank`` 永远不生效 —— 评测里"重排开/关"两套
+    # 数字根本没法对比。
+    parser.add_argument("--no-rerank", action="store_true", default=False)
     parser.add_argument("--rerank", action="store_true", help="打开重排")
     parser.add_argument("--no-parent", action="store_true")
     parser.add_argument("--json", default=None, help="把完整记录写成 JSON")
     parser.add_argument("--only", default=None, help="只跑某个 case_id")
+    parser.add_argument(
+        "--embed-input-ab",
+        action="store_true",
+        help="A/B：向量化用分词文本还是自然原文（只跑向量路和全链路对比）",
+    )
     args = parser.parse_args()
 
     use_rerank = args.rerank and not args.no_rerank
@@ -433,6 +637,10 @@ async def main() -> None:
         if not cases:
             print(f"没有 case_id={args.only} 的用例")
             return
+
+    if args.embed_input_ab:
+        await run_embed_input_ab(cases)
+        return
 
     print(
         f"配置：top_k={args.top_k} candidate_k={args.candidate_k} "

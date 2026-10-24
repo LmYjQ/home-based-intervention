@@ -21,6 +21,7 @@ asd_agent/fixtures/responses/
 # ---------------------------------------------------------------- 前端
 node_modules/
 frontend/dist/
+frontend_rdi/dist/
 
 # Playwright MCP 的浏览器测试产物（snapshot / console log），不是源码
 .playwright-mcp/
@@ -30,15 +31,37 @@ frontend/dist/
 
 # ---------------------------------------------------------------- RDI Agent 重建
 data/documents/
+# 指南全文（OCR 转出来的分页 Markdown + 合并版）。
+#
+# **不进版本库**：仓库是公开的，而 knowledge_sources.rights_status 是
+# internal_review_only —— 计划 §5.6 明确"不对外提供原文，不做大段引用"。
+# 指南正文进了公开仓库，口径就自相矛盾了。
+#
+# **但流水线依赖它** —— clone 下来之后要先 OCR 出这份 Markdown：
+#     PADDLEOCR_TOKEN=xxx python tools/ocr_pdf_paddle.py <pdf> --out data/ocr/guideline2026
+# 工具脚本已提交，谁拿到扫描件都能重新 OCR 出来。
+data/ocr/
 # data/index/ 下大部分是中间产物（pages.jsonl 等），不进版本库；
 # 但章节树、入库报告和人工抽查标记是半人工的交付物 —— 人工改过的东西不能丢
 data/index/*
 !data/index/section_map.json
 !data/index/ingest_report.json
 !data/index/chunk_reviews.json
+# 人工评估用的执行日志（tools/run_log.py 生成的）——
+# **不进版本库**：日志里逐条引用了指南正文片段，篇幅比指南全文还大
+# （实测 144%）。指南全文都不进公开仓库，日志同理。
+#
+# 需要时本地跑一条命令就有：
+#     python -m tools.run_log
+# 产出 data/index/exec_log.md（人读）+ exec_log.json（机读）。
 *.pdf
 *.mobi
 /*.png
+
+# PaddleOCR 官方示例的拷贝，放根目录没人引用 ——
+# 实际用的是 tools/ocr_pdf_paddle.py（带参数、能指定输出目录）。
+# 留一份几乎一样的脚本在根目录只会让人改错文件。
+bd_api.py
 
 # ---------------------------------------------------------------- 旧代码
 # legacy 目录已冻结，但先留着参考；真要删时从下面列表移除即可

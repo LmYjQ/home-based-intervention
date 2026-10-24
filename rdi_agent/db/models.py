@@ -124,9 +124,14 @@ class KnowledgeChunk(Base):
     # 生成列：值由 Postgres 算，不能也不能往里写。
     # 必须声明成 Computed，否则 SQLAlchemy 会把它塞进 INSERT，PG 直接报错
     # "cannot insert a non-DEFAULT value into column content_tsv"。
+    #
+    # 用 'simple' 而不是 'english'：知识库现在是中文指南，
+    # 英文配置对中文无效（整段中文会变成一个 token）。
+    # 'simple' 靠**空格**分词，而入库时 content_normalized 已经用
+    # jieba 分好词了 —— 每个词因此都是独立的 lexeme。
     content_tsv: Mapped[Any] = mapped_column(
         TSVECTOR,
-        Computed("to_tsvector('english', coalesce(content_normalized, ''))", persisted=True),
+        Computed("to_tsvector('simple', coalesce(content_normalized, ''))", persisted=True),
     )
     embedding: Mapped[Any] = mapped_column(Vector(1024))
     summary_zh: Mapped[str | None] = mapped_column(Text)
@@ -151,7 +156,12 @@ class KnowledgeChunk(Base):
 
 
 class ConceptAlias(Base):
-    """检索用术语表（B 层简化版）。首版只做 30–50 个核心术语。"""
+    """检索用术语表（B 层简化版）。首版只做 30–50 个核心术语。
+
+    ``canonical_name`` 是**规范名** —— 知识库里真的用这个词。
+    以前规范名是英文（书是英文的），所以叫 ``canonical_name_en``；
+    现在知识库是中文指南，规范名是中文术语，列名去掉了 ``_en``。
+    """
 
     __tablename__ = "concept_aliases"
 
@@ -159,9 +169,8 @@ class ConceptAlias(Base):
         UUID(as_uuid=True), primary_key=True, default=_uuid
     )
     concept_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    canonical_name_en: Mapped[str] = mapped_column(Text, nullable=False)
+    canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
     aliases_zh_json: Mapped[list] = mapped_column(JSONB, default=list)
-    aliases_en_json: Mapped[list] = mapped_column(JSONB, default=list)
     source_chunk_ids_json: Mapped[list] = mapped_column(JSONB, default=list)
     is_explicit_in_source: Mapped[bool] = mapped_column(default=False)
     limitations_json: Mapped[list] = mapped_column(JSONB, default=list)

@@ -1,6 +1,6 @@
 """证据相关契约。
 
-EvidenceItem 描述"书里/研究里/观察里说了什么"，
+EvidenceItem 描述"指南里/研究里/观察里说了什么"，
 EvidenceBundle 是一次检索的完整结果集，
 EvidenceDecision 是证据门控（evidence_gate 节点）的裁决。
 """
@@ -12,7 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 SourceType = Literal[
-    "book",
+    "guideline",
     "external_research",
     "professional_review",
     "child_observation",
@@ -37,6 +37,13 @@ class EvidenceItem(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     review_status: str
     may_quote_to_user: bool = False
+    # 向量路的余弦相似度（1 - 距离）。只有 FTS 命中、没进向量候选池时为 None。
+    # 门控层用它判断"这条能不能当直接依据"（见 search.DIRECT_MAX_DISTANCE）。
+    similarity: float | None = None
+    # 是否被关键词路命中。精确术语命中是比距离更硬的信号：
+    # 距离分不开"崩溃点理论"（0.5341，相关）和"红烧肉"（0.5345，无关），
+    # FTS 命中能分开。
+    fts_matched: bool = False
 
 
 class EvidenceBundle(BaseModel):

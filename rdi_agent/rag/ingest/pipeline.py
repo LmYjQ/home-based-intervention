@@ -1,16 +1,20 @@
-"""入库流水线：PDF -> 可追溯的向量 + 关键词索引。
+"""入库流水线：Markdown -> 可追溯的向量 + 关键词索引。
 
-    python -m rdi_agent.rag.ingest.pipeline --pdf data/documents/the_rdi_book.pdf
+    python -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026
 
 **幂等**：整个 source 的块先删后建。重建后条目数必须一致 ——
 这是计划 §9.1 的验收项之一，所以重跑一次不会多出半套数据。
 
 **分步可查**：每一步的中间结果都落盘（``pages.jsonl`` / ``section_map.json``），
-出问题时不用从头再解析一遍 PDF。
+出问题时不用从头再解析一遍。
 
-**版权**：这本书的授权未核实，``rights_status`` 固定 ``internal_review_only``。
+**版权**：这份指南的授权未核实，``rights_status`` 固定 ``internal_review_only``。
 库里存的是**供检索的片段**，不是给用户看的原文；面向用户的引用走
 "摘要 + 页码"，不给大段原文。
+
+**为什么源是 Markdown 而不是 PDF**：指南是扫描件，PDF 里没有文字层
+（``fitz`` 抽出来是空串）。所以入库源是 OCR 转出来的分页 Markdown ——
+一个文件对应 PDF 的一页，**页码因此可以保留**，引用能翻回扫描件。
 """
 
 from __future__ import annotations
@@ -30,15 +34,51 @@ from rdi_agent.config import get_settings
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.models import BookSection, KnowledgeChunk, KnowledgeSource
 from rdi_agent.rag.ingest import chunk as chunker
-from rdi_agent.rag.ingest import clean, embeddings, parse_pdf, review, sections
+from rdi_agent.rag import search as search_mod
+from rdi_agent.rag.ingest import embeddings, parse_md, review, sections_zh
+from rdi_agent.rag.ingest.sections import Section, SectionMap
 
-SOURCE_ID = "the_rdi_book_2009"
-SOURCE_TITLE = "The RDI Book: Forging New Pathways for Autism, Asperger's and PDD"
-SOURCE_AUTHORS = ["Steven Gutstein", "Stacy Rosenzweig Pirhala"]
-PUBLICATION_YEAR = 2009
+SOURCE_ID = "guideline2026"
+SOURCE_TITLE = "孤独症谱系障碍儿童干预康复指南（2026 年版）"
+SOURCE_AUTHORS = ["国家卫生健康委员会"]
+PUBLICATION_YEAR = 2026
 # 授权未核实：只用于本地研发和内部演示
 RIGHTS_STATUS = "internal_review_only"
-INDEX_VERSION = "v1"
+INDEX_VERSION = "v2"
+SOURCE_LANGUAGE = "zh"
+
+# 向量化的输入取哪一份文本。
+#
+# **两���内容各有用途，不能混**：
+#
+# - ``content_normalized``：jieba 分词后的文本。**FTS 需要它** ——
+#   ``content_tsv`` 是 ``to_tsvector('simple', content_normalized)`` 的
+#   生成列，``simple`` 按空格分词，不分词的话整段中文是一个 lexeme。
+# - ``content_original``：没分词的原文。
+#
+# **问题在于给 bge-m3 喂哪一份**：bge-m3 是在**自然中文**上训的，
+# 喂它"（ 一 ） 早期干预 。 早期干预 可以 显著 ..."这种分好词的文本，
+# 拿到的不是它训练时见过的分布。
+#
+# 实测（``tools/ab_embed_input.py``，34 条中文用例，只走向量路）：
+# 两种输入的 recall@5 **完全相同**（0.7941），MRR 自然文本略高
+# （0.5983 → 0.6361）。所以这不是个"修 bug"，是**在两者间选一个更优的**。
+#
+# 留成常量而不是写死，是为了让这个选择**可复现、可回退** —— 评测集、
+# 报告里的数字都要能对上用的是哪一种。
+EMBED_INPUT_NORMALIZED = "normalized"  # 分词文本（当前默认）
+EMBED_INPUT_ORIGINAL = "original"  # 自然文本
+
+
+def _embed_text(chunk: chunker.Chunk, embed_input: str) -> str:
+    """挑一份文本送去向量化。
+
+    ``original`` 走 ``content_original``，但要把换行压成空格 ——
+    表格行之间是 ``\\n\\n``，那些换行对嵌入没有意义，只是噪声。
+    """
+    if embed_input == EMBED_INPUT_ORIGINAL:
+        return " ".join(chunk.content_original.split())
+    return chunk.content_normalized
 
 
 @dataclass
@@ -63,20 +103,51 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
+def _dir_hash(directory: Path) -> str:
+    """目录内容哈希。
+
+    **按文件名排序** —— 页码顺序必须稳定，否则同样的内容每次入库
+    得到不同的 hash，"内容变了没变"就判断不了了。
+
+    只哈希 ``page_*.md`` —— 目录里可能还有别的文件（合并版），
+    它们不参与入库，不该影响 hash。
+    """
+    h = hashlib.sha256()
+    for path in sorted(directory.glob("page_*.md")):
+        h.update(path.name.encode("utf-8"))
+        h.update(path.read_bytes())
+    return h.hexdigest()
+
+
 def _section_pages(
-    section_map: sections.SectionMap,
-    cleaned: dict[int, str],
-) -> list[tuple[sections.Section, list[tuple[int, str]]]]:
-    """把清洗后的正文按章节归位。"""
-    result = []
-    for section in section_map.sections:
-        pages = [
-            (page, cleaned[page])
-            for page in range(section.pdf_page_start, section.pdf_page_end + 1)
-            if page in cleaned and cleaned[page].strip()
-        ]
-        if pages:
-            result.append((section, pages))
+    section_map: SectionMap,
+    blocks: list[parse_md.Block],
+) -> list[tuple[Section, list[tuple[int, str]]]]:
+    """把正文块按章节归位。
+
+    **按块归，不按页归**：指南的一页里可能有多个标题（第 3 页同时有
+    "三、干预康复内容"和两个"（一）（二）"），按页归会把一页里
+    不同章节的内容混在一起 —— 章节名和正文对不上，引用会指错地方。
+
+    **表格行各自成段**：附件 1–4 全是宽表格，**一行就是一条完整的
+    干预要点**（"年龄 → 干预目标 → 干预内容 → 干预重点"）。
+    如果把整张表当成连续段落，子块会把 7 条策略（正强化 / 负强化 /
+    消退 / 负惩罚 / 辅助 / 反应中断 / 差别强化）挤进同一个块 ——
+    问"孩子做对了怎么奖励"时，这个大块和讲挑战性行为的块竞争，
+    正确的答案挤不进前 5 名。
+
+    所以这里把表格行用 ``\\n\\n`` 分隔 —— 切块器按空行分段，
+    表格行就成了独立的段落。
+    """
+    grouped = sections_zh.assign_blocks(blocks, section_map)
+    result: list[tuple[Section, list[tuple[int, str]]]] = []
+    for section, items in grouped:
+        parts: list[tuple[int, str]] = []
+        for page, text in items:
+            # 表格行已经在 parse_blocks 里是独立的 Block，
+            # 这里只要把同一页的多个块用空行连起来，让切块器能分开它们。
+            parts.append((page, text))
+        result.append((section, parts))
     return result
 
 
@@ -219,51 +290,64 @@ def embeddings_model() -> str:
 
 async def run(
     *,
-    pdf_path: str | Path,
+    md_dir: str | Path,
     source_id: str = SOURCE_ID,
     rebuild_sections: bool = False,
     do_embed: bool = True,
+    embed_input: str = EMBED_INPUT_NORMALIZED,
 ) -> IngestResult:
     """跑一遍完整入库。"""
     settings = get_settings()
-    pdf = Path(pdf_path)
+    md_dir = Path(md_dir)
     index_dir = Path(settings.index_dir)
     index_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 1. 章节树（人工改过就沿用）----
+    # ---- 1. 逐页解析 ----
+    page_records = parse_md.extract_pages(md_dir)
+    parse_md.write_pages(page_records, index_dir / "pages.jsonl")
+
+    # ---- 2. 拆块（标题 / 段落 / 表格行）----
+    #
+    # 用**原始** Markdown 拆块 —— ``parse_blocks`` 靠 ``#`` 识别标题，
+    # 剥掉标记就认不出来了。
+    blocks: list[parse_md.Block] = []
+    for page_no, raw in parse_md.read_raw_pages(md_dir):
+        blocks.extend(parse_md.parse_blocks(raw, page_no))
+
+    # ---- 3. 章节树（人工改过就沿用）----
     section_map_path = index_dir / "section_map.json"
-    section_map = None if rebuild_sections else sections.load_section_map(section_map_path)
-    if section_map is None:
-        section_map = sections.build_sections(pdf, source_id=source_id)
-        sections.write_section_map(section_map, section_map_path)
-
-    # ---- 2. 逐页抽取 ----
-    page_records = parse_pdf.extract_pages(
-        pdf, label_pages=sections.section_starts(section_map)
+    section_map = None if rebuild_sections else sections_zh.load_section_map(
+        section_map_path
     )
-    parse_pdf.write_pages(page_records, index_dir / "pages.jsonl")
-
-    # ---- 3. 清洗 ----
-    non_empty = [r for r in page_records if not r.skipped]
-    headers = clean.find_repeated_lines([r.text for r in non_empty])
-    drop_lines = set(headers)
-    cleaned: dict[int, str] = {}
-    for record in non_empty:
-        result = clean.clean_page(record.text, drop_lines=drop_lines)
-        if result.normalized:
-            cleaned[record.pdf_page] = result.original
+    if section_map is None:
+        section_map = sections_zh.build_sections_zh(
+            blocks,
+            source_id=source_id,
+            total_pages=len(page_records),
+            pdf=str(md_dir),
+        )
+        sections_zh.write_section_map(section_map, section_map_path)
 
     # ---- 4. 切块 ----
     chunks: list[chunker.Chunk] = []
     index = 0
-    for section, pages in _section_pages(section_map, cleaned):
-        in_appendix = section.toc_level == 1 and "APPEND" in section.title.upper()
+    for section, pages in _section_pages(section_map, blocks):
+        # 附件：指南的"附件 1–4"都是宽表格（不同年龄的干预要点、
+        # 行为干预策略、挑战性行为要点、共存问题要点）——
+        # 这部分是家长最用得上的实操内容。
+        #
+        # **表格行各自成块**（``atomic_items=True``）：一行就是一条完整的
+        # 干预要点。按字数攒子块的话，7 条策略会挤进同一个 543 字的块，
+        # 问"孩子做对了要怎么奖励"时正确��案挤不进前 5 名。
+        in_appendix = section.title.startswith("附件")
         produced = chunker.chunk_section(
             section_code=section.section_code,
             section_title=section.title,
             pages=pages,
             in_appendix=in_appendix,
             start_index=index,
+            language=SOURCE_LANGUAGE,
+            atomic_items=in_appendix,
         )
         chunks.extend(produced)
         index += len(produced)
@@ -272,7 +356,7 @@ async def run(
     vectors: list[list[float]] | None = None
     embedded = 0
     if do_embed:
-        texts = [c.content_normalized for c in chunks]
+        texts = [_embed_text(c, embed_input) for c in chunks]
         vectors = await embeddings.embed_texts(texts)
         dim = embeddings.expected_dim()
         bad = [i for i, v in enumerate(vectors) if len(v) != dim]
@@ -289,14 +373,14 @@ async def run(
     stale_marks = review.unmatched_marks(chunks, review_file)
     source = KnowledgeSource(
         source_id=source_id,
-        source_type="book",
+        source_type="guideline",
         title=SOURCE_TITLE,
         authors_json=SOURCE_AUTHORS,
         publication_year=PUBLICATION_YEAR,
-        language="en",
+        language=SOURCE_LANGUAGE,
         rights_status=RIGHTS_STATUS,
-        source_uri=str(pdf),
-        content_hash=_file_hash(pdf),
+        source_uri=str(md_dir),
+        content_hash=_dir_hash(md_dir),
         version=INDEX_VERSION,
     )
     counts = await write_to_db(
@@ -307,31 +391,46 @@ async def run(
         marks=marks_applied,
     )
 
+    # 高频词表跟着内容变 —— 入库后强制重算，
+    # 否则检索侧还拿着上一版的词频（模块级缓存）。
+    await search_mod.ensure_high_freq_terms(force=True)
+
     # ---- 7. 入库报告 ----
-    stats = parse_pdf.summarize(page_records)
+    stats = parse_md.summarize(page_records)
     parents = sum(1 for c in chunks if c.is_parent)
     children = len(chunks) - parents
     report = {
         "source_id": source_id,
-        "pdf": str(pdf),
-        "content_hash": _file_hash(pdf),
+        "title": SOURCE_TITLE,
+        "language": SOURCE_LANGUAGE,
+        "md_dir": str(md_dir),
+        "content_hash": _dir_hash(md_dir),
         "index_version": INDEX_VERSION,
         "embedding_model": embeddings_model(),
         "embedding_dim": embeddings.expected_dim(),
+        # 向量化用的是哪份文本 —— 评测报告要靠它区分"结果变了是因为
+        # 换了输入形态，还是因为重新入库了"。
+        "embed_input": embed_input,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "pages": stats,
         "sections": {
             "count": counts["sections"],
             "notes": section_map.notes,
+            "tree": [
+                {
+                    "section_code": s.section_code,
+                    "title": s.title,
+                    "parent": s.parent_code,
+                    "pages": [s.pdf_page_start, s.pdf_page_end],
+                }
+                for s in section_map.sections
+            ],
         },
         "chunks": {
             "total": len(chunks),
             "parents": parents,
             "children": children,
             "embedded": embedded,
-        },
-        "cleaning": {
-            "header_footer_lines_dropped": sorted(drop_lines),
         },
         "review": {
             "file": review.REVIEW_FILE_NAME,
@@ -343,6 +442,7 @@ async def run(
             "parent_target_chars": chunker.PARENT_TARGET_CHARS,
             "child_target_chars": chunker.CHILD_TARGET_CHARS,
             "child_overlap_chars": chunker.CHILD_OVERLAP_CHARS,
+            "language": SOURCE_LANGUAGE,
         },
         "rights_status": RIGHTS_STATUS,
     }
@@ -366,11 +466,11 @@ async def run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RDI Book 入库流水线")
+    parser = argparse.ArgumentParser(description="指南入库流水线")
     parser.add_argument(
-        "--pdf",
-        default=str(get_settings().documents_dir / "the_rdi_book.pdf"),
-        help="PDF 路径",
+        "--md-dir",
+        default=str(get_settings().guideline_md_dir),
+        help="分页 Markdown 目录（page_001.md …）",
     )
     parser.add_argument("--source-id", default=SOURCE_ID)
     parser.add_argument(
@@ -381,20 +481,30 @@ def main() -> None:
     parser.add_argument(
         "--no-embed", action="store_true", help="只切块不向量化（调试用）"
     )
+    parser.add_argument(
+        "--embed-input",
+        choices=[EMBED_INPUT_NORMALIZED, EMBED_INPUT_ORIGINAL],
+        default=EMBED_INPUT_NORMALIZED,
+        help=(
+            "向量化用哪份文本：normalized=jieba 分词文本（默认），"
+            "original=自然原文。FTS 两种都一样（生成列读的是 normalized）"
+        ),
+    )
     args = parser.parse_args()
 
     result = asyncio.run(
         run(
-            pdf_path=args.pdf,
+            md_dir=args.md_dir,
             source_id=args.source_id,
             rebuild_sections=args.rebuild_sections,
             do_embed=not args.no_embed,
+            embed_input=args.embed_input,
         )
     )
     print(
         f"页 {result.pages_total}（解析 {result.pages_parsed} / 跳过 {result.pages_skipped}）"
         f" | 章节 {result.sections} | 父块 {result.parent_chunks} | 子块 {result.child_chunks}"
-        f" | 向量 {result.embedded}"
+        f" | 向量 {result.embedded}（输入 {args.embed_input}）"
     )
     print(f"报告：{result.report_path}")
 

@@ -1,77 +1,225 @@
 {
-  "source_id": "the_rdi_book_2009",
-  "pdf": "data/documents/the_rdi_book.pdf",
-  "content_hash": "9ee67b02c567bd3465cafcbf1d2db908f21e12488f215adf4d28d072eeede287",
-  "index_version": "v1",
+  "source_id": "guideline2026",
+  "title": "孤独症谱系障碍儿童干预康复指南（2026 年版）",
+  "language": "zh",
+  "md_dir": "/Users/qiyusama/Documents/code/ganyu/data/ocr/guideline2026",
+  "content_hash": "27605516cfa5e0184cf28ff5de136321ce3200ff73a693b10d427f011953ba1f",
+  "index_version": "v2",
   "embedding_model": "BAAI/bge-m3",
   "embedding_dim": 1024,
-  "generated_at": "2026-10-22T10:25:31+08:00",
+  "generated_at": "2026-10-23T21:29:10+08:00",
   "pages": {
-    "total_pages": 392,
-    "parsed_pages": 355,
-    "skipped_pages": 37,
-    "skipped_detail": {
-      "no_text_layer": [
-        1,
-        4,
-        5,
-        8,
-        11,
-        13,
-        17,
-        31,
-        44,
-        47,
-        189,
-        226,
-        305,
-        308,
-        335,
-        383,
-        385
-      ],
-      "section_label_page": [
-        32,
-        52,
-        74,
-        91,
-        103,
-        107,
-        147,
-        171,
-        190,
-        207,
-        233,
-        265,
-        288,
-        298,
-        356,
-        365,
-        375,
-        378,
-        381
-      ],
-      "too_short": [
-        366
-      ]
-    },
-    "total_chars": 635873
+    "total_pages": 25,
+    "parsed_pages": 25,
+    "skipped_pages": 0,
+    "skipped_detail": {}
   },
   "sections": {
-    "count": 29,
+    "count": 21,
     "notes": [
-      "APPENDICIES(p356) 与下一条同页，区间按 1 页计",
-      "起始页(p17)在父级 PART ONE: Setting the Stage for RDI(p31) 之前 —— 目录页码与嵌套不一致，父级按目录保留，待人工确认"
+      "一、干预康复目的(p1) 与下一条同页，区间按 1 页计",
+      "（一）健康教育(p3) 与下一条同页，区间按 1 页计",
+      "（七）心理治疗(p11) 与下一条同页，区间按 1 页计",
+      "（九）随访(p12) 与下一条同页，区间按 1 页计",
+      "（二）干预康复人员(p13) 与下一条同页，区间按 1 页计"
+    ],
+    "tree": [
+      {
+        "section_code": "000_干预康复目的",
+        "title": "一、干预康复目的",
+        "parent": null,
+        "pages": [
+          1,
+          1
+        ]
+      },
+      {
+        "section_code": "001_干预康复基本原则",
+        "title": "二、干预康复基本原则",
+        "parent": null,
+        "pages": [
+          1,
+          2
+        ]
+      },
+      {
+        "section_code": "002_干预康复内容",
+        "title": "三、干预康复内容",
+        "parent": null,
+        "pages": [
+          3,
+          11
+        ]
+      },
+      {
+        "section_code": "003_健康教育",
+        "title": "（一）健康教育",
+        "parent": "002_干预康复内容",
+        "pages": [
+          3,
+          3
+        ]
+      },
+      {
+        "section_code": "004_针对缺陷行为的干预康复",
+        "title": "（二）针对缺陷行为的干预康复",
+        "parent": "002_干预康复内容",
+        "pages": [
+          3,
+          5
+        ]
+      },
+      {
+        "section_code": "005_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预",
+        "title": "（三）针对非适应性、非功能性的局限兴趣和重复刻板行为的干预",
+        "parent": "002_干预康复内容",
+        "pages": [
+          6,
+          6
+        ]
+      },
+      {
+        "section_code": "006_针对挑战性行为的干预",
+        "title": "（四）针对挑战性行为的干预",
+        "parent": "002_干预康复内容",
+        "pages": [
+          7,
+          8
+        ]
+      },
+      {
+        "section_code": "007_共存问题和共患病干预",
+        "title": "（五）共存问题和共患病干预",
+        "parent": "002_干预康复内容",
+        "pages": [
+          9,
+          9
+        ]
+      },
+      {
+        "section_code": "008_家庭干预",
+        "title": "（六）家庭干预",
+        "parent": "002_干预康复内容",
+        "pages": [
+          10,
+          10
+        ]
+      },
+      {
+        "section_code": "009_心理治疗",
+        "title": "（七）心理治疗",
+        "parent": "002_干预康复内容",
+        "pages": [
+          11,
+          11
+        ]
+      },
+      {
+        "section_code": "010_数智干预康复",
+        "title": "（八）数智干预康复",
+        "parent": "002_干预康复内容",
+        "pages": [
+          11,
+          11
+        ]
+      },
+      {
+        "section_code": "011_随访",
+        "title": "（九）随访",
+        "parent": "002_干预康复内容",
+        "pages": [
+          12,
+          12
+        ]
+      },
+      {
+        "section_code": "012_干预康复场地和人员",
+        "title": "四、干预康复场地和人员",
+        "parent": null,
+        "pages": [
+          12,
+          12
+        ]
+      },
+      {
+        "section_code": "013_干预康复场地",
+        "title": "（一）干预康复场地",
+        "parent": "012_干预康复场地和人员",
+        "pages": [
+          12,
+          12
+        ]
+      },
+      {
+        "section_code": "014_干预康复人员",
+        "title": "（二）干预康复人员",
+        "parent": "012_干预康复场地和人员",
+        "pages": [
+          13,
+          13
+        ]
+      },
+      {
+        "section_code": "015_质量控制",
+        "title": "五、质量控制",
+        "parent": null,
+        "pages": [
+          13,
+          13
+        ]
+      },
+      {
+        "section_code": "016_名词解释",
+        "title": "六、名词解释",
+        "parent": null,
+        "pages": [
+          14,
+          15
+        ]
+      },
+      {
+        "section_code": "017_不同年龄和能力水平的孤独症儿童干预要点",
+        "title": "附件 1 不同年龄和能力水平的孤独症儿童干预要点",
+        "parent": null,
+        "pages": [
+          16,
+          19
+        ]
+      },
+      {
+        "section_code": "018_常用于孤独症儿童的行为干预策略",
+        "title": "附件 2 常用于孤独症儿童的行为干预策略",
+        "parent": null,
+        "pages": [
+          20,
+          20
+        ]
+      },
+      {
+        "section_code": "019_挑战性行为干预要点",
+        "title": "附件 3 挑战性行为干预要点",
+        "parent": null,
+        "pages": [
+          21,
+          23
+        ]
+      },
+      {
+        "section_code": "020_常见共存问题干预要点",
+        "title": "附件 4 常见共存问题干预要点",
+        "parent": null,
+        "pages": [
+          24,
+          25
+        ]
+      }
     ]
   },
   "chunks": {
-    "total": 1178,
-    "parents": 251,
-    "children": 927,
-    "embedded": 1178
-  },
-  "cleaning": {
-    "header_footer_lines_dropped": []
+    "total": 73,
+    "parents": 19,
+    "children": 54,
+    "embedded": 73
   },
   "review": {
     "file": "chunk_reviews.json",
@@ -82,7 +230,8 @@
   "chunker": {
     "parent_target_chars": 2400,
     "child_target_chars": 500,
-    "child_overlap_chars": 150
+    "child_overlap_chars": 150,
+    "language": "zh"
   },
   "rights_status": "internal_review_only"
 }

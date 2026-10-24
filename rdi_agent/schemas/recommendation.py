@@ -3,7 +3,7 @@
 硬规则（由 Pydantic 强制，不靠 prompt 自觉）：
 
 1. success_indicators / stop_conditions 不得为空 —— 家长要能看出"怎么算有效果"和"什么时候该停"。
-2. application_label == "book_summary" 时必须带真实引用 —— 没有直接证据就不许标成"书里说的"。
+2. application_label == "source_summary" 时必须带真实引用 —— 没有直接证据就不许标成"指南里说的"。
 3. expert_reviewed 第一阶段不实现，出现即拒绝。
 """
 
@@ -13,13 +13,28 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-ApplicationLabel = Literal["book_summary", "ai_adaptation", "expert_reviewed"]
+# ``source_summary`` = 这张卡的主要依据是知识库原文（现在是指南）。
+# 以前叫 ``book_summary`` —— 知识库从英文书换成中文指南之后，
+# "book" 这个词就不准了，但语义没变：有原文依据 vs 应用转化。
+ApplicationLabel = Literal["source_summary", "ai_adaptation", "expert_reviewed"]
+
+
+def _require_recommended(schema: dict) -> None:
+    """把 ``recommended`` 塞进 json_schema 的 required 列表。
+
+    在 ``RecommendationCard.model_json_schema()`` 上原地改。
+    pydantic 只在顶层模型生成 schema，但嵌套的 card 也会带上这个 hook
+    —— 所以 RecommendationSet 里嵌着 card 时同样生效。
+    """
+    required = schema.get("required")
+    if isinstance(required, list) and "recommended" not in required:
+        required.append("recommended")
 
 
 class SourceCitation(BaseModel):
     source_id: str
     source_type: Literal[
-        "book",
+        "guideline",
         "external_research",
         "professional_review",
         "application_adaptation",
@@ -41,7 +56,21 @@ class ParentAction(BaseModel):
 
 class RecommendationCard(BaseModel):
     # 同 CaseSummary：多余字段直接报错，避免模型偷偷加"诊断结论"字段
-    model_config = ConfigDict(extra="forbid")
+    #
+    # json_schema_extra 强制把 ``recommended`` 放进 required 列表。
+    #
+    # **为什么**：这个字段在 pydantic 上有默认值 False，所以它**不在**
+    # json_schema 的 required 里 —— 结构化输出允许模型整张卡都不写它。
+    # 漏写之后三张卡全是 False，``RecommendationSet`` 的
+    # "必须恰好一张卡 recommended=True" 校验就抛错，整轮生成被打成 500
+    # （实测大约三次里撞上一次）。
+    #
+    # pydantic 侧保留默认值，是为了让**代码构造**这张卡时不用每次都写；
+    # 只在 json_schema 里要求模型必须显式表态。
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=_require_recommended,
+    )
 
     plan_id: str
     title: str
@@ -65,7 +94,7 @@ class RecommendationCard(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def book_summary_needs_citation(self):
-        if self.application_label == "book_summary" and not self.source_citations:
-            raise ValueError("book_summary 必须至少有一条真实引用")
+    def source_summary_needs_citation(self):
+        if self.application_label == "source_summary" and not self.source_citations:
+            raise ValueError("source_summary 必须至少有一条真实引用")
         return self

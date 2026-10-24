@@ -1,6 +1,8 @@
 .PHONY: install db-up db-down migrate test dev demo feedback ingest ingest-no-embed \
         ingest-sections concepts search eval health clean \
-        review-export review-mark review-apply review-list
+        review-export review-mark review-apply review-list \
+        web web-install web-mock \
+        drop-old-book ocr run-log
 
 PY := .venv/bin/python
 PIP := .venv/bin/pip
@@ -25,6 +27,20 @@ test:
 dev:
 	.venv/bin/uvicorn rdi_agent.api.main:app --reload
 
+# ---- 前端手动测试台（frontend_rdi/，Vue 3 + Vite）----
+# 端口 5176。旧的 frontend/ 占着 5173/5174，那套是冻结遗留的，别混。
+web-install:
+	cd frontend_rdi && npm install
+
+# 打真后端（make dev，8000 端口）。先起 make dev 和 make db-up。
+web:
+	cd frontend_rdi && npm run dev
+
+# 脱离数据库跑前端：mock 后端回放真后端抓下来的响应形状。
+# 用来看渲染逻辑对不对，不验证业务。
+web-mock:
+	cd frontend_rdi && npm run mock
+
 # 固定演示输入，走完 追问 → 方案 → 选择 → 反馈
 demo:
 	$(PY) -m rdi_agent.cli --demo
@@ -38,22 +54,45 @@ feedback:
 	$(PY) -m rdi_agent.cli --feedback
 
 # 全量入库：解析 -> 切块 -> 向量 -> 写库 + ingest_report.json
-# 会把书的正文发给 embedding 服务（BAAI/bge-m3）做向量化
+# 会把指南正文发给 embedding 服务（BAAI/bge-m3）做向量化
+#
+# 源是**分页 Markdown**（data/ocr/guideline2026/page_001.md …）：
+# 指南是扫描件，PDF 里没有文字层，页码靠"一个文件一页"保留。
+#
+# **这份源不在版本库里**（.gitignore 的 data/ocr/）——
+# 指南全文进公开仓库和 rights_status=internal_review_only 自相矛盾。
+# clone 之后先 OCR 出来：make ocr <pdf>
 ingest:
-	$(PY) -m rdi_agent.rag.ingest.pipeline --pdf data/documents/the_rdi_book.pdf
+	$(PY) -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026
 
 # 只解析和切块，不向量化（不外发正文，用于本地核对结构）
 ingest-no-embed:
-	$(PY) -m rdi_agent.rag.ingest.pipeline --pdf data/documents/the_rdi_book.pdf --no-embed
+	$(PY) -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026 --no-embed
 
 # 重新生成章节树（会丢掉人工改过的边界）
 ingest-sections:
-	$(PY) -m rdi_agent.rag.ingest.pipeline --pdf data/documents/the_rdi_book.pdf \
+	$(PY) -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026 \
 		--rebuild-sections --no-embed
 
-# 写入核心术语表（中文别名 -> 书里的英文术语）
+# 写入核心术语表（中文口语 -> 指南里的规范术语）
 concepts:
 	$(PY) -m rdi_agent.rag.ingest.concepts
+
+# 删除旧的英文书来源（the_rdi_book_2009）及其全部块和章节
+# 已经跑过了（2026-10-24），留着是为了以后再遇到同类情况有现成脚本
+drop-old-book:
+	$(PY) -m tools.drop_rdi_book
+
+# 把扫描件 OCR 成入库源（分页 Markdown）。
+# 用法: make ocr <pdf 路径>
+# 需要 PADDLEOCR_TOKEN 环境变量。
+ocr:
+	@test -n "$(PDF)" || (echo "用法: make ocr PDF=<pdf 路径>" && exit 1)
+	$(PY) tools/ocr_pdf_paddle.py "$(PDF)" --out data/ocr/guideline2026
+
+# 产出人工评估用的执行日志（data/index/exec_log.md + .json，不进版本库）
+run-log:
+	$(PY) -m tools.run_log
 
 # ---- 人工抽查标记（计划 §9.1 第 11 步）----
 # 标记存在 data/index/chunk_reviews.json（进版本库），入库时按内容哈希回填，

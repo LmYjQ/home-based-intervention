@@ -19,6 +19,9 @@ dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.0",
     "openai>=1.40",
+    # 中文分词。知识库是中文指南，Postgres 的 to_tsvector('simple')
+    # 按空格分词，所以入库和查询两边都要先分词。
+    "jieba>=0.42",
 ]
 
 [project.optional-dependencies]

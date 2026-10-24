@@ -7,7 +7,9 @@ services:
       POSTGRES_USER: rdi
       POSTGRES_PASSWORD: rdi
     ports:
-      - "5432:5432"
+      # 宿主 5432 常被别的项目占着（本机 trpg 的 pgvector 容器就是），
+      # 所以 ganyu 映射到 5433。容器内仍是 5432。
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

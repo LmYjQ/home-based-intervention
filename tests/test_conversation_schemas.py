@@ -65,6 +65,23 @@ def test_recommendation_set_rejects_two_recommended():
         RecommendationSet(plans=[_card("plan_1", True), _card("plan_2", True)])
 
 
+def test_recommended_is_required_in_json_schema():
+    """模型必须显式表态推荐哪张卡。
+
+    ``recommended`` 在 pydantic 上有默认值 False，所以它默认**不在**
+    json_schema 的 required 里 —— 结构化输出允许模型整张卡都不写它。
+    漏写之后三张卡全是 False，"必须恰好一张卡 recommended=True" 的校验
+    就抛错，整轮生成被打成 500（实测大约三次里撞上一次）。
+
+    所以这里断言的是 **json_schema 里它必须在 required**，
+    而不是 pydantic 层面拒绝构造 —— pydantic 侧保留默认值，
+    是为了让代码构造这张卡时不用每次都写。
+    """
+    schema = RecommendationSet.model_json_schema()
+    card_schema = schema["$defs"]["RecommendationCard"]
+    assert "recommended" in card_schema["required"]
+
+
 def test_recommendation_set_rejects_duplicate_plan_ids():
     """plan_id 重复会导致 select-plan 选错卡。"""
     with pytest.raises(ValidationError):

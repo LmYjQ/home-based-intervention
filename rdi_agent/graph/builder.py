@@ -1,4 +1,4 @@
-"""Graph 装配（计划 §8.2）。
+"""图装配（计划 §8.2 + §9.3）。
 
 图有两条入口，用 ``route_entry`` 分流：
 
@@ -6,16 +6,30 @@
                                   ├─ 需要补充 → generate_followup
                                   │             → await_user_answer (interrupt)
                                   │             → parse_parent_input  （回到判断）
-                                  └─ 信息足够 → build_recommendation
-                                                → persist_candidate_plans
-                                                → present_plans (interrupt)
-                                                → commit_plan_selection → END
+                                  └─ 信息足够 → rewrite_query
+                                                → retrieve_knowledge
+                                                → rerank_and_expand
+                                                → evidence_gate
+                                                   ├─ recommend  → build_recommendation
+                                                   ├─ limited    → build_limited_answer
+                                                   ├─ risk       → build_limited_answer
+                                                   └─ followup   → generate_evidence_followup
+                                                → safety_review
+                                                   ├─ pass    → render_answer
+                                                   └─ 不通过  → build_limited_answer
+                                                → render_answer
+                                                   ├─ 有卡 → persist_candidate_plans
+                                                   │        → present_plans (interrupt)
+                                                   │        → commit_plan_selection → END
+                                                   └─ 无卡 → END
 
     START → feedback: capture_feedback → analyze_feedback → next_step → END
 
 追问那圈是**故意**回到 ``parse_parent_input`` 而不是接一个新节点：
 家长的回答要重新并进 CaseSummary，事实是累积的，不能问一轮丢一轮。
-收敛靠 ``followup_rounds``，到 3 轮强制出方案。
+收敛靠 ``followup_rounds``（阶段 1，3 轮）和 ``evidence_followup_rounds``
+（证据门控，1 轮）两个上限 —— 两个环都回 ``parse_parent_input``，
+没有上限就会互相打转。
 """
 
 from __future__ import annotations
@@ -26,6 +40,7 @@ from langgraph.graph import END, START, StateGraph
 
 from rdi_agent.graph.nodes import chat_nodes as chat
 from rdi_agent.graph.nodes import feedback_nodes as fb
+from rdi_agent.graph.nodes import retrieval_nodes as ret
 from rdi_agent.graph.nodes import write_nodes as write
 from rdi_agent.graph.state import CoachState
 
@@ -45,9 +60,20 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_node("generate_followup", chat.generate_followup)
     g.add_node("await_user_answer", chat.await_user_answer)
     g.add_node("build_recommendation", chat.build_recommendation)
+    g.add_node("persist_evidence_bundle", write.persist_evidence_bundle)
     g.add_node("persist_candidate_plans", write.persist_candidate_plans)
     g.add_node("present_plans", chat.present_plans)
     g.add_node("commit_plan_selection", write.commit_plan_selection)
+
+    # ---- 检索与证据（阶段 2C）----
+    g.add_node("rewrite_query", ret.rewrite_query)
+    g.add_node("retrieve_knowledge", ret.retrieve_knowledge)
+    g.add_node("rerank_and_expand", ret.rerank_and_expand)
+    g.add_node("evidence_gate", ret.evidence_gate)
+    g.add_node("generate_evidence_followup", ret.generate_evidence_followup)
+    g.add_node("build_limited_answer", ret.build_limited_answer)
+    g.add_node("safety_review", ret.safety_review)
+    g.add_node("render_answer", ret.render_answer)
 
     # ---- 反馈入口 ----
     g.add_node("capture_feedback", fb.capture_feedback)
@@ -68,7 +94,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         chat.route_after_sufficiency,
         {
             "generate_followup": "generate_followup",
-            "build_recommendation": "build_recommendation",
+            "rewrite_query": "rewrite_query",
         },
     )
     g.add_conditional_edges(
@@ -76,13 +102,48 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         chat.route_after_followup,
         {
             "await_user_answer": "await_user_answer",
-            "build_recommendation": "build_recommendation",
+            "rewrite_query": "rewrite_query",
         },
     )
     # 家长答完 → 重新并进 CaseSummary 再判断一次
     g.add_edge("await_user_answer", "parse_parent_input")
 
-    g.add_edge("build_recommendation", "persist_candidate_plans")
+    # ---- 检索链 ----
+    g.add_edge("rewrite_query", "retrieve_knowledge")
+    g.add_edge("retrieve_knowledge", "rerank_and_expand")
+    g.add_edge("rerank_and_expand", "persist_evidence_bundle")
+    g.add_edge("persist_evidence_bundle", "evidence_gate")
+    g.add_conditional_edges(
+        "evidence_gate",
+        ret.route_after_evidence_gate,
+        {
+            "recommend": "build_recommendation",
+            "limited_answer": "build_limited_answer",
+            "professional_support": "build_limited_answer",
+            "followup": "generate_evidence_followup",
+        },
+    )
+    # 证据不足导致的追问：答完回到 parse_parent_input，事实重新并一遍
+    g.add_edge("generate_evidence_followup", "await_user_answer")
+
+    # ---- 生成 → 审查 → 渲染 ----
+    g.add_conditional_edges(
+        "build_recommendation",
+        chat.route_after_recommendation,
+        {"plans": "safety_review", "limited_answer": "build_limited_answer"},
+    )
+    g.add_edge("build_limited_answer", "safety_review")
+    g.add_conditional_edges(
+        "safety_review",
+        ret.route_after_safety_review,
+        {"present": "render_answer", "fallback": "build_limited_answer"},
+    )
+    g.add_conditional_edges(
+        "render_answer",
+        ret.route_after_render,
+        {"plans": "persist_candidate_plans", "end": END},
+    )
+
     g.add_edge("persist_candidate_plans", "present_plans")
     g.add_edge("present_plans", "commit_plan_selection")
     g.add_edge("commit_plan_selection", END)

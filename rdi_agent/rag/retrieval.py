@@ -36,12 +36,28 @@ from rdi_agent.schemas.evidence import EvidenceBundle, EvidenceItem
 
 # 检索管线版本。改了什么就改它 —— 评测报告靠它区分"结果变了是因为
 # 改了检索逻辑，还是因为重新入库了"。
-RETRIEVAL_VERSION = "2b-v1"
+#
+# 2c-v1：加了向量距离下限 + 排除参考文献/脚注（见 search.py），
+#         并把管线拆成 recall_candidates / build_evidence_bundle。
+RETRIEVAL_VERSION = "2c-v1"
 
 # 计划 §5.4 的初始配置
 DEFAULT_CANDIDATE_K = 30
 DEFAULT_RERANK_CANDIDATES = 20
 DEFAULT_FINAL_EVIDENCE = 8
+
+
+@dataclass
+class RecallOutcome:
+    """双路召回的结果（未重排）。
+
+    图里 ``retrieve_knowledge`` 节点用它，``rerank_and_expand`` 节点接着处理。
+    """
+
+    vector_candidates: list[search_mod._Candidate] = field(default_factory=list)
+    fts_candidates: list[search_mod._Candidate] = field(default_factory=list)
+    merged: list[search_mod._Candidate] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -125,57 +141,101 @@ def _relevance_reason(
         parts.append(f"关键词召回第 {hit.fts_rank} 名")
     if not parts:
         parts.append("召回来源不明")
+    if hit.similarity is not None:
+        parts.append(f"相似度 {hit.similarity:.4f}")
     if rerank_score is not None:
         parts.append(f"重排分 {rerank_score:.4f}")
     elif degraded:
         parts.append("重排已降级，未参与排序")
     if queries.bridged_terms:
         bridged = "、".join(
-            f"{b['matched_alias']}->{b['canonical_name_en']}"
+            f"{b['matched_alias']}->{b['canonical_name']}"
             for b in queries.bridged_terms[:3]
         )
         parts.append(f"术语桥接 {bridged}")
     return "；".join(parts)
 
 
-async def retrieve(
-    query: str,
+async def recall_candidates(
+    queries: RetrievalQueries,
     *,
-    source_id: str | None = None,
-    top_k: int = DEFAULT_FINAL_EVIDENCE,
     candidate_k: int = DEFAULT_CANDIDATE_K,
     use_vector: bool = True,
-    use_rerank: bool = True,
-    expand_parents: bool = True,
     kind: str = "child",
-) -> RetrievalOutcome:
-    """跑完整检索管线，返回命中 + 过程记录。"""
-    queries = await rewrite_query(query, source_id=source_id)
-    notes: list[str] = []
+) -> RecallOutcome:
+    """双路召回 + RRF 合并。
 
-    # ---- 双路召回 ----
+    图里拆成两个节点：``retrieve_knowledge`` 调这个，
+    ``rerank_and_expand`` 接着处理 ``RecallOutcome.merged``。
+
+    ``kind`` 默认只回子块：子块是召回单元，父块是它的上下文。
+    父块和它的子块同时出现在结果里，等于同一段话显示两遍。
+    """
     vector_hits: list[search_mod._Candidate] = []
     if use_vector:
         query_vector = await embeddings.embed_query(queries.semantic_query)
         vector_hits = await search_mod._vector_candidates(
             query_vector, candidate_k, None
         )
+    await search_mod.ensure_high_freq_terms()
     fts_hits = await search_mod._fts_candidates(
         queries.keyword_query, candidate_k, None
     )
-    notes.append(f"向量路 {len(vector_hits)} 条，关键词路 {len(fts_hits)} 条")
 
     merged = search_mod._rrf_merge(vector_hits, fts_hits)
     if kind == "child":
         merged = [c for c in merged if not c.is_parent]
     elif kind == "parent":
         merged = [c for c in merged if c.is_parent]
-    notes.append(f"RRF 合并去重后 {len(merged)} 条")
+
+    notes = [
+        f"向量路 {len(vector_hits)} 条，关键词路 {len(fts_hits)} 条",
+        f"RRF 合并去重后 {len(merged)} 条",
+    ]
+    return RecallOutcome(
+        vector_candidates=vector_hits,
+        fts_candidates=fts_hits,
+        merged=merged,
+        notes=notes,
+    )
+
+
+@dataclass
+class EvidenceBuildResult:
+    """``build_evidence_bundle`` 的返回值。
+
+    证据包本身是给下游用的；hits / 重排状态是给评测和 trace 用的。
+    """
+
+    bundle: EvidenceBundle
+    hits: list[search_mod.SearchHit] = field(default_factory=list)
+    rerank_degraded: bool = False
+    rerank_reason: str = ""
+    parent_expanded: int = 0
+    notes: list[str] = field(default_factory=list)
+
+
+async def build_evidence_bundle(
+    candidates: list[search_mod._Candidate],
+    queries: RetrievalQueries,
+    *,
+    original_question: str,
+    case_summary: dict[str, Any] | None = None,
+    top_k: int = DEFAULT_FINAL_EVIDENCE,
+    use_rerank: bool = True,
+    expand_parents: bool = True,
+) -> EvidenceBuildResult:
+    """重排 -> 截断 -> 父块扩展 -> 组装证据包。
+
+    每条证据都带 ``relevance_reason``、章节、PDF 页码。
+    """
+    notes: list[str] = []
+    merged = list(candidates)
 
     # ---- 重排 ----
     rerank_degraded = False
     rerank_reason = ""
-    rerank_scores: list[float | None] = [None] * len(merged)
+    rerank_scores: dict[str, float | None] = {}
     if use_rerank and merged:
         head = merged[:DEFAULT_RERANK_CANDIDATES]
         tail = merged[DEFAULT_RERANK_CANDIDATES:]
@@ -187,13 +247,15 @@ async def retrieve(
         rerank_reason = result.reason
         for pos, src_idx in enumerate(result.order):
             if src_idx < len(head):
-                rerank_scores[pos] = result.scores[src_idx]
+                rerank_scores[head[src_idx].chunk_id] = result.scores[src_idx]
         reordered = [head[i] for i in result.order]
         merged = reordered + tail
         notes.append(
             f"重排 {len(head)} 条"
             + ("（已降级：%s）" % result.reason if result.degraded else "")
         )
+    else:
+        notes.append("未启用重排")
 
     merged = merged[:top_k]
 
@@ -215,6 +277,7 @@ async def retrieve(
                 is_parent=candidate.is_parent,
                 knowledge_type=candidate.knowledge_type,
                 review_status=candidate.review_status,
+                similarity=candidate.similarity,
             )
         )
 
@@ -224,13 +287,100 @@ async def retrieve(
         parents = await _load_parents([h.chunk_id for h in hits])
         notes.append(f"父块扩展命中 {len(parents)} 条")
 
-    return RetrievalOutcome(
-        queries=queries,
+    evidence: list[EvidenceItem] = []
+    for hit in hits:
+        parent = parents.get(hit.chunk_id)
+        excerpt = parent["content"] if parent else hit.snippet
+        page_start = parent["pdf_page_start"] if parent else hit.pdf_page_start
+        page_end = parent["pdf_page_end"] if parent else hit.pdf_page_end
+        evidence.append(
+            EvidenceItem(
+                evidence_id=hit.chunk_id,
+                source_type="guideline",
+                title=hit.section_title,
+                section_title=hit.section_title,
+                pdf_page_start=page_start,
+                pdf_page_end=page_end,
+                # print_page_* 一律空：calibre 重排时把原书页码丢了，猜不得
+                print_page_start=None,
+                print_page_end=None,
+                summary=hit.snippet,
+                source_excerpt=excerpt,
+                relevance_reason=_relevance_reason(
+                    hit,
+                    queries,
+                    rerank_score=rerank_scores.get(hit.chunk_id),
+                    degraded=rerank_degraded,
+                ),
+                review_status=hit.review_status,
+                # 版权未核实：只给摘要 + 页码，不给大段原文
+                may_quote_to_user=False,
+                similarity=hit.similarity,
+                fts_matched=hit.fts_rank is not None,
+            )
+        )
+
+    gaps: list[str] = []
+    if not evidence:
+        gaps.append("知识库中没有找到相关片段")
+    if rerank_degraded:
+        gaps.append(f"重排已降级：{rerank_reason}")
+
+    bundle = EvidenceBundle(
+        original_question=original_question,
+        case_summary=case_summary or {},
+        evidence=evidence,
+        evidence_gaps=gaps,
+        retrieval_version=RETRIEVAL_VERSION,
+    )
+    return EvidenceBuildResult(
+        bundle=bundle,
         hits=hits,
         rerank_degraded=rerank_degraded,
         rerank_reason=rerank_reason,
         parent_expanded=len(parents),
         notes=notes,
+    )
+
+
+async def retrieve(
+    query: str,
+    *,
+    source_id: str | None = None,
+    top_k: int = DEFAULT_FINAL_EVIDENCE,
+    candidate_k: int = DEFAULT_CANDIDATE_K,
+    use_vector: bool = True,
+    use_rerank: bool = True,
+    expand_parents: bool = True,
+    kind: str = "child",
+) -> RetrievalOutcome:
+    """跑完整检索管线，返回命中 + 过程记录。
+
+    这是 ``recall_candidates`` + ``build_evidence_bundle`` 的便捷串法。
+    评测脚本和 CLI 用它；图里两个节点分别调那两个函数。
+    """
+    queries = await rewrite_query(query, source_id=source_id)
+    recall = await recall_candidates(
+        queries,
+        candidate_k=candidate_k,
+        use_vector=use_vector,
+        kind=kind,
+    )
+    built = await build_evidence_bundle(
+        recall.merged,
+        queries,
+        original_question=query,
+        top_k=top_k,
+        use_rerank=use_rerank,
+        expand_parents=expand_parents,
+    )
+    return RetrievalOutcome(
+        queries=queries,
+        hits=built.hits,
+        rerank_degraded=built.rerank_degraded,
+        rerank_reason=built.rerank_reason,
+        parent_expanded=built.parent_expanded,
+        notes=recall.notes + built.notes,
     )
 
 
@@ -248,62 +398,20 @@ async def retrieve_evidence(
 
     每条证据都带 ``relevance_reason``、章节、PDF 页码。
     """
-    outcome = await retrieve(
-        query,
-        source_id=source_id,
+    queries = await rewrite_query(query, source_id=source_id)
+    recall = await recall_candidates(
+        queries, use_vector=use_vector, kind="child"
+    )
+    built = await build_evidence_bundle(
+        recall.merged,
+        queries,
+        original_question=query,
+        case_summary=case_summary,
         top_k=top_k,
-        use_vector=use_vector,
         use_rerank=use_rerank,
         expand_parents=expand_parents,
     )
-    parents: dict[str, dict[str, Any]] = {}
-    if expand_parents:
-        parents = await _load_parents([h.chunk_id for h in outcome.hits])
-
-    evidence: list[EvidenceItem] = []
-    for hit in outcome.hits:
-        parent = parents.get(hit.chunk_id)
-        excerpt = parent["content"] if parent else hit.snippet
-        page_start = parent["pdf_page_start"] if parent else hit.pdf_page_start
-        page_end = parent["pdf_page_end"] if parent else hit.pdf_page_end
-        evidence.append(
-            EvidenceItem(
-                evidence_id=hit.chunk_id,
-                source_type="book",
-                title=hit.section_title,
-                section_title=hit.section_title,
-                pdf_page_start=page_start,
-                pdf_page_end=page_end,
-                # print_page_* 一律空：calibre 重排时把原书页码丢了，猜不得
-                print_page_start=None,
-                print_page_end=None,
-                summary=hit.snippet,
-                source_excerpt=excerpt,
-                relevance_reason=_relevance_reason(
-                    hit,
-                    outcome.queries,
-                    rerank_score=None,
-                    degraded=outcome.rerank_degraded,
-                ),
-                review_status=hit.review_status,
-                # 版权未核实：只给摘要 + 页码，不给大段原文
-                may_quote_to_user=False,
-            )
-        )
-
-    gaps: list[str] = []
-    if not evidence:
-        gaps.append("知识库中没有找到相关片段")
-    if outcome.rerank_degraded:
-        gaps.append(f"重排已降级：{outcome.rerank_reason}")
-
-    return EvidenceBundle(
-        original_question=query,
-        case_summary=case_summary or {},
-        evidence=evidence,
-        evidence_gaps=gaps,
-        retrieval_version=RETRIEVAL_VERSION,
-    )
+    return built.bundle
 
 
 async def main() -> None:
@@ -330,7 +438,7 @@ async def main() -> None:
 
     print(f"查询：{outcome.queries.original_query}")
     print(f"关键词查询：{outcome.queries.keyword_query}")
-    print(f"桥接术语：{[b['canonical_name_en'] for b in outcome.queries.bridged_terms]}")
+    print(f"桥接术语：{[b['canonical_name'] for b in outcome.queries.bridged_terms]}")
     for note in outcome.notes:
         print(f"  · {note}")
     print()

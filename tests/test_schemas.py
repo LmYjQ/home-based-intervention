@@ -59,16 +59,16 @@ class TestRecommendationCard:
 
     def test_book_summary_without_citation_rejected(self):
         with pytest.raises(ValidationError, match="真实引用"):
-            RecommendationCard(**_card(application_label="book_summary"))
+            RecommendationCard(**_card(application_label="source_summary"))
 
     def test_book_summary_with_citation_passes(self):
         card = RecommendationCard(
             **_card(
-                application_label="book_summary",
+                application_label="source_summary",
                 source_citations=[
                     {
-                        "source_id": "the_rdi_book_2009",
-                        "source_type": "book",
+                        "source_id": "guideline2026",
+                        "source_type": "guideline",
                         "title": "The RDI Book",
                         "chapter": "Chapter 5",
                         "pdf_page_start": 120,
@@ -99,7 +99,7 @@ class TestEvidence:
     def _item(self, **overrides) -> dict:
         base = {
             "evidence_id": "e1",
-            "source_type": "book",
+            "source_type": "guideline",
             "title": "The RDI Book",
             "section_title": "Guided Participation",
             "pdf_page_start": 120,
@@ -136,8 +136,8 @@ class TestEvidence:
 class TestCitation:
     def test_citation_fields(self):
         c = SourceCitation(
-            source_id="the_rdi_book_2009",
-            source_type="book",
+            source_id="guideline2026",
+            source_type="guideline",
             title="The RDI Book",
             claim_supported="逐步告别",
         )

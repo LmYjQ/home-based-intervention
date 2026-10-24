@@ -84,7 +84,14 @@ async def test_hnsw_embedding_index_exists(db):
 
 
 async def test_fulltext_search_roundtrip(db):
-    """写入一个块，用内置全文检索查回来。"""
+    """写入一个块，用内置全文检索查回来。
+
+    **中文路径**：`content_tsv` 用 ``to_tsvector('simple', ...)``，
+    ``simple`` 按**空格**分词 —— 所以 ``content_normalized`` 里存的
+    必须是**分好词**的文本（入库时 jieba 干的活）。
+
+    这里直接写分词后的形态，模拟入库后的样子。
+    """
     source_id = uuid.uuid4()
     chunk_id = uuid.uuid4()
     # source_id 是唯一列，先清掉上一次可能残留的（测试中途失败会留下）。
@@ -108,7 +115,7 @@ async def test_fulltext_search_roundtrip(db):
             text(
                 """
                 INSERT INTO knowledge_sources (id, source_id, source_type, title)
-                VALUES (:id, 'test_source_tmp', 'book', 'Test Source')
+                VALUES (:id, 'test_source_tmp', 'guideline', 'Test Source')
                 """
             ),
             {"id": source_id},
@@ -118,13 +125,15 @@ async def test_fulltext_search_roundtrip(db):
                 """
                 INSERT INTO knowledge_chunks
                     (id, source_id, content_original, content_normalized, knowledge_type)
-                VALUES (:id, :sid, :c, :c, 'principle')
+                VALUES (:id, :sid, :c, :seg, 'principle')
                 """
             ),
             {
                 "id": chunk_id,
                 "sid": source_id,
-                "c": "Guided participation builds joint attention over time.",
+                "c": "挑战性行为干预应坚持预防为主，通过功能分析明确行为的功能",
+                # 分词后的形态（jieba 的输出）
+                "seg": "挑战性行为 干预 应 坚持 预防 为主 ， 通过 功能分析 明确 行为 的 功能",
             },
         )
 
@@ -134,18 +143,18 @@ async def test_fulltext_search_roundtrip(db):
                 text(
                     """
                     SELECT id,
-                           ts_rank_cd(content_tsv, websearch_to_tsquery('english', :q)) AS score
+                           ts_rank_cd(content_tsv, to_tsquery('simple', :q)) AS score
                     FROM knowledge_chunks
-                    WHERE content_tsv @@ websearch_to_tsquery('english', :q)
+                    WHERE content_tsv @@ to_tsquery('simple', :q)
                       AND source_id = :sid
                     ORDER BY score DESC
                     """
                 ),
-                {"q": "guided participation", "sid": source_id},
+                {"q": "'挑战性行为' | '功能分析'", "sid": source_id},
             )
         ).all()
-    # 只查本测试自己插的那条 —— 库里还有真实入库的书（1049 块），
-    # 不限定 source_id 的话 "guided participation" 会命中上百条
+    # 只查本测试自己插的那条 —— 库里还有真实入库的指南，
+    # 不限定 source_id 的话会命中别的块
     assert len(rows) == 1
     assert rows[0][0] == chunk_id
     assert float(rows[0][1]) > 0
@@ -216,7 +225,7 @@ async def test_first_parent_children_link_to_their_parent(db):
     source_id = "test_first_parent_tmp"
     source = KnowledgeSource(
         source_id=source_id,
-        source_type="book",
+        source_type="guideline",
         title="Test First Parent",
         language="en",
         rights_status="internal_review_only",
@@ -353,7 +362,7 @@ async def test_review_marks_survive_rebuild(db):
     source_id = "test_review_source_tmp"
     source = KnowledgeSource(
         source_id=source_id,
-        source_type="book",
+        source_type="guideline",
         title="Test Review Source",
         language="en",
         rights_status="internal_review_only",
@@ -422,7 +431,7 @@ async def test_review_marks_survive_rebuild(db):
     # 重建一次（先删后建），标记必须还在
     source2 = KnowledgeSource(
         source_id=source_id,
-        source_type="book",
+        source_type="guideline",
         title="Test Review Source",
         language="en",
         rights_status="internal_review_only",

@@ -37,13 +37,29 @@ class CoachState(TypedDict, total=False):
     retrieval_queries: dict[str, Any]
     retrieval_candidates: list[dict[str, Any]]  # 只放 chunk_id + score
     evidence_bundle: dict[str, Any]
+    # 证据包落库后的 id（建议卡靠它追溯依据）
+    evidence_bundle_db_id: str | None
     evidence_decision: dict[str, Any]
+    # 证据门控额外追问了几轮。用来防死循环：阶段 1 的追问环回到
+    # parse_parent_input，门控的追问也回那里，两个环会互相打转。
+    evidence_followup_rounds: int
 
     # 生成与审核
     candidate_plans: list[dict[str, Any]]
     selected_plan_id: str | None
     safety_review: dict[str, Any]
     final_answer: str
+    # 有限回答的分段内容（answer / low_risk_actions / observe / ...）
+    answer_parts: dict[str, Any]
+    # 这一路是"证据不够"（limited）还是"家长报告了风险信号"（risk）
+    answer_mode: str
+    # 多张卡之间的比较说明（模型写的），render 时用
+    comparison_note: str
+    # 安全审查已经降级过一次没有（防 safety_review 的死循环）
+    safety_fallback_used: bool
+    # 节点之间的路由提示
+    route_after_recommendation: str | None
+    route_after_render: str | None
 
     # 反馈与记忆
     feedback: dict[str, Any]

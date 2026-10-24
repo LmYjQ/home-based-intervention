@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from rdi_agent.rag import rerank as rerank_mod
+from rdi_agent.rag.ingest import chunk as chunker
 from rdi_agent.rag import search as search_mod
 from rdi_agent.rag.query_rewrite import RetrievalQueries
 
@@ -221,7 +222,7 @@ class TestEvalSet:
                             SELECT DISTINCT b.section_code
                             FROM book_sections b
                             JOIN knowledge_sources k ON k.id = b.source_id
-                            WHERE k.source_id = 'the_rdi_book_2009'
+                            WHERE k.source_id = 'guideline2026'
                             """
                         )
                     )
@@ -265,3 +266,75 @@ class TestEvaluationMetrics:
         assert summary["recall_at_5"] == 0.5
         assert summary["mrr"] == 0.5
         assert summary["relevant"] == 2
+
+
+class TestEmbedInputSwitch:
+    """向量化输入形态的开关。
+
+    **为什么要有这个开关**：中文路径的 ``content_normalized`` 是 jieba
+    分词后的文本，而 bge-m3 是在自然中文上训的。到底该喂哪一份，
+    是**要测出来的**，不是拍脑袋定的（见 ``tools/ab_embed_input.py``）。
+    留成开关是为了这个选择**可复现、可回退** —— 评测集和报告里的
+    数字要能对上用的是哪一种。
+    """
+
+    def test_two_forms_exist(self):
+        from rdi_agent.rag.ingest import pipeline
+
+        assert pipeline.EMBED_INPUT_NORMALIZED == "normalized"
+        assert pipeline.EMBED_INPUT_ORIGINAL == "original"
+
+    def test_normalized_uses_segmented_text(self):
+        from rdi_agent.rag.ingest import pipeline
+
+        chunk = chunker.Chunk(
+            content_original="早期干预\n\n越早越好",
+            content_normalized="早期 干预 越早 越好",
+            pdf_page_start=1,
+            pdf_page_end=1,
+            chunk_index=0,
+            parent_index=0,
+            is_parent=True,
+            knowledge_type="paragraph",
+            section_code="001_x",
+        )
+        out = pipeline._embed_text(chunk, pipeline.EMBED_INPUT_NORMALIZED)
+        assert out == "早期 干预 越早 越好"
+
+    def test_original_uses_natural_text_without_newlines(self):
+        from rdi_agent.rag.ingest import pipeline
+
+        chunk = chunker.Chunk(
+            content_original="早期干预\n\n越早越好",
+            content_normalized="早期 干预 越早 越好",
+            pdf_page_start=1,
+            pdf_page_end=1,
+            chunk_index=0,
+            parent_index=0,
+            is_parent=True,
+            knowledge_type="paragraph",
+            section_code="001_x",
+        )
+        out = pipeline._embed_text(chunk, pipeline.EMBED_INPUT_ORIGINAL)
+        # 换行压成空格 —— 表格行之间的 \n\n 对嵌入只是噪声
+        assert out == "早期干预 越早越好"
+        assert "\n" not in out
+
+    def test_original_is_not_segmented(self):
+        """自然文本**不能**是分词形态 —— 这是这个开关存在的全部意义。"""
+        from rdi_agent.rag.ingest import pipeline
+
+        chunk = chunker.Chunk(
+            content_original="（一）早期干预。早期干预可以显著改善预后。",
+            content_normalized="（ 一 ） 早期干预 。 早期干预 可以 显著 改善 预后 。",
+            pdf_page_start=1,
+            pdf_page_end=1,
+            chunk_index=0,
+            parent_index=0,
+            is_parent=True,
+            knowledge_type="paragraph",
+            section_code="001_x",
+        )
+        out = pipeline._embed_text(chunk, pipeline.EMBED_INPUT_ORIGINAL)
+        assert out == chunk.content_original
+        assert out != chunk.content_normalized

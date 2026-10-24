@@ -22,7 +22,10 @@ class Settings(BaseSettings):
     )
 
     # ---- 数据库 ----
-    database_url: str = "postgresql://rdi:rdi@localhost:5432/rdi"
+    # 宿主端口是 **5433**，不是 5432 —— 5432 常被本机别的项目占着
+    # （比如另一个 pgvector 容器），所以 compose 把 ganyu 映射到 5433。
+    # 容器内部仍然是 5432。
+    database_url: str = "postgresql://rdi:rdi@localhost:5433/rdi"
 
     # ---- LLM ----
     llm_base_url: str = "https://api.siliconflow.cn/v1"
@@ -51,6 +54,21 @@ class Settings(BaseSettings):
     memory_enabled: bool = True
     rerank_enabled: bool = True
 
+    # 图里要不要用重排。
+    #
+    # **默认关**：重排要把书里的片段发给外部 API（bge-reranker-v2-m3）。
+    # 2B 的评测是用户手动跑带重排的版本的，图是自动化链路 ——
+    # 自动化权限分类器不读对话里的授权，所以这里默认不外发书稿内容。
+    # 想看重排的效果时显式打开。
+    rerank_in_graph: bool = False
+
+    # 要不要为进证据包的片段生成中文摘要（写回 knowledge_chunks.summary_zh）。
+    #
+    # **默认关**：每次开都要多一次 LLM 调用（6–8 块合并成一次），
+    # 而收益只是让证据面板更好看。摘要是**转述**不是原文引用，
+    # 版权上可以给家长看（may_quote_to_user 仍然恒为 False）。
+    summary_zh_enabled: bool = False
+
     # ---- 关键词检索后端 ----
     # postgres_fts（默认，Postgres 内置 tsvector + ts_rank_cd）
     # paradedb_bm25（可选扩展，启用前需确认目标 Postgres 装得上 pg_search）
@@ -59,6 +77,9 @@ class Settings(BaseSettings):
     # ---- 路径 ----
     documents_dir: Path = REPO_ROOT / "data" / "documents"
     index_dir: Path = REPO_ROOT / "data" / "index"
+    # 指南的 OCR 结果（分页 Markdown）。入库源在这里 ——
+    # 指南是扫描件，PDF 没有文字层，页码靠"一个文件一页"保留。
+    guideline_md_dir: Path = REPO_ROOT / "data" / "ocr" / "guideline2026"
 
     @property
     def has_llm_key(self) -> bool:

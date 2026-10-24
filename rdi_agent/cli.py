@@ -21,11 +21,32 @@ from typing import Any
 from rdi_agent.db.engine import dispose_engine
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 
-DEMO_ANSWER = "早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，抱起来能好。送进去以后老师说她今天自己吃了早饭。"
+# 固定演示输入：开场白 + 三轮追问的回答。
+#
+# 为什么是三轮：计划的兜底是"追问到第 3 轮还问不齐就强制收手出方案"
+# （MAX_FOLLOWUP_ROUNDS）。所以演示要凑够三轮，才能走到"追问 → 方案"这一步 ——
+# 少一轮就停在追问，多一轮是浪费。
+#
+# 三轮回答分别补齐 check_sufficiency 关心的四件事：
+# 场景（几点、在哪、持续多久）、孩子的具体行为、试过什么效果如何、家长的目标。
+DEMO_ANSWER_1 = (
+    "早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，"
+    "抱起来能好。送进去以后老师说她今天自己吃了早饭。"
+)
+DEMO_ANSWER_2 = (
+    "在家不这样，只有去幼儿园才哭。哭的时候脸涨得通红，说不出话。"
+    "试过提前十分钟出门，也试过抱着她走过去，都没什么用。"
+)
+DEMO_ANSWER_3 = (
+    "目标是能正常入园、别在门口哭半小时。她喜欢玩积木，在幼儿园午睡也正常。"
+    "只要别在门口堵着就行，晚十分钟到也接受。"
+)
 
 DEMO_MESSAGES = [
     "孩子 4 岁，最近不愿意去幼儿园，早上出门就哭。",
-    DEMO_ANSWER,
+    DEMO_ANSWER_1,
+    DEMO_ANSWER_2,
+    DEMO_ANSWER_3,
 ]
 
 
@@ -47,6 +68,32 @@ def _show_plan(plan: dict[str, Any]) -> None:
     print(f"  停止条件：{'; '.join(plan.get('stop_conditions', []))}")
     if plan.get("uncertainty_notes"):
         print(f"  不确定：{'; '.join(plan['uncertainty_notes'])}")
+    citations = plan.get("source_citations") or []
+    if citations:
+        print(f"  标签：{plan.get('application_label')}")
+        for c in citations:
+            pages = ""
+            if c.get("pdf_page_start") is not None:
+                pages = f"，PDF 第 {c['pdf_page_start']}-{c['pdf_page_end']} 页"
+            print(f"    - {c.get('chapter') or c.get('title')}{pages}")
+            print(f"      支撑：{c.get('claim_supported')}")
+    else:
+        print(f"  标签：{plan.get('application_label')}（无指南引用）")
+
+
+def _show_evidence(items: list[dict[str, Any]]) -> None:
+    """证据面板：这次依据的是指南里哪几段。"""
+    if not items:
+        print("\n（这次没有检索到可引用的指南内容）")
+        return
+    print(f"\n【指南依据 {len(items)} 条】")
+    for i, item in enumerate(items, start=1):
+        pages = ""
+        if item.get("pdf_page_start") is not None:
+            pages = f"，PDF 第 {item['pdf_page_start']}-{item['pdf_page_end']} 页"
+        print(f"  {i}. {item.get('section_title') or item.get('title')}{pages}")
+        print(f"     {item.get('summary')}")
+        print(f"     来源：{item.get('source_type')}　审核：{item.get('review_status')}")
 
 
 async def _demo() -> None:
@@ -76,14 +123,19 @@ async def _demo() -> None:
             continue
         if status == "awaiting_plan_selection":
             plans = res["plans"]
+            _show_evidence(res.get("evidence") or [])
             for p in plans:
                 _show_plan(p)
-            continue
+            break
         print(f"\n【助手】{res['message']}")
+        _show_evidence(res.get("evidence") or [])
+        if res.get("evidence_gaps"):
+            print(f"\n（证据缺口：{'; '.join(res['evidence_gaps'])}）")
         break
 
     if status != "awaiting_plan_selection":
-        print("\n演示输入没走到方案选择就结束了，这和预期不符。")
+        print(f"\n演示输入没走到方案选择就结束了（status={status}），这和预期不符。")
+        print("如果是 limited_answer，说明证据门控没放行 —— 看上面的证据缺口。")
         return
 
     pick = next(p["plan_id"] for p in plans if p.get("recommended"))
@@ -134,6 +186,7 @@ async def _interactive() -> None:
                 print(f"  ? {q}")
             continue
         if res["status"] == "awaiting_plan_selection":
+            _show_evidence(res.get("evidence") or [])
             for p in res["plans"]:
                 _show_plan(p)
             try:
@@ -149,6 +202,7 @@ async def _interactive() -> None:
             print("（下一轮 :feedback 会让你录入这次尝试的结果）")
             continue
         print(f"\n【助手】{res['message']}")
+        _show_evidence(res.get("evidence") or [])
 
 
 async def _feedback() -> None:

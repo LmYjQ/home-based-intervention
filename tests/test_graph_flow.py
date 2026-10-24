@@ -16,7 +16,7 @@ from langgraph.types import Command
 
 from rdi_agent import llm
 from rdi_agent.graph.builder import build_graph
-from rdi_agent.graph.nodes import chat_nodes, write_nodes
+from rdi_agent.graph.nodes import chat_nodes, retrieval_nodes, write_nodes
 from rdi_agent.graph.state import CoachState
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
@@ -24,10 +24,21 @@ from rdi_agent.schemas.conversation import (
     RecommendationSet,
     SufficiencyDecision,
 )
+from rdi_agent.schemas.conversation import LimitedAnswer, SafetyReviewCheck
+from rdi_agent.schemas.evidence import EvidenceDecision
 from rdi_agent.schemas.feedback import FeedbackAnalysis
-from rdi_agent.schemas.recommendation import ParentAction, RecommendationCard
+from rdi_agent.schemas.recommendation import (
+    ParentAction,
+    RecommendationCard,
+    SourceCitation,
+)
 
 CID = "00000000-0000-0000-0000-00000000000a"
+
+# 检索节点要连库、要调 embedding。流程测试不碰这两样，
+# 所以整段检索被替身顶掉（见 no_retrieval fixture）。
+EVIDENCE_ID = "11111111-1111-1111-1111-111111111111"
+EVIDENCE_SUMMARY = "the guided participation is a way of interacting with the child"
 
 
 def _card(plan_id: str, recommended: bool) -> RecommendationCard:
@@ -39,10 +50,84 @@ def _card(plan_id: str, recommended: bool) -> RecommendationCard:
         parent_actions=[ParentAction(action="提前十分钟出门", context="早上")],
         success_indicators=["哭的时间变短"],
         stop_conditions=["一周没变化就停下重新评估"],
-        application_label="ai_adaptation",
+        application_label="source_summary",
+        source_citations=[
+            SourceCitation(
+                source_id=EVIDENCE_ID,
+                source_type="guideline",
+                title="Guided Participation",
+                chapter="Guided Participation",
+                pdf_page_start=154,
+                pdf_page_end=155,
+                claim_supported="书里讲的是 guided participation",
+            )
+        ],
         uncertainty_notes=["还不确定原因"],
         recommended=recommended,
     )
+
+
+def _bundle() -> dict:
+    """一份"有一条可用证据"的证据包。"""
+    return {
+        "original_question": "孩子 4 岁",
+        "case_summary": {},
+        "evidence": [
+            {
+                "evidence_id": EVIDENCE_ID,
+                "source_type": "guideline",
+                "title": "Guided Participation",
+                "section_title": "Guided Participation",
+                "pdf_page_start": 154,
+                "pdf_page_end": 155,
+                "print_page_start": None,
+                "print_page_end": None,
+                "summary": EVIDENCE_SUMMARY,
+                "source_excerpt": EVIDENCE_SUMMARY,
+                "relevance_reason": "向量召回第 1 名；关键词召回第 1 名",
+                "limitations": [],
+                "review_status": "unreviewed",
+                "may_quote_to_user": False,
+                "similarity": 0.61,
+                "fts_matched": True,
+            }
+        ],
+        "evidence_gaps": [],
+        "retrieval_version": "2c-v1",
+    }
+
+
+_DIRECT = EvidenceDecision(
+    evidence_status="direct",
+    supported_claims=["书里讲的是引导式参与"],
+    unsupported_claims=[],
+    missing_information=[],
+    can_support_personalized_advice=True,
+    high_risk=False,
+    needs_followup=False,
+    decision="recommend",
+)
+
+_NO_EVIDENCE = EvidenceDecision(
+    evidence_status="none",
+    supported_claims=[],
+    unsupported_claims=[],
+    missing_information=["知识库里没有对应内容"],
+    can_support_personalized_advice=False,
+    high_risk=False,
+    needs_followup=False,
+    decision="limited_answer",
+)
+
+_SAFETY_OK = SafetyReviewCheck(passed=True, severity="none", concerns=[])
+
+_LIMITED = LimitedAnswer(
+    answer="手上没有书里对应的内容，先记一记情况。",
+    low_risk_actions=["把发生的时间和当时的情形记下来"],
+    observe=["他有没有主动靠近你"],
+    when_to_seek_professional_help=["情绪持续剧烈、明显抗拒时"],
+    knowledge_gap_note="这次知识库里没有对应的内容，所以没有给出书里的结论。",
+)
 
 
 class FakeLLM:
@@ -52,6 +137,11 @@ class FakeLLM:
     用来模拟状态变化（比如第一轮说信息不足、第二轮说够了）。
     给单个值则每次都返回它。
     """
+
+    # 阶段 2C 之后，图上多了证据门控和安全复核两个要调模型的节点。
+    # 这两个的"正常答案"是固定的，脚本里没写就用默认 ——
+    # 免得每加一个用例都要记得补两行。
+    DEFAULTS: dict[type, object] = {}
 
     def __init__(self, script: dict[type, object]) -> None:
         self.script = script
@@ -65,6 +155,8 @@ class FakeLLM:
         self.calls.append(stage)
         payload = self.script.get(model_cls)
         if payload is None:
+            payload = self.DEFAULTS.get(model_cls)
+        if payload is None:
             raise AssertionError(f"{stage} 没有预置答案")
         if isinstance(payload, list):
             i = self._cursor.get(model_cls, 0)
@@ -72,6 +164,13 @@ class FakeLLM:
             payload = payload[min(i, len(payload) - 1)]
             self._cursor[model_cls] = i + 1
         return payload, llm.LLMTrace(stage=stage, model="fake", source="fake")
+
+
+FakeLLM.DEFAULTS = {
+    EvidenceDecision: _DIRECT,
+    SafetyReviewCheck: _SAFETY_OK,
+    LimitedAnswer: _LIMITED,
+}
 
 
 @pytest.fixture
@@ -82,6 +181,37 @@ def patched_llm(monkeypatch):
         return fake
 
     return _install
+
+
+@pytest.fixture
+def no_retrieval(monkeypatch):
+    """把整段检索换成替身。
+
+    检索要连 Postgres、要调 embedding API —— 流程测试不碰这两样。
+    检索本身的行为由 ``tests/test_retrieval_2c.py`` 覆盖。
+    """
+
+    async def fake_rewrite(state):
+        return {
+            "retrieval_queries": {
+                "original_query": state.get("user_message", ""),
+                "semantic_query": state.get("user_message", ""),
+                "keyword_query": state.get("user_message", ""),
+                "concept_ids": [],
+                "filters": {},
+                "bridged_terms": [],
+            }
+        }
+
+    async def fake_retrieve(state):
+        return {"retrieval_candidates": []}
+
+    async def fake_rerank(state):
+        return {"evidence_bundle": _bundle()}
+
+    monkeypatch.setattr(retrieval_nodes, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(retrieval_nodes, "retrieve_knowledge", fake_retrieve)
+    monkeypatch.setattr(retrieval_nodes, "rerank_and_expand", fake_rerank)
 
 
 @pytest.fixture
@@ -106,6 +236,12 @@ def no_writes(monkeypatch):
             "final_answer": "已经选定。",
         }
 
+    async def fake_persist_bundle(state: CoachState) -> dict:
+        return {"evidence_bundle_db_id": "bundle_fake"}
+
+    monkeypatch.setattr(
+        write_nodes, "persist_evidence_bundle", fake_persist_bundle
+    )
     monkeypatch.setattr(write_nodes, "persist_candidate_plans", fake_persist)
     monkeypatch.setattr(write_nodes, "commit_plan_selection", fake_commit)
     return seen
@@ -140,7 +276,7 @@ _SUFFICIENT = SufficiencyDecision(requires_followup=False)
 
 # ------------------------------------------------------------------ 追问
 @pytest.mark.asyncio
-async def test_insufficient_info_triggers_followup(patched_llm, no_writes):
+async def test_insufficient_info_triggers_followup(patched_llm, no_writes, no_retrieval):
     patched_llm(
         {
             CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
@@ -160,12 +296,14 @@ async def test_insufficient_info_triggers_followup(patched_llm, no_writes):
 
 
 @pytest.mark.asyncio
-async def test_enough_info_skips_followup(patched_llm, no_writes):
+async def test_enough_info_skips_followup(patched_llm, no_writes, no_retrieval):
     """信息够就直奔方案，中间不追问。"""
     fake = patched_llm(
         {
             CaseSummary: CaseSummary(observed_facts=["4 岁", "早上出门哭五分钟"]),
             SufficiencyDecision: _SUFFICIENT,
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
             RecommendationSet: RecommendationSet(
                 plans=[_card("plan_1", True), _card("plan_2", False)]
             ),
@@ -179,7 +317,9 @@ async def test_enough_info_skips_followup(patched_llm, no_writes):
 
 
 @pytest.mark.asyncio
-async def test_answer_resumes_from_the_same_interrupt(patched_llm, no_writes):
+async def test_answer_resumes_from_the_same_interrupt(
+    patched_llm, no_writes, no_retrieval
+):
     """补充信息后从原中断点恢复：追问轮数 +1，然后出方案。
 
     SufficiencyDecision 给的是列表 —— 第一轮"不够"所以会追问，
@@ -193,6 +333,8 @@ async def test_answer_resumes_from_the_same_interrupt(patched_llm, no_writes):
                 SufficiencyDecision(requires_followup=True, reasons=["缺细节"]),
                 _SUFFICIENT,
             ],
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
             FollowupQuestions: FollowupQuestions(questions=["哭多久？"]),
             RecommendationSet: RecommendationSet(
                 plans=[_card("plan_1", True), _card("plan_2", False)]
@@ -212,7 +354,7 @@ async def test_answer_resumes_from_the_same_interrupt(patched_llm, no_writes):
 
 
 @pytest.mark.asyncio
-async def test_followup_stops_after_three_rounds(patched_llm, no_writes):
+async def test_followup_stops_after_three_rounds(patched_llm, no_writes, no_retrieval):
     """追问 3 轮还不齐就必须出方案，不能无限问下去。"""
     fake = patched_llm(
         {
@@ -249,12 +391,14 @@ def _count_followups(fake: FakeLLM) -> int:
 
 # ------------------------------------------------------------------ 选方案
 @pytest.mark.asyncio
-async def test_select_plan_commits(patched_llm, no_writes):
+async def test_select_plan_commits(patched_llm, no_writes, no_retrieval):
     """选完方案才写库；写入的正是选中的那张。"""
     patched_llm(
         {
             CaseSummary: CaseSummary(observed_facts=["4 岁"]),
             SufficiencyDecision: _SUFFICIENT,
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
             RecommendationSet: RecommendationSet(
                 plans=[_card("plan_1", True), _card("plan_2", False)]
             ),
@@ -282,19 +426,28 @@ async def test_present_plans_has_no_side_effects(monkeypatch):
     LangGraph 的 `interrupt` 语义：resume 的时候，含 `interrupt()` 的
     整个节点再执行一遍。所以带中断的节点里任何写库/调模型都会翻倍。
 
-    做法：把中断**之前**的节点都换成干净的替身（它们该做的事已经由
-    别的用例覆盖了），然后把 `llm.chat_json` 和 `write_nodes.session_scope`
-    换成会抛异常的探针。跑到方案选择中断，再 resume 一次 ——
+    做法：跑到方案选择中断，再 resume 一次 —— 恢复窗口里
     探针一次都不该被碰，只有 commit 该跑。
+
+    **阶段 2C 之后中断前面多了几个调模型的节点**（证据门控、安全复核），
+    所以探针是"上膛"式的：第一遍正常跑，第二遍（resume）才装探针。
+    否则测的就不是恢复路径，而是"前半段流程有没有调模型"。
 
     `persist_candidate_plans` 也换掉：它在中断之前，本来就该写库，
     留着会让探针在分界点之前就炸，把正确行为当失败。
     """
     touched: list[str] = []
+    armed = {"on": False}
 
-    async def boom_llm(**kwargs):
-        touched.append(f"llm:{kwargs['stage']}")
-        raise AssertionError(f"恢复窗口里不该调 LLM：{kwargs['stage']}")
+    async def fake_llm(**kwargs):
+        if armed["on"]:
+            touched.append(f"llm:{kwargs['stage']}")
+            raise AssertionError(f"恢复窗口里不该调 LLM：{kwargs['stage']}")
+        model_cls = kwargs["model_cls"]
+        payload = FakeLLM.DEFAULTS.get(model_cls)
+        if payload is None:
+            raise AssertionError(f"{kwargs['stage']} 没有预置答案")
+        return payload, llm.LLMTrace(stage=kwargs["stage"], model="fake", source="fake")
 
     def boom_scope(*a, **kw):
         touched.append("db")
@@ -317,13 +470,32 @@ async def test_present_plans_has_no_side_effects(monkeypatch):
     async def fake_build(state: CoachState) -> dict:
         return {"candidate_plans": [_card("plan_1", True).model_dump(mode="json")]}
 
-    monkeypatch.setattr(llm, "chat_json", boom_llm)
+    async def fake_rewrite(state):
+        return {"retrieval_queries": {}}
+
+    async def fake_retrieve(state):
+        return {"retrieval_candidates": []}
+
+    async def fake_rerank(state):
+        return {"evidence_bundle": _bundle()}
+
+    monkeypatch.setattr(llm, "chat_json", fake_llm)
+    async def fake_persist_bundle(state: CoachState) -> dict:
+        touched.append("persist_bundle")
+        return {"evidence_bundle_db_id": "bundle_fake"}
+
     monkeypatch.setattr(write_nodes, "session_scope", boom_scope)
     monkeypatch.setattr(write_nodes, "commit_plan_selection", fake_commit)
+    monkeypatch.setattr(
+        write_nodes, "persist_evidence_bundle", fake_persist_bundle
+    )
     monkeypatch.setattr(write_nodes, "persist_candidate_plans", fake_persist)
     monkeypatch.setattr(chat_nodes, "parse_parent_input", fake_parse)
     monkeypatch.setattr(chat_nodes, "check_sufficiency", fake_sufficiency)
     monkeypatch.setattr(chat_nodes, "build_recommendation", fake_build)
+    monkeypatch.setattr(retrieval_nodes, "rewrite_query", fake_rewrite)
+    monkeypatch.setattr(retrieval_nodes, "retrieve_knowledge", fake_retrieve)
+    monkeypatch.setattr(retrieval_nodes, "rerank_and_expand", fake_rerank)
 
     graph = build_graph(checkpointer=InMemorySaver())
     cfg = {"configurable": {"thread_id": "pure"}}
@@ -332,10 +504,12 @@ async def test_present_plans_has_no_side_effects(monkeypatch):
     first = await graph.ainvoke(_state("x"), config=cfg)
     assert _interrupt(first) is not None, "没到中断点，探针断言就没意义了"
     assert _interrupt(first)["kind"] == "plan_selection"
-    assert touched == ["persist"], f"中断前只该落候选卡，实际：{touched}"
+    assert "persist" in touched, "中断前该落候选卡"
+    assert "persist_bundle" in touched, "证据包也该在中断前落库"
 
     # 第二次：resume。present_plans 重跑，只有 commit 该有副作用。
     touched.clear()
+    armed["on"] = True
     await graph.ainvoke(Command(resume={"plan_id": "plan_1"}), config=cfg)
 
     assert touched == ["commit"], f"恢复期间除了 commit 不该有别的副作用：{touched}"

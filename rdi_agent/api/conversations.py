@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from langgraph.types import Command
 from pydantic import BaseModel
 
 from rdi_agent.db.engine import session_scope
@@ -67,13 +68,74 @@ def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else {"raw": str(value)}
 
 
-def _status_of(interrupt_payload: dict[str, Any] | None) -> str:
-    if interrupt_payload is None:
-        return "completed"
-    kind = interrupt_payload.get("kind")
-    return {"followup": "awaiting_followup", "plan_selection": "awaiting_plan_selection"}.get(
-        kind, "interrupted"
-    )
+async def _pending_interrupt(config: dict[str, Any]) -> dict[str, Any] | None:
+    """当前 thread 停在哪个中断上。没有就返回 None。
+
+    没有它就没法判断"这次调用是新开一轮，还是在回答上一个问题"——
+    而这个判断决定了要传普通 dict 还是 Command(resume=...)。
+    """
+    try:
+        snapshot = await get_graph().aget_state(config)
+    except RuntimeError:
+        return None
+    for task in snapshot.tasks or ():
+        for intr in getattr(task, "interrupts", None) or ():
+            value = getattr(intr, "value", None)
+            return value if isinstance(value, dict) else {"raw": str(value)}
+    return None
+
+
+def _status_of(
+    interrupt_payload: dict[str, Any] | None,
+    result: dict[str, Any] | None = None,
+) -> str:
+    """这一轮的状态。
+
+    阶段 2C 之后多了一种"跑完了但没给建议卡"的情况 ——
+    证据不够（limited_answer）或者家长报告了风险信号
+    （needs_professional_support）。这两种都要和"正常完成"区分开，
+    否则前端会把"我没给建议"当成"建议生成完了"。
+    """
+    if interrupt_payload is not None:
+        kind = interrupt_payload.get("kind")
+        return {
+            "followup": "awaiting_followup",
+            "plan_selection": "awaiting_plan_selection",
+        }.get(kind, "interrupted")
+    decision = (result or {}).get("evidence_decision") or {}
+    if decision.get("high_risk"):
+        return "needs_professional_support"
+    if decision.get("decision") == "limited_answer":
+        return "limited_answer"
+    return "completed"
+
+
+def _evidence_panel(bundle: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """证据面板（计划 §9.3：章节、页码、摘要、来源标签、审核状态）。
+
+    **不给原文**：这份指南的授权没核实过，``may_quote_to_user`` 恒为 False，
+    所以响应里只有摘要和页码，没有 ``source_excerpt``。
+    """
+    if not bundle:
+        return []
+    panel: list[dict[str, Any]] = []
+    for item in bundle.get("evidence") or []:
+        panel.append(
+            {
+                "evidence_id": item.get("evidence_id"),
+                "source_type": item.get("source_type"),
+                "title": item.get("title"),
+                "section_title": item.get("section_title"),
+                "pdf_page_start": item.get("pdf_page_start"),
+                "pdf_page_end": item.get("pdf_page_end"),
+                "summary": item.get("summary"),
+                "relevance_reason": item.get("relevance_reason"),
+                "review_status": item.get("review_status"),
+                "similarity": item.get("similarity"),
+                "may_quote_to_user": item.get("may_quote_to_user", False),
+            }
+        )
+    return panel
 
 
 async def _ensure_identity(
@@ -145,23 +207,38 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
         context = await repo.child_context(child_id)
 
     graph = get_graph()
-    result = await graph.ainvoke(
-        {
-            "entrypoint": "chat",
-            "conversation_id": conversation_id,
-            "thread_id": conversation_id,
-            "family_id": family_id,
-            "child_id": child_id,
-            "turn_id": turn_id,
-            "user_message": req.message,
-            "child_context": context,
-            "debug": req.debug,
-        },
-        config=config_for(conversation_id),
-    )
+    config = config_for(conversation_id)
+    pending = await _pending_interrupt(config)
+
+    if pending and pending.get("kind") == "followup":
+        # 这条消息是**回答上一个追问**，不是新开一轮。
+        # 必须用 Command(resume=...) 恢复：普通 dict 会让图从 START 重跑，
+        # await_user_answer 永远跑不完，followup_rounds 也就永远停在 0，
+        # "追问 3 轮就收手"的兜底形同虚设。
+        result = await graph.ainvoke(
+            Command(resume=req.message, update={"turn_id": turn_id}),
+            config=config,
+        )
+    else:
+        result = await graph.ainvoke(
+            {
+                "entrypoint": "chat",
+                "conversation_id": conversation_id,
+                "thread_id": conversation_id,
+                "family_id": family_id,
+                "child_id": child_id,
+                "turn_id": turn_id,
+                "user_message": req.message,
+                "child_context": context,
+                "debug": req.debug,
+            },
+            config=config,
+        )
 
     interrupt_payload = _interrupt_payload(result)
-    status = _status_of(interrupt_payload)
+    status = _status_of(interrupt_payload, result)
+    evidence = _evidence_panel(result.get("evidence_bundle"))
+    decision = result.get("evidence_decision") or {}
 
     # 助手侧也记一条，方便 GET 查回完整对话。
     assistant_text = result.get("final_answer") or ""
@@ -189,6 +266,18 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
         "plans": (interrupt_payload or {}).get("plans", []),
         "message": assistant_text,
         "trial_id": result.get("trial_id"),
+        # 证据面板：家长能看见"这次依据的是书里哪几段"
+        "evidence": evidence,
+        "evidence_decision": {
+            "evidence_status": decision.get("evidence_status"),
+            "can_support_personalized_advice": decision.get(
+                "can_support_personalized_advice"
+            ),
+            "missing_information": decision.get("missing_information") or [],
+        },
+        "evidence_gaps": (result.get("evidence_bundle") or {}).get(
+            "evidence_gaps"
+        ) or [],
     }
 
 
@@ -199,10 +288,30 @@ async def select_plan(conversation_id: str, req: SelectPlanRequest) -> dict[str,
     turn_id = req.turn_id or _new_id("turn")
 
     graph = get_graph()
-    result = await graph.ainvoke(
-        {"selected_plan_id": req.plan_id, "turn_id": turn_id},
-        config=config_for(conversation_id),
-    )
+    config = config_for(conversation_id)
+    pending = await _pending_interrupt(config)
+
+    if pending and pending.get("kind") == "plan_selection":
+        # 同样要恢复：present_plans 后面才是 commit_plan_selection，
+        # 不恢复的话 trial 根本不会被创建。
+        result = await graph.ainvoke(
+            Command(resume={"plan_id": req.plan_id}, update={"turn_id": turn_id}),
+            config=config,
+        )
+    else:
+        # 没有待选的中断：可能已经选过了（重试），从已落库的结果里回读。
+        snapshot = await graph.aget_state(config)
+        values = snapshot.values or {}
+        if values.get("selected_plan_id") == req.plan_id and values.get("trial_id"):
+            return {
+                "conversation_id": conversation_id,
+                "status": "completed",
+                "selected_plan_id": values.get("selected_plan_id"),
+                "selected_plan_db_id": values.get("selected_plan_db_id"),
+                "trial_id": values.get("trial_id"),
+                "message": values.get("final_answer", ""),
+            }
+        raise HTTPException(409, "当前会话没有待选的方案")
     if result.get("error_code"):
         raise HTTPException(404, f"选方案失败：{result['error_code']}")
 
@@ -238,15 +347,24 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
     except RuntimeError:
         pending = None  # 图没 setup（比如只跑 /health），不算错误
 
+    values: dict[str, Any] = {}
+    try:
+        snapshot = await get_graph().aget_state(config_for(conversation_id))
+        values = snapshot.values or {}
+    except RuntimeError:
+        values = {}
+
     return {
         "conversation_id": conversation_id,
         "family_id": family_id,
         "child_id": child_id,
         "child_context": context,
-        "status": _status_of(pending),
+        "status": _status_of(pending, values),
         "pending_interrupt": pending,
         "interactions": interactions,
         "plans": plans,
+        "evidence": _evidence_panel(values.get("evidence_bundle")),
+        "evidence_decision": values.get("evidence_decision") or {},
     }
 
 

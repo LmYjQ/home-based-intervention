@@ -17,7 +17,14 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from rdi_agent.db.models import Child, Feedback, Interaction, Plan, Trial
+from rdi_agent.db.models import (
+    Child,
+    EvidenceBundleRecord,
+    Feedback,
+    Interaction,
+    Plan,
+    Trial,
+)
 from rdi_agent.schemas.feedback import FeedbackSubmission
 from rdi_agent.schemas.recommendation import RecommendationCard
 
@@ -136,6 +143,66 @@ class Repository:
             for r in rows
         ]
 
+    # ------------------------------------------------------------ 证据包
+    async def save_evidence_bundle(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        bundle: dict[str, Any],
+        retrieval_version: str = "v1",
+    ) -> uuid.UUID:
+        """把证据包落库，返回它的 id。
+
+        幂等：靠 ``evidence_bundles`` 上的 UNIQUE(conversation_id, turn_id)
+        挡重放（迁移 003 加的）。
+
+        **重复写会覆盖**：同一轮里如果发生过追问循环，检索会跑不止一次，
+        最后一次才是"最终回答所依据的那份"。所以这里用 DO UPDATE 而不是
+        DO NOTHING —— 追溯时要看到的是给出回答时依据的那份。
+        """
+        stmt = (
+            pg_insert(EvidenceBundleRecord)
+            .values(
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                bundle_json=bundle,
+                retrieval_version=retrieval_version,
+            )
+            .on_conflict_do_update(
+                constraint="uq_evidence_bundles_conversation_turn",
+                set_={
+                    "bundle_json": bundle,
+                    "retrieval_version": retrieval_version,
+                },
+            )
+            .returning(EvidenceBundleRecord.id)
+        )
+        new_id = (await self.session.execute(stmt)).scalar_one_or_none()
+        if new_id is not None:
+            return new_id
+        existing = (
+            await self.session.execute(
+                select(EvidenceBundleRecord).where(
+                    EvidenceBundleRecord.conversation_id == conversation_id,
+                    EvidenceBundleRecord.turn_id == turn_id,
+                )
+            )
+        ).scalar_one()
+        return existing.id
+
+    async def get_evidence_bundle(
+        self, conversation_id: str, turn_id: str
+    ) -> EvidenceBundleRecord | None:
+        return (
+            await self.session.execute(
+                select(EvidenceBundleRecord).where(
+                    EvidenceBundleRecord.conversation_id == conversation_id,
+                    EvidenceBundleRecord.turn_id == turn_id,
+                )
+            )
+        ).scalar_one_or_none()
+
     # ------------------------------------------------------------ 方案
     async def save_candidate_plans(
         self,
@@ -144,6 +211,7 @@ class Repository:
         family_id: str,
         child_id: str | None,
         cards: list[RecommendationCard],
+        evidence_bundle_id: uuid.UUID | None = None,
     ) -> dict[str, uuid.UUID]:
         """把候选建议卡落库，返回 {plan_id: db_uuid}。
 
@@ -168,6 +236,7 @@ class Repository:
                 child_id=uuid.UUID(str(child_id)) if child_id else None,
                 conversation_id=conversation_id,
                 plan_json=card.model_dump(mode="json"),
+                evidence_bundle_id=evidence_bundle_id,
                 application_label=card.application_label,
                 recommended=card.recommended,
                 status="proposed",

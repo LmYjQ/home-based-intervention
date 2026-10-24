@@ -1,20 +1,120 @@
-# 基于 LangGraph 的 RDI 家长干预建议智能体：可执行实施计划
+# 基于 LangGraph 的 孤独症家长干预建议智能体：可执行实施计划
 
-> **版本**：v2.0（合并版）
+> **版本**：v3.0（全中文改造后）
 > **合并来源**：`langgraph_family_assistant_phased_plan.md` + `RDI_家长干预建议智能体_知识库Schema_RAG与LangGraph设计.md`
 > **文档定位**：本文件是唯一执行依据。原 RDI 设计文档保留为背景资料；两者冲突时，以本文件为准。
-> **实施方式**：按阶段推进，每阶段末尾有明确验收标准。未通过验收，不进入下一阶段。阶段 2A（书籍入库）可以与阶段 1 并行。
+> **实施方式**：按阶段推进，每阶段末尾有明确验收标准。未通过验收，不进入下一阶段。阶段 2A（知识库入库）可以与阶段 1 并行。
+>
+> **v3.0 变更（2026-10-24）**：知识库从《The RDI Book》（英文）换成
+> 《孤独症谱系障碍儿童干预康复指南（2026 年版）》（中文，扫描件）。
+> 整条链路**全中文** —— 知识库是中文，家长输入是中文。
+> 这消掉了原来的一整层跨语言机器（英文书 → 中文查询、zh→en 术语桥接、
+> `to_tsvector('english')`），代价是**中文分词**成为关键词路的必要条件。
+> 详见 §0.1。
 
 ---
 
 ## 0. TL;DR
 
-- **最终形态**：一个基于 LangGraph 的家长建议智能体。家长用中文描述孩子的情况，系统先判断信息是否足够，再从《The RDI Book》检索可追溯证据，生成 2–3 张结构化建议卡，用户选择并执行后提交反馈，系统结合长期记忆调整下一轮建议。
+- **最终形态**：一个基于 LangGraph 的家长建议智能体。家长用中文描述孩子的情况，系统先判断信息是否足够，再从《孤独症谱系障碍儿童干预康复指南（2026 年版）》检索可追溯证据，生成 2–3 张结构化建议卡，用户选择并执行后提交反馈，系统结合长期记忆调整下一轮建议。
 - **这次重新开始**：旧代码只保留 `llm.py` 中已踩过坑的 3 个能力（`json_schema` 结构化输出、超时/重试、live/replay/capture），业务代码全部重写。新代码只写 `rdi_agent/`，旧目录冻结。
 - **阶段 2 是 RAG 主战场**，拆成 2A 入库、2B 检索、2C 接入图与证据门控，每个子阶段单独验收。
+- **知识库是中文指南**（`guideline2026`），家长输入也是中文 —— 检索链路**全中文**，
+  没有跨语言桥接。术语桥接改成**中文口语 → 中文规范术语**。
 - **技术底座**：FastAPI + LangGraph + Pydantic v2 + PostgreSQL 16 + pgvector（业务数据、向量、全文检索、Checkpointer）+ SiliconFlow（Chat / `BAAI/bge-m3` Embedding）。
 - **最重要的工程原则**：业务数据、图执行状态、知识来源三者从第一天分开；建议卡从阶段 1 就按最终契约定义，阶段 2 只补证据字段，不重写 schema。
 - **单人预计**：约 17–24 个工作日。阶段 1 结束应有一个可演示闭环；阶段 2 结束应能展示“有出处、会拒答”的 RAG。
+
+---
+
+## 0.1 v3.0：全中文链路（2026-10-24）
+
+知识库换成中文指南之后，整条链路的设计跟着变了几处。**这些改动散落在
+后面各节，这里先集中列一遍**，免得读的人到处找。
+
+### 知识源
+
+| | 原来（v2.0） | 现在（v3.0） |
+|---|---|---|
+| `source_id` | `the_rdi_book_2009` | `guideline2026` |
+| 标题 | The RDI Book | 孤独症谱系障碍儿童干预康复指南（2026 年版） |
+| 语言 | en | zh |
+| 入库源 | PDF（有文字层，`fitz` 抽文本） | **分页 Markdown**（扫描件，PDF 无文字层） |
+| 解析模块 | `rag/ingest/parse_pdf.py` | `rag/ingest/parse_md.py` |
+| 章节树 | `rag/ingest/sections.py`（读目录） | `rag/ingest/sections_zh.py`（读标题，无目录） |
+| 章节数 | 29 | 21 |
+
+**为什么入库源是 Markdown**：指南是扫描件，PDF 里抽不出文字（`fitz` 返回空串）。
+所以入库源是 OCR 转出来的**分页 Markdown** —— 一个文件对应 PDF 的一页，
+**页码因此能保留**，引用可以翻回扫描件。
+
+**为什么章节树靠标题而不是目录**：这份指南**没有目录页**。章节层级从
+Markdown 的 `#` 标题里重建，`sections_zh.py` 负责。
+
+### 关键词路：分词从"可选"变成"必需"
+
+`content_tsv` 是 `to_tsvector('simple', content_normalized)` 的生成列。
+`simple` 配置**按空格分词** —— 中文连写的话，整段会变成**一个** lexeme，
+关键词路等于没有。
+
+所以：
+
+- **入库侧**：`clean.normalize_zh()` 用 jieba 分词，中文路径产出
+  `（ 一 ） 早期干预 。 早期干预 可以 显著 ...` 这样空格分隔的文本；
+- **查询侧**：`query_rewrite` 同样用 jieba 分词（`segment_zh`），两边形态一致；
+- **指南术语进 jieba 词典**：`挑战性行为` 默认被切成 "挑战/性/行为"，
+  加进自定义词典后才是整词 —— 术语命中精度直接受影响。
+
+英文路径（`clean.normalize`，NFKC）保留着，将来接英文资料时能用。
+
+**跨语言桥接没了**。原来家长说中文、书是英文，要靠 `concept_aliases`
+把中文桥成英文词才能命中。现在是**中文口语 → 中文规范术语**：
+
+| 家长说 | 指南写 |
+|---|---|
+| 发脾气 | 挑战性行为 |
+| 奖励 | 正强化 |
+| 抽风 | 癫痫 |
+
+### 契约去"英文书"化
+
+| 原来 | 现在 |
+|---|---|
+| `application_label: "book_summary"` | `"source_summary"` |
+| `SourceCitation.source_type: "book"` | `"guideline"` |
+| `concept_aliases.canonical_name_en` | `canonical_name` |
+| `concept_aliases.aliases_en_json` | 删除（只留 `aliases_zh_json`） |
+
+`SourceType` 枚举现在是 `guideline / external_research / professional_review /
+child_observation / application_pattern`。
+
+前端 `PlanCard.vue` 显示中文标签：指南依据 / 应用转化 / 专业审核。
+
+### 迁移
+
+`alembic/versions/004_chinese_guideline_source.py` 做三件事：
+
+1. `content_tsv` 生成列换成 `to_tsvector('simple', ...)`，GIN 索引重建；
+2. `concept_aliases` 改列名、删 `aliases_en_json`；
+3. 存量 JSON 里的 `"book"` / `"book_summary"` 用 `jsonb_set` 迁成
+   `"guideline"` / `"source_summary"`。
+
+### 当前指标
+
+评测集 37 条中文用例（34 相关 + 3 无关），`evals/retrieval_cases.jsonl`：
+
+| 指标 | 值 | 目标 |
+|---|---|---|
+| Recall@5 | **0.8529**（29/34） | ≥ 0.80 |
+| MRR | **0.5515** | — |
+| 页码可定位率 | **100%** | 100% |
+| 必含术语命中率 | 0.6471 | — |
+| 硬凑率（无关题） | **0%** | ≈ 0 |
+| 硬凑率（可作依据） | **0%** | 0 |
+
+**注意**：v2.0 时期报的是 0.88 —— 那个数字是在**评测脚本有两个 bug** 的
+情况下跑出来的（见 §9.2 的「评测脚本的两个 bug」）。修完之后真实数字是
+0.8529，不是变差了，是之前报高了。
 
 ---
 
@@ -98,7 +198,7 @@ git switch -c rebuild/rdi-agent
 |---|---|---|---|
 | 业务数据 | PostgreSQL 业务表 | 交互、方案、反馈、观察、假设、尝试 | 不能把 checkpoint 当业务记录 |
 | 图执行状态 | LangGraph Checkpointer（PostgreSQL，独立 schema） | 暂停、恢复、检查、Time Travel | 不能当长期记忆 |
-| 知识库 | PostgreSQL 元数据 + pgvector + 全文索引 | 书籍片段、章节、页码、检索 | 不能和儿童数据混在同一组表/集合 |
+| 知识库 | PostgreSQL 元数据 + pgvector + 全文索引 | 指南片段、章节、页码、检索 | 不能和儿童数据混在同一组表/集合 |
 
 一句话：**Checkpoint 记录“流程走到哪”，业务表记录“现实中发生了什么”，知识库记录“书上说了什么”。**
 
@@ -114,7 +214,7 @@ parse_parent_input           抽取事实、目标、情境、已尝试行为、
 check_sufficiency            信息够不够？
    |-- 不够 --> generate_followup --> interrupt 追问 --> 回到 parse_parent_input
    |
-   +-- 够 --> rewrite_query          中文问题 -> 语义查询 + 英文关键词查询 + 概念别名
+   +-- 够 --> rewrite_query          中文问题 -> 语义查询 + 分词关键词查询 + 概念别名
                 |
              retrieve_knowledge      pgvector + PostgreSQL 全文检索 + 元数据过滤
                 |
@@ -465,7 +565,7 @@ class RecommendationCard(BaseModel):
     success_indicators: list[str]
     stop_conditions: list[str]
     source_citations: list[SourceCitation] = Field(default_factory=list)
-    application_label: Literal["book_summary", "ai_adaptation", "expert_reviewed"]
+    application_label: Literal["source_summary", "ai_adaptation", "expert_reviewed"]
     uncertainty_notes: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
     recommended: bool = False
@@ -478,9 +578,9 @@ class RecommendationCard(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def book_summary_needs_citation(self):
-        if self.application_label == "book_summary" and not self.source_citations:
-            raise ValueError("book_summary 必须至少有一条真实引用")
+    def source_summary_needs_citation(self):
+        if self.application_label == "source_summary" and not self.source_citations:
+            raise ValueError("source_summary 必须至少有一条真实引用")
         return self
 ```
 
@@ -488,7 +588,7 @@ class RecommendationCard(BaseModel):
 
 1. `RecommendationCard` 的每一条 `source_citations` 必须能在当前 `EvidenceBundle` 中找到对应 `evidence_id`；找不到就判定为编造引用，整张卡重试或降级为 `limited_answer`。
 2. `success_indicators` 和 `stop_conditions` 不得为空，由 Pydantic 强制。
-3. `book_summary` 必须有 citation；没有直接证据时只能是 `ai_adaptation`。
+3. `source_summary` 必须有 citation；没有直接证据时只能是 `ai_adaptation`。
 4. `expert_reviewed` 第一阶段不实现，出现即拒绝。
 
 ### 4.4 PostgreSQL 表设计
@@ -501,10 +601,10 @@ class RecommendationCard(BaseModel):
 
 | 表 | 作用 | 关键字段 | 约束/说明 |
 |---|---|---|---|
-| `knowledge_sources` | 来源登记 | `id`, `source_type`, `title`, `authors_json`, `publication_year`, `language`, `rights_status`, `source_uri`, `content_hash`, `version` | `source_id` 固定如 `the_rdi_book_2009`；`rights_status='internal_review_only'` |
+| `knowledge_sources` | 来源登记 | `id`, `source_type`, `title`, `authors_json`, `publication_year`, `language`, `rights_status`, `source_uri`, `content_hash`, `version` | `source_id` 固定如 `guideline2026`；`rights_status='internal_review_only'` |
 | `book_sections` | 章节树 | `id`, `source_id`, `parent_section_id`, `section_code`, `title_original`, `title_zh`, `section_order`, `pdf_page_start`, `pdf_page_end`, `print_page_start`, `print_page_end`, `parse_status` | `section_code` 唯一；PDF 页码与印刷页码分开，印刷页码无法确认就置空 |
 | `knowledge_chunks` | 父子块 | `id`, `source_id`, `section_id`, `parent_chunk_id`, `chunk_index`, `content_original`, `content_normalized`, `content_tsv`, `embedding`, `summary_zh`, `knowledge_type`, `concept_ids_json`, `pdf_page_start`, `pdf_page_end`, `print_page_start`, `print_page_end`, `parse_confidence`, `review_status`, `embedding_model`, `embedding_version` | 向量存 `embedding vector(1024)`；全文索引用生成列 `content_tsv`；`summary_zh` 可空，按需生成并缓存 |
-| `concept_aliases` | 检索用术语表（B 层简化版） | `concept_id`, `canonical_name_en`, `aliases_zh_json`, `aliases_en_json`, `source_chunk_ids_json`, `is_explicit_in_source`, `limitations_json`, `review_status`, `version` | 首版只做 30–50 个核心术语；不做概念因果图 |
+| `concept_aliases` | 检索用术语表（B 层简化版） | `concept_id`, `canonical_name`, `aliases_zh_json`, `source_chunk_ids_json`, `is_explicit_in_source`, `limitations_json`, `review_status`, `version` | **只有中文别名**（v3.0 去掉了 `canonical_name_en` / `aliases_en_json`）；53 个核心术语；不做概念因果图 |
 | `application_patterns` | 应用转化库（C 层） | 字段同 RDI 设计稿 4.5 | **首版不建表**，用 prompt 模板和 `RecommendationCard` 字段承载 |
 | `external_evidence` | 外部研究（D 层） | — | **首版不做**，留接口 |
 
@@ -558,7 +658,8 @@ CREATE UNIQUE INDEX uq_feedback_turn ON feedbacks(trial_id, turn_id);
 说明：
 
 - 内置全文检索用 `to_tsvector('english', ...)` + GIN，排序用 `ts_rank_cd`；**它不是 BM25**。
-- 书是英文，关键词通道主要召回英文术语、章节名和关键短语；中文查询先由 `rewrite_query` 转成英文关键词。
+- 知识库是中文，关键词通道召回指南术语、章节名和关键短语；查询侧用 jieba 分词，
+  和入库侧形态一致（`content_tsv` 用 `to_tsvector('simple', ...)`，按空格切词）。
 - 语义召回由 bge-m3 + pgvector 负责；一本书几千个块，HNSW 足够，精确扫描也可接受。
 - 若启用 ParadeDB `pg_search`，另建 BM25 索引，`KEYWORD_BACKEND=paradedb_bm25`；不改变表结构。
 - 中文摘要检索暂不做；需要时加 `pg_trgm` 或中文分词扩展。
@@ -578,36 +679,56 @@ CREATE UNIQUE INDEX uq_feedback_turn ON feedbacks(trial_id, turn_id);
 
 | 层 | 内容 | 首版策略 |
 |---|---|---|
-| A `book_evidence` | 从书中直接解析、可定位的原文片段 | **必须做**。这是所有书籍类引用的唯一来源；儿童观察走业务表 |
+| A `book_evidence` | 从指南直接解析、可定位的原文片段 | **必须做**。这是所有指南类引用的唯一来源；儿童观察走业务表 |
 | B `rdi_concepts` | 人工整理的概念、别名、定义、边界 | **轻量做**。只做 `concept_aliases`，用于查询扩展，不做因果图 |
-| C `application_patterns` | 把书中原则转成家长可理解的行动框架 | **用契约承载**。暂不建表，落在 `RecommendationCard.parent_actions / success_indicators / stop_conditions`，明确标记 `ai_adaptation` |
+| C `application_patterns` | 把指南原则转成家长可理解的行动框架 | **用契约承载**。暂不建表，落在 `RecommendationCard.parent_actions / success_indicators / stop_conditions`，明确标记 `ai_adaptation` |
 | D `external_evidence` | 当前研究、指南、专业审核 | **暂不做**。接口预留，避免首版知识源膨胀 |
 
-关键原则：**A 层提供“书上说了什么”，C 层提供“可以怎么尝试”，两者不能混写。** 检索结果和回答都要能看出当前内容属于哪一层。
+关键原则：**A 层提供“指南说了什么”，C 层提供“可以怎么尝试”，两者不能混写。** 检索结果和回答都要能看出当前内容属于哪一层。
 
-### 5.2 已核实的 PDF 情况与入库流水线
+### 5.2 已核实的源文件情况与入库流水线
 
-当前仓库的 `the_rdi_book.pdf`：
+> **v3.0 重写**：源从《The RDI Book》换成《孤独症谱系障碍儿童干预康复指南
+> （2026 年版）》。两者的"毛病"完全不同，入库流水线跟着变。
+
+#### 旧源（英文书，v2.0，已删除）
 
 - 392 页，PDF 1.4，Calibre 生成，有文本层；
 - 抽查第 30 页可正常抽取英文正文，封面页无文本；
 - 默认**不需要 OCR**，只对少数字符数异常低的页面做 OCR 兜底；
-- PDF 页码 ≠ 书籍印刷页码，不能用一个固定偏移量全局换算。
+- PDF 页码 ≠ 书籍印刷页码，不能用一个固定偏移量全局换算；
+- **有目录页**，章节树从目录生成。
+
+#### 新源（中文指南，v3.0，当前）
+
+- 25 页，**扫描件 —— PDF 里没有文字层**（`fitz` 抽出来是空串）；
+- 所以入库源是 OCR 转出来的**分页 Markdown**：`data/ocr/guideline2026/page_001.md`
+  … `page_025.md`，一个文件对应 PDF 的一页，**页码因此能保留**；
+- **没有目录页** —— 章节树从 Markdown 的 `#` 标题重建（`sections_zh.py`）；
+- 正文里有 4 个**宽表格附件**（附件 1–4），一行就是一条完整的干预要点，
+  切块时要特殊处理（见 §5.3）；
+- OCR 质量参差（"爆发气"、"困难"之类的错字），**不要试图在清洗阶段修正**
+  —— 改了反而对不上原文，引用要能翻回扫描件。
 
 入库流水线（对应 `rdi_agent/rag/ingest/`）：
 
-1. **登记来源**：书名、作者、出版年、语言、文件哈希、版权状态 `internal_review_only`。
-2. **逐页抽取**：PyMuPDF (`fitz`) 或 `pdftotext -layout`，保留 PDF 页码。
-3. **清洗文本**：修复跨页断词、页眉页脚、页码、连字符、多余换行；原文和规范化文本分字段保存。
-4. **识别章节**：解析目录 + 标题字号/加粗启发式，生成 `section_map.json`，人工抽查修正。
-5. **建立章节树**：Part / Chapter / Section 三级，写 `book_sections`；`section_code` 稳定可引用。
-6. **切父子块**：按语义边界切子块，保留父块；标题与解释不拆散，案例保留“背景—互动—作者分析—结论”。
-7. **打元数据**：`knowledge_type`、页码、章节、解析置信度、审核状态；自动打标不确定时允许 `unknown`。
+1. **登记来源**：标题、作者、出版年、语言、文件哈希、版权状态 `internal_review_only`。
+2. **逐页抽取**：读分页 Markdown（`parse_md.read_raw_pages`），保留 PDF 页码。
+   **必须读原始 Markdown 而不是剥过标记的纯文本** —— 剥掉 `#` 就认不出标题了。
+3. **清洗文本**：NFC 规范化（不是 NFKC —— 全角标点是中文的语义边界）+
+   jieba 分词；原文和规范化文本分字段保存。
+4. **识别章节**：从 Markdown 标题层级重建，生成 `section_map.json`，人工抽查修正。
+5. **建立章节树**：写 `book_sections`；`section_code` 用中文标题 slug，稳定可引用。
+6. **切父子块**：按语义边界切子块，保留父块；**附件表格行各自成块**（见 §5.3）。
+7. **打元数据**：`knowledge_type`、页码、章节、解析置信度、审核状态。
 8. **生成向量**：`BAAI/bge-m3`，批量 32，失败重试；记录 embedding 模型与版本。
-9. **写索引**：PostgreSQL 元数据 + `embedding vector(1024)` + `content_tsv`（GIN）+ HNSW；用 manifest 记录索引版本和条目数。
+   **向量化用哪份文本**由 `--embed-input` 决定（`normalized` 默认 / `original`），
+   实测两者召回相同、自然文本 MRR 略高（见 §9.2）。
+9. **写索引**：PostgreSQL 元数据 + `embedding vector(1024)` + `content_tsv`（GIN）+ HNSW；
+   用 manifest 记录索引版本和条目数。
 10. **生成报告**：`ingest_report.json`，包含总页数、成功页、跳过页、块数、父子块数、模型版本、内容哈希。
 11. **人工抽查**：优先核对评测集和演示会用到的大约 50 个片段；通过后标记 `reviewed`，其余保持 `unreviewed`。
-12. **可重建**：清空知识表并重新执行入库，能从 PDF 一键重建；入库脚本按 `content_hash` 幂等，不重复插入。
+12. **可重建**：清空知识表并重新执行入库，能从 Markdown 一键重建；入库脚本按 `content_hash` 幂等，不重复插入。
 
 **摘要策略**：入库时不为每一块调用 LLM 生成中文摘要（成本高且容易失真）。检索命中 Top-K 后，只为进入证据包的 6–8 块生成中文摘要，写入 `knowledge_chunks.summary_zh` 缓存。摘要 prompt 必须要求“只复述原文，不添加建议”。
 
@@ -615,11 +736,22 @@ CREATE UNIQUE INDEX uq_feedback_turn ON feedbacks(trial_id, turn_id);
 
 - 子块初始目标 200–350 tokens，父块 800–1200 tokens，重叠 10–15%；这是实验起点，不是硬规则。
 - 标题和其下解释保持在同一父块。
-- 一个案例尽量保留完整结构；如果案例跨块，父块必须能覆盖。
-- 保留“可能、通常、在特定条件下”等限定词，禁止在清洗时删掉。
-- 作者举例与作者一般原则不能混成一条。
+- 保留"可能、通常、在特定条件下"等限定词，禁止在清洗时删掉。
 - 原文、规范化文本、中文摘要、模型应用建议分字段存储。
 - 每条 chunk 必须有可复现的 PDF 页码；印刷页码无法确认就置空，不猜。
+
+**中文路径的额外规则**（v3.0）：
+
+- **句子边界用 `。！？；`**，不是英文的 `. ` —— 中文标点是语义边界，
+  切块器要靠它断句（所以规范化用 NFC 而不是 NFKC，全角标点不能被折成半角）。
+- **表格行各自成块**（`atomic_items=True`）。指南附件 1–4 全是宽表格，
+  **一行就是一条完整的干预要点**（"正强化：xxx" / "0~18 月龄：xxx"）。
+  按字数攒子块的话，7 条策略会挤进同一个 543 字的块 ——
+  问"孩子做对了要怎么奖励"时正确���案挤不进前 5 名。
+  开了之后每行一个块，召回粒度直接对上"针对某一条策略的干预"。
+- **分词只发生在 `content_normalized`**，`content_original` 保留原文。
+  分词是给 `to_tsvector('simple', ...)` 用的（它按空格切词），
+  向量用哪一份由 `--embed-input` 决定。
 
 ### 5.4 检索流程
 
@@ -650,7 +782,8 @@ class RetrievalQueries(BaseModel):
 
 1. bge-m3 的多语言向量能力；
 2. 用 `concept_aliases` 把“引导式参与”扩展成 `guided participation` 等英文术语；
-3. Postgres 全文检索用英文关键词兜底精确术语和章节名；默认 `ts_rank_cd`，需要严格 BM25 时切 `pg_search`。
+3. Postgres 全文检索用分词关键词兜底精确术语和章节名；排序先按"命中几个有区分度的词"，
+   再按信息量之和，最后才 `ts_rank_cd`。需要严格 BM25 时切 `pg_search`。
 
 关键词通道是一个可替换接口 `KeywordSearchBackend`：默认 `postgres_fts`（`websearch_to_tsquery` + `ts_rank_cd`）；可选 `paradedb_bm25`（`pg_search` 的 BM25 索引）。二者都返回 `{chunk_id, score}`，上层 RRF 不变。
 
@@ -705,7 +838,7 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 | 最终证据 | 6–8 | 控制 token 和噪音 |
 | 父块扩展 | 1 层 | 补上下文，不无限扩散 |
 
-过滤条件至少包含：`source_id`、`review_status != needs_correction`、`rights_status`。不要把儿童观察直接拼进书籍向量检索；儿童上下文用于查询改写和后续生成，不进入知识库召回。
+过滤条件至少包含：`source_id`、`review_status != needs_correction`、`rights_status`。不要把儿童观察直接拼进知识库向量检索；儿童上下文用于查询改写和后续生成，不进入知识库召回。
 
 ### 5.5 证据门控（Evidence Gate）
 
@@ -714,9 +847,9 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 | 条件 | `evidence_status` | 系统行为 | 路由 |
 |---|---|---|---|
 | 有直接相关且定位准确的证据 | `direct` | 可解释相关原则，引用章节和页码 | `recommend` |
-| 只有间接相关证据 | `indirect` | 明确说这是可能参考，不声称原书直接回答了该情形 | `limited_answer` |
+| 只有间接相关证据 | `indirect` | 明确说这是可能参考，不声称指南直接回答了该情形 | `limited_answer` |
 | 检索结果互相矛盾 | `conflicting` | 呈现分歧或标记待审，不静默挑选 | `limited_answer` |
-| 没有可靠证据 | `none` | 说明知识库暂未找到依据；可给低风险观察建议，标明不是原书结论 | `limited_answer` |
+| 没有可靠证据 | `none` | 说明知识库暂未找到依据；可给低风险观察建议，标明不是指南结论 | `limited_answer` |
 | 缺失信息会改变建议 | `none/indirect` + `needs_followup` | 先追问 | `followup` |
 | 诊断、治疗决策或明显风险 | `risk` | 不凭 RAG 下结论，转向专业支持 | `professional_support` |
 
@@ -742,15 +875,15 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 每张建议卡至少包含：
 
 - `source_citations`：章节、PDF 页码、支持的 claim；
-- `application_label`：`book_summary` / `ai_adaptation`；
+- `application_label`：`source_summary` / `ai_adaptation`；
 - `uncertainty_notes`：当前不能判断什么；
 - `success_indicators`：观察到什么算积极信号；
 - `stop_conditions`：什么情况下暂停或降低要求。
 
 回答中使用的来源标签：
 
-- **原书观点摘要**：能由指定章节和页码直接支持；
-- **应用转化建议**：根据原书概念整理出的可尝试方式，不是原书逐字步骤；
+- **指南依据摘要**：能由指定章节和页码直接支持；
+- **应用转化建议**：根据指南概念整理出的可尝试方式，不是指南逐字步骤；
 - **待验证假设**：针对孩子当前情况的可能解释，不是事实或诊断；
 - **外部研究/指南**：首版不出现；
 - **专业审核意见**：首版不出现。
@@ -761,7 +894,7 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 - 只展示模型生成的中文摘要、章节名和页码；
 - 内部调试页可按权限查看 `source_excerpt`；
 - 每条回答保存使用的 `evidence_id` 和 `bundle_id`，便于审计；
-- 不把书籍内容用于对外服务或商业化，除非完成授权审查。
+- 不把指南内容用于对外服务或商业化，除非完成授权审查。
 
 ### 5.7 无命中、冲突与风险
 
@@ -945,9 +1078,19 @@ def await_plan_selection(state: CoachState) -> dict:
 - 服务重启后，未完成会话能通过 Checkpointer 恢复。
 - 重试同一 `turn_id` 的请求不会重复创建方案或尝试。
 
-**待人工验证**（按你的要求，阶段 1 只做了语法和导入检查，没有跑测试）：
-`make demo` 和 `make test`。代码已通过 `compileall` + 全模块 import + 图编译，
-但流程行为、`followup_rounds` 兜底、幂等写入都要真跑一遍才算数。
+**已人工验证**（2026-10-22）：`make test` 全绿（109 passed），
+`make demo` 走完「追问 3 轮 → 3 张方案卡 → 选择 → 建 trial → 反馈」完整闭环。
+
+验证时发现并修掉一个**接口层 bug**：`send_message` / `select_plan` 用普通 dict 调
+`ainvoke`，而 LangGraph 里普通 dict **不恢复 `interrupt()`**、只会让图从 START 重跑。
+后果是 `followup_rounds` 永远为 0（本节的 3 轮兜底形同虚设）、
+`commit_plan_selection` 不执行（trial 建不出来）。
+修法是按当前 pending interrupt 分流，用 `Command(resume=...)` 恢复。
+`tests/test_graph_flow.py` 直接调图、测不到这一层，所以另加了
+`tests/test_api_conversation_flow.py`（要真 Postgres）从 API 入口钉住这条路径。
+
+> 教训：**改图的"中断恢复方式"时，要同时跑 API 集成测试。**
+> 只跑图层的单测会让接口层的错误一路绿灯。
 
 ### 8.6 刻意不做
 
@@ -1026,16 +1169,60 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
    清洗按"空行分段、块内接回"处理；行尾连字符全书只有 96 处，逐条看过
    全是真连字符（`hyper-` / `seven-year-olds`），所以保留连字符不补空格。
 
-**卡住的一步（需要人拍板）**：`make ingest` 里的 embedding 环节要把书的
-正文发给 SiliconFlow（`BAAI/bge-m3`）。计划 §9.1 自己要求写这个模型的
-向量，配置里 `llm_base_url` 也指向 SiliconFlow，所以这是既定设计；但计划
-§2.1 又写了"书籍只在本地使用"。自动化权限按版权风险拦了这一步，本地
-已跑通的是 `--no-embed` 版本（解析 + 切块 + 关键词索引 + 术语表），
-FTS 检索可用，向量路要等人决定后补跑。
+**卡住的一步（已解决）**：`make ingest` 里的 embedding 环节要把正文
+发给 SiliconFlow（`BAAI/bge-m3`）。当时按版权风险被拦下，只跑通了
+`--no-embed` 版本。
 
-**关于"书里没有的词"的一处提醒**：检索走 FTS 时用的是 `to_tsvector('english')`，
-所以中文查询必须先经术语表桥接成英文词，否则命中不了 —— `rag/search.py` 里
-的 `expand_with_concepts()` 就是干这个的。
+**2026-10-23 用户明确批准外发** —— 本地没有任何患者数据，指南正文是
+公开发布的官方文件。**2026-10-24 已用自然文本向量跑完**（§9.1）。
+
+#### 2A 落地记录 · 中文指南（2026-10-24）
+
+实测数字：**25 页 → 解析 25 / 跳过 0**；**21 个章节**；
+**父块 19**、**子块 54**（其中附件 1–4 的表格行各自成块）。
+73 块全部已向量化。
+
+**踩到并解决的坑**：
+
+1. **PDF 没有文字层**。指南是扫描件，`fitz` 抽出来是空串 —— 入库源改成
+   OCR 转出来的**分页 Markdown**（`data/ocr/guideline2026/page_001.md` …），
+   一个文件对应 PDF 的一页，**页码因此能保留**。
+2. **剥 Markdown 会丢标题**。最初 `parse_md.extract_pages()` 把 `#` 标记
+   剥掉再交给 `parse_blocks()`，导致认不出标题、章节树建不出来。
+   改成 `read_raw_pages()` 返回**原始** Markdown，剥过标记的纯文本
+   只用来写 `pages.jsonl`。
+3. **指南没有目录页**。章节树从 Markdown 的 `#` 标题层级重建
+   （`sections_zh.py`），不是从目录解析。
+4. **表格挤成一坨**。附件 2 的 7 条策略（正强化 / 负强化 / 消退 /
+   负惩罚 / 辅助 / 反应中断 / 差别强化）按字数攒子块的话会挤进同一个
+   543 字的块，问"孩子做对了要怎么奖励"时正确答案挤不进前 5 名。
+   改成表格行各自成块（`atomic_items=True`），子块 35 → 54。
+5. **表格行里的 `|` 和 `<br>`** 进了正文。`_table_row_to_text()` 把
+   管道符转成空格、`<br>` 转成"。"。
+6. **分词必须两边都做**。`to_tsvector('simple', ...)` 按空格切词，
+   中文连写的话整段是一个 lexeme。入库侧 jieba 分词，查询侧也分词。
+7. **术语表要按指南里的真实用词重建**。53 条概念，每条的
+   `is_explicit_in_source` 都是**扫正文算出来的**，不是人工断言 ——
+   规范名没在正文出现过的概念不入库，桥过去也捞不到东西。
+8. **旧书来源必须删干净**。`tools/drop_rdi_book.py` 删掉 1178 块 /
+   29 章节 / 1 来源。**中英两个语料混检**会让"引用哪份文档哪一页"
+   说不清 —— 这是必须删而不是留着的理由。
+
+**授权已解决**（2026-10-23 用户批准）：本地无患者数据，指南正文是公开发布的
+官方文件，向量化外发没有隐私风险。
+
+**关于"指南里没有的词"的一处提醒**（v3.0 已改）：关键词路现在用的是
+`to_tsvector('simple', content_normalized)` —— `simple` 按**空格**分词，
+而入库侧已经用 jieba 把中文切开了，所以命中的是**词**不是整段。
+查询侧同样要 jieba 分词（`query_rewrite.segment_zh`），两边形态一致才能匹配。
+
+所以中文查询命中不了的时候，要分清是哪种情况：
+
+1. **指南里真的没有这个词** —— 只能靠术语桥接（"发脾气" → "挑战性行为"）
+   或向量路兜；
+2. **指南里有，但说法不一样** —— 分词是精确匹配，"一周"和"每周"在
+   `content_tsv` 里是两个不同的 lexeme，**"一周"匹配不上"每周"**。
+   这一类目前只能靠向量路兜，是已知短板（见 §9.2 的失败用例分析）。
 
 #### 怎么手动测
 
@@ -1060,30 +1247,43 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 
 ---
 
-## 9. 阶段 2：RDI Book 专业知识 RAG
+## 9. 阶段 2：指南专业知识 RAG
 
 阶段 2 拆成三个可独立验收的子阶段。**2A 可以先做**，因为它只依赖 PDF 和数据库，不依赖图。
 
-### 9.1 子阶段 2A：书籍入库与可追溯索引
+### 9.1 子阶段 2A：知识库入库与可追溯索引
+
+> **v3.0 重写**：源从《The RDI Book》（英文 PDF）换成
+> 《孤独症谱系障碍儿童干预康复指南（2026 年版）》（中文扫描件）。
+> 任务清单按新事实重列，已完成的项保留勾选。
 
 #### 目标
 
-把 PDF 变成“每条都能回到章节和 PDF 页码”的知识片段，并建立向量 + 关键词两套索引。
+把扫描件变成"每条都能回到章节和 PDF 页码"的知识片段，并建立向量 + 关键词两套索引。
 
 #### 任务
 
-- [x] 登记 `knowledge_sources`：`the_rdi_book_2009`，`rights_status='internal_review_only'`。
-- [x] `parse_pdf.py`：逐页抽取，保存 PDF 页码、原始文本、字符数；字符数异常低的页面记录到 `skipped_pages`。
-- [x] `sections.py`：用目录生成章节树，输出 `data/index/section_map.json`。
-- [ ] 人工抽查章节边界（程序已核对：29 个区间的页码连续无缺口；**人工过一遍 `section_map.json` 仍待办**）。
-- [x] `chunk.py`：父子块切分，写 `knowledge_chunks`；子块保留 `parent_chunk_id`。
-- [x] 清洗文本：断词、页眉页脚、页码、连字符；原文和规范化文本分开。
-- [x] 建立 `content_tsv` 生成列 + GIN 索引（阶段 0 的 001 迁移已建；ORM 侧改成 `Computed` 才能正常 INSERT）。
-- [ ] 建立 pgvector `embedding vector(1024)` + HNSW 索引，写入 `BAAI/bge-m3` 向量和元数据。
-      **卡在授权**：这一步要把书的正文发给 SiliconFlow 做向量化，
-      自动化权限按版权风险拦下了 —— 见下面「2A 落地记录」。
-- [ ] 可选：`KEYWORD_BACKEND=paradedb_bm25` 时，安装 ParadeDB `pg_search` 并建 BM25 索引；默认关闭。
-- [x] 建 `concept_aliases`，52 个核心术语（英文规范名 + 中文别名 + 来源 chunk），全部实测在书里出现过。
+- [x] 登记 `knowledge_sources`：`guideline2026`，`rights_status='internal_review_only'`，
+      `language='zh'`，`version='v2'`。
+- [x] `parse_md.py`：读分页 Markdown（`page_001.md` … `page_025.md`），保留 PDF 页码、
+      原始文本、字符数。**必须读原始 Markdown 而不是剥过标记的纯文本** ——
+      剥掉 `#` 就认不出标题了，章节树就建不出来。
+- [x] `sections_zh.py`：从 Markdown 标题重建章节树（**这份指南没有目录页**），
+      输出 `data/index/section_map.json`。21 个章节，章节码用中文标题 slug。
+- [x] `chunk.py`：父子块切分。中文句子边界用 `。！？；`；**附件 1–4 是宽表格，
+      一行就是一条完整的干预要点，所以表格行各自成块**（`atomic_items=True`）——
+      否则 7 条行为策略会挤进同一个 543 字的块，问"孩子做对了怎么奖励"时
+      正确答案挤不进前 5 名。
+- [x] 清洗文本：NFC 规范化（**不是 NFKC** —— NFKC 会把 `（）！？` 折成半角，
+      全角标点是中文的语义边界，切块器要靠它断句）+ jieba 分词。
+- [x] 建立 `content_tsv` 生成列 + GIN 索引，配置改成 `to_tsvector('simple', ...)`
+      （迁移 004）。
+- [x] 建立 pgvector `embedding vector(1024)` + HNSW 索引，写入 `BAAI/bge-m3` 向量和元数据。
+      **授权已获用户批准**（2026-10-23）—— 本地无患者数据，指南正文是公开发布的官方文件。
+- [x] 阈值按中文重新标定：`MAX_VECTOR_DISTANCE = STRICT_VECTOR_DISTANCE = 0.52`。
+      依据：相关查询最近邻距离 0.2876–0.4691，无关查询 0.5675–0.6071。
+- [x] 建 `concept_aliases`，**53 个中文核心术语**（中文规范名 + 中文别名 + 来源 chunk），
+      全部实测在指南正文里出现过。**没有英文别名** —— 知识库和用户输入都是中文。
 - [x] 生成 `ingest_report.json`：页数、成功页、跳过页、父子块数、模型版本、内容哈希、索引版本。
 - [x] 人工抽查标记的**机制**（`rag/ingest/review.py`）：标记存 `data/index/chunk_reviews.json`，
       以**内容哈希**为键，入库重建时回填 —— 否则 `make ingest` 的"先删后建"会把手改的标记全冲掉。
@@ -1092,19 +1292,21 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
       机制已就位，`make review-export` 导出候选 -> 人工读 -> `make review-mark` 标记 -> `make review-apply` 写回）。
       另：检索默认排除 `review_status='needs_correction'`（§5.4 的过滤要求，已实现）。
 - [x] 实现 `python -m rdi_agent.rag.search "查询" --top-k 8`，输出章节、PDF 页码、摘要和相似度。
+- [x] 删除旧书来源（`tools/drop_rdi_book.py`）：1178 块 / 29 章节 / 1 来源，
+      **避免中英两个语料混检** —— 混检会让"引用哪份文档哪一页"说不清。
 
 #### 验收
 
-- 392 页全部有解析记录；跳过页有明确原因。
+- 25 页全部有解析记录；跳过页有明确原因。
 - 任意返回片段都有 `section_code` 和 `pdf_page_start/end`。
-- 用 `pdfinfo` / PDF 阅读器打开对应页，能核对到原文内容。
+- 打开对应页（`data/ocr/guideline2026/page_0NN.md`）能核对到原文内容。
 - 子块能通过 `parent_chunk_id` 找到父块。
-- 清空知识表与索引后能从 PDF 重建，结果条目数一致。
+- 清空知识表与索引后能从 Markdown 重建，结果条目数一致。
 - `ingest_report.json` 记录 embedding 模型和索引版本。
 
 #### 交付物
 
-可重建的书籍索引 + 检索 CLI + 入库报告。
+可重建的指南索引 + 检索 CLI + 入库报告。
 
 ---
 
@@ -1116,47 +1318,119 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 
 #### 任务
 
-- [x] `query_rewrite.py`：输入原始问题，输出 `RetrievalQueries`（语义查询、英文关键词、概念 ID、过滤器）。**纯规则 + DB 查询，不调 LLM** —— 评测集要可复现。
-- [x] `concept_aliases` 扩展：补 18 条**日常说法**（打招呼/哭闹/发脾气/不听话/抢玩具/感觉敏感…）。原来的术语表只覆盖术语不覆盖口语。
+- [x] `query_rewrite.py`：输入原始问题，输出 `RetrievalQueries`（语义查询、**分词后的**关键词、概念 ID、过滤器）。**纯规则 + DB 查询，不调 LLM** —— 评测集要可复现。
+      查询侧用 jieba 分词（`segment_zh`），和入库侧形态一致。
+- [x] **定义意图识别**：家长问"挑战性行为指什么"和问"孩子发脾气怎么办"
+      需要的不是同一段内容 —— 前者要定义（指南的"名词解释"章节），后者要干预方法。
+      向量路和关键词路都分不开（实测前 4 名全是讲挑战性行为**内容**的块，
+      没有一条是**定义**）。所以在改写层识别意图，把区分度高的定义句式词
+      （`相对 于`）加进关键词查询。recall@5 0.882 → 0.912。
+- [x] `concept_aliases` 扩展：补**日常说法**（发脾气/哭闹/不听话/感觉敏感…）。
 - [x] 向量检索：pgvector Top-30，带元数据过滤。
-- [x] 关键词检索：PostgreSQL 全文检索 Top-30（`websearch_to_tsquery` + `ts_rank_cd`）。
-- [ ] 实现 `KeywordSearchBackend` 切换；`paradedb_bm25` 作为可选后端，评测时对比 `postgres_fts` 与 BM25。
-      **本轮未做**：评测显示关键词路**从未单独命中过**（要么和向量路重合，要么为 0），
-      换 BM25 改不了这个瓶颈。待重排收益量化后再判断要不要投入。
+- [x] 关键词检索：PostgreSQL 全文检索 Top-30。
+      **用 `to_tsquery('simple', 'a | b | c')` 显式构造 OR**，不用 `websearch_to_tsquery`
+      —— 后者对多个词是 **AND** 语义（一段话要同时提到三个词才被捞出来，召回几乎为零）。
+- [x] **高频词过滤**：出现在 >30% 块里的词没有区分度（"儿童""行为""干预"…）。
+      高频词仍参与**召回**，只是不参与**排序**。词频统计按 `count(DISTINCT chunk_id)`
+      —— 用 `count(*)` 会把词频算成 295（73 块的全集），阈值全乱。
+- [x] **关键词路排序**：先按"命中了几个**有区分度**的词"降序，再按"命中词的信息量之和"降序
+      （长的词更有信息量），最后才 `ts_rank_cd`。理由：`ts_rank_cd` 按词频排，
+      而中文查询里最高频的词恰恰是最没信息量的那些。
+- [ ] 实现 `KeywordSearchBackend` 切换；`paradedb_bm25` 作为可选后端。
+      **本轮未做**：瓶颈不在后端，是中文同义表述（见下面「失败用例分析」）。
 - [x] RRF 合并去重：`score = sum(1 / (60 + rank))`。
+      **加权 RRF 试过，不采用**：关键词权重 ×2 会把 4 条原本命中的挤掉，
+      recall@5 从 0.853 掉到 0.765（34 条全量扫过，不是手调 3 条）。
 - [x] 可选重排：`BAAI/bge-reranker-v2-m3`，失败自动回退 RRF，并记录降级。
 - [x] 父块扩展：命中子块后加载父块或相邻上下文。
 - [x] 构建 `EvidenceItem` / `EvidenceBundle`。
-- [ ] `summary_zh` 按需生成并缓存。
-      **未做**（2026-10-22 更正：之前误勾了）。字段 `knowledge_chunks.summary_zh`
-      已在 schema 里，但生成与缓存逻辑没写。计划 §5.3 的策略是"只为进入证据包的
-      6–8 块生成中文摘要"，需要调 LLM，涉及版权边界（摘要是转述，不是原文引用）
-      和缓存失效策略（重新入库后摘要要重算），2C 一起做更合适。
-- [x] 建立 `evals/retrieval_cases.jsonl`，至少 25 条中文问题，人工标注期望章节、必含术语。
-      **27 条**（25 相关 + 2 无关）。标注按**章节**不按页码 —— 这本书讲一个主题会散在好几章。
+- [x] `summary_zh` 按需生成并缓存（`rag/summary_zh.py`）。
+      计划 §5.3 的策略是"只为进入证据包的 6–8 块生成中文摘要"——
+      `ensure_summaries()` 只处理 `bundle.evidence[:MAX_CHUNKS]`，
+      缓存失效用 `embedding_version` 当版本号（重新入库后块 id 会变）。
+      **默认关闭**（`settings.summary_zh_enabled = False`），每次开启都要多一次 LLM 调用。
+      版权边界：摘要是**转述**不是原文引用，所以可以给家长看；
+      但 `may_quote_to_user` 恒为 `False`（指南授权未核实）。
+- [x] 建立 `evals/retrieval_cases.jsonl`，**37 条中文问题**（34 相关 + 3 无关），
+      人工标注期望章节、必含术语。标注按**章节**不按页码。
+      无关题：红烧肉 / 上海天气 / 三年级数学乘法口诀。
 - [x] `evals/run_retrieval.py` 输出 Recall@5、MRR、页码可定位率、无命中率，以及每条失败案例。
+- [x] `tools/run_log.py`：产出**人工可评估**的执行日志（`data/index/exec_log.md` + `.json`）——
+      每条用例列出家长实际会看到的证据、章节、页码、正文片段。指标只给方向，
+      给不出"家长到底会看到什么"。
+      **日志不进版本库**（`.gitignore`）：日志里逐条引用了指南正文片段，
+      篇幅比指南全文还大（实测 144%）。指南全文都不进公开仓库，日志同理。
+      需要时本地跑 `python -m tools.run_log` 就有。
 - [ ] 调参记录：chunk 大小、overlap、Top-K、是否重排，每次只改一个变量。
       **基线已存**（`evals/REPORT_v1.md`），后续每次改一个变量重跑一次做对比。
 
-#### 验收（2026-10-22 实测）
+#### 评测脚本的两个 bug（2026-10-24 修）
+
+**这两个 bug 让之前报的 0.88 是假的。** 记在这里是因为教训是通用的：
+
+1. **`--no-rerank` 带 `default=True`** —— 于是 `args.no_rerank` 永远是 True，
+   `--rerank` 从来没生效过。评测里"重排开/关"两套数字根本没法对比。
+   修掉后实测：**开重排 recall@5 反而降到 0.8235**（MRR 从 0.5686 升到 0.6382）
+   —— 重排把章节覆盖打散了。
+2. **评测脚本从不调 `ensure_high_freq_terms()`** —— 生产链路（`rag/retrieval.py`）调了，
+   评测没调，所以评测跑的是"没剔高频词"的排序，和线上**不是同一套**。
+
+修完之后真实数字 **recall@5 = 0.8529**，不是变差了，是之前报高了。
+
+#### 验收（2026-10-24 实测，中文指南）
 
 | 验收项 | 目标 | 实测 | 结论 |
 |---|---|---|---|
-| Recall@5 | ≥ 0.80 | **0.88**（22/25） | 达标 |
+| Recall@5 | ≥ 0.80 | **0.8529**（29/34） | 达标 |
+| MRR | — | **0.5515** | — |
 | 章节 + PDF 页码可定位率 | 100% | **100%** | 达标 |
 | 每条证据有 `relevance_reason` | 必须 | 有（含两路名次 + 术语桥接） | 达标 |
-| 明显无关的问题不硬凑 | 接近 0 | **1.00**（2/2 都硬凑了） | **不达标** |
-| 关闭 reranker 仍可接受 | 是 | Recall@5 = 0.88，且降级状态可见 | 达标 |
+| 明显无关的问题不硬凑 | 接近 0 | **0%**（3/3 都没硬凑） | 达标 |
+| 关闭 reranker 仍可接受 | 是 | Recall@5 = 0.8529，且降级状态可见 | 达标 |
+| 必含术语命中率 | — | 0.6471 | — |
 
-**不达标项的根因**（详见 `evals/REPORT_v1.md` §5.1）：
-向量检索**永远能返回"最像的"若干条**，哪怕完全不相关 ——
-`ts_rank_cd` 有天然下限，向量路没有。实测相关查询最近邻距离 0.375–0.446、
-无关查询 0.535–0.572，0.50 是分界；但英文问句落在 0.46（同语言导致），
-所以还要靠关键词路配合判断。**阈值需要更多标定点重新标定，不能拍脑袋。**
+#### 失败用例分析（5 条未命中）
+
+`early_intervention` / `intensity_hours` / `behavior_strategy_positive_reinforcement` /
+`behavior_strategy_differential` / `venue_staff`
+
+**根因是同一个：中文同义表述对不上。** 把关键词路每个区分度词的命中块
+都打出来之后：
+
+| 查询用词 | 指南里实际用词 | 命中 |
+|---|---|---|
+| 一周 | 每周 | 0 块 |
+| 哪里 | 场地 | 0 块 |
+| 多久 / 多少 / 怎么 / 别的 | — | 0 块 |
+
+分词是精确匹配，"一周"和"每周"在 `content_tsv` 里是两个不同的 lexeme。
+向量路也救不回来 —— "每天要陪孩子练多久"的向量 top1 是「004 针对缺陷性行为」
+（相似度 0.5939），正确答案「001 干预康复基本原则」在向量路里排第 13。
+
+**试过并否决的方案**（34 条全量扫过，不是手调 3 条）：
+
+| 方案 | recall@5 | 结论 |
+|---|---|---|
+| 现状 | **0.8529** | 基准 |
+| 加权 RRF（关键词 ×2） | 0.7647 | 更差，挤掉 4 条原本命中的 |
+| 每章节限 1 块 | 0.7941 | 更差 |
+| 加权 + 限 1 块 | 0.8529 | 持平，MRR 略升 |
+
+**已验证的一个正面结论**：向量化改用**自然原文**（而不是 jieba 分词文本）
+对召回**没有实质帮助** —— 向量路 recall@5 两者都是 0.7941，全链路都是 0.7647，
+只有 MRR 略好（0.598→0.639 / 0.556→0.570）。bge-m3 对分词文本并不敏感。
+所以 `pipeline` 留了 `--embed-input` 开关（`normalized` / `original`），
+但**默认仍是 `normalized`**（分词文本），因为换过去要重建整库向量，
+收益却只有 MRR 的 +0.014。
+
+**下一步该往哪走**：不是调融合权重，是**补同义词**。要么在术语表里加
+"每周/一周""场地/哪里"这类别名，要么给关键词路加 trigram 匹配
+（`pg_trgm`）兜住字面不完全一致的情况。
 
 #### 交付物
 
-可量化、可复现的检索管线 + 27 条检索评测集 + 评测报告（`evals/REPORT_v1.md`）。
+可量化、可复现的检索管线 + 37 条中文检索评测集 + 执行日志
+（本地 `python -m tools.run_log` 生成，不进版本库）+ 评测报告。
 
 ---
 
@@ -1164,13 +1438,13 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 
 #### 目标
 
-让主流程真正基于证据生成建议，并且在证据不足时明确拒答或降级，而不是编造书中观点。
+让主流程真正基于证据生成建议，并且在证据不足时明确拒答或降级，而不是编造指南观点。
 
 #### 新增节点
 
 | 节点 | 输入 | 职责 | 输出 |
 |---|---|---|---|
-| `rewrite_query` | `case_summary` | 生成语义查询、英文关键词、概念 ID | `retrieval_queries` |
+| `rewrite_query` | `case_summary` | 生成语义查询、分词关键词、概念 ID | `retrieval_queries` |
 | `retrieve_knowledge` | 查询、过滤器 | 向量 + FTS 召回 | `retrieval_candidates` |
 | `rerank_and_expand` | 候选 | 去重、重排、父块扩展 | `evidence_bundle` |
 | `evidence_gate` | 证据包、事实摘要 | 判断证据是否足够、是否高风险 | `evidence_decision` |
@@ -1199,9 +1473,9 @@ def route_after_evidence_gate(state: CoachState) -> str:
 
 1. 只能使用 `EvidenceBundle` 中的内容作为专业依据；
 2. 每条专业主张必须对应一个 `evidence_id`；
-3. 明确区分“原书观点摘要”和“应用转化建议”；
+3. 明确区分“指南依据摘要”和“应用转化建议”；
 4. 每张卡必须包含观察指标和停止条件；
-5. 证据不足时不得补写书中观点；
+5. 证据不足时不得补写指南观点；
 6. 不输出诊断、不强迫孩子、不把单次行为标签化；
 7. 生成 2–3 个候选，其中明确推荐一个，并说明推荐理由。
 
@@ -1212,7 +1486,7 @@ def route_after_evidence_gate(state: CoachState) -> str:
 - `citation.source_id` 是否存在；
 - 章节和页码是否与 `EvidenceItem` 一致；
 - `claim_supported` 是否能被该片段摘要支持；
-- `application_label='book_summary'` 时是否至少有一条引用。
+- `application_label='source_summary'` 时是否至少有一条引用。
 
 任何一条失败：
 
@@ -1227,7 +1501,7 @@ def route_after_evidence_gate(state: CoachState) -> str:
 - 是否建议强迫眼神接触、压制拒绝、忽视明显不适；
 - 是否缺少停止条件；
 - 是否出现大段原文；
-- 是否把 AI 转化说成原书原话。
+- 是否把 AI 转化说成指南原话。
 
 结果三选一：
 
@@ -1512,7 +1786,7 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 
 | 指标 | 首版目标 | 测量方式 |
 |---|---|---|
-| Recall@5 | ≥ 0.80 | 25 条人工标注检索集 |
+| Recall@5 | ≥ 0.80 | 37 条人工标注检索集 |
 | 页码可定位率 | ≥ 95% | 抽检 20 条返回证据 |
 | 重要主张有证据支持率 | ≥ 90% | 人工标注 20 条回答 |
 | 事实/假设区分准确率 | ≥ 95% | 20 条记忆用例 |
@@ -1528,7 +1802,7 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 只做一个页面，包含四个区域：
 
 1. 对话区：输入、追问、候选方案；
-2. 证据区：章节、页码、摘要、`book_summary / ai_adaptation` 标签、审核状态；
+2. 证据区：章节、页码、摘要、`source_summary / ai_adaptation` 标签、审核状态；
 3. 记忆区：当前相关事实、观察、假设，支持纠正/删除；
 4. 调试区：节点 trace、耗时、retrieval scores、checkpoint 列表。
 
@@ -1612,7 +1886,7 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 | 一个家庭问题场景（不愿去幼儿园） | 多领域通用专家系统 |
 | 一个 LangGraph 主流程 + 两个入口 | 多 Agent 协作 |
 | 追问、方案选择两个 interrupt | 复杂审批流和多层子图 |
-| 单本 RDI Book 的 A 层 RAG | 多知识源融合平台 |
+| 单份指南的 A 层 RAG | 多知识源融合平台 |
 | PostgreSQL + pgvector + 内置全文检索 | 独立向量数据库服务、BM25 扩展（默认不启用） |
 | 四类结构化记忆 | 复杂记忆图谱、独立记忆 Agent |
 | 基本反馈分析 | 固定多阶段能力状态机 |
@@ -1631,7 +1905,7 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 |---|---|---|
 | 版权风险 | 对外输出大段原文、商业化 | `rights_status='internal_review_only'`；默认只给摘要和页码；对外前做授权审查 |
 | 章节解析错误 | 页码或章节错位，引用不可核对 | `section_map.json` 人工抽查；评测集覆盖关键章节；印刷页码不猜 |
-| 跨语言召回弱 | 中文问题搜不到英文书 | bge-m3 + 英文关键词改写 + 概念别名表 + 检索评测 |
+| 中文同义表述召不回 | 家长说"一周"、指南写"每周" | 分词关键词 + 术语别名表 + 向量路兜底 + 检索评测 |
 | 引用幻觉 | 模型编造章节/页码 | 引用必须命中 `EvidenceBundle`；失败重试后降级；专门测试“编造引用必须失败” |
 | 结构化输出失败 | schema 不合规、字段缺失 | `json_schema` + 重试 + 校验；关键字段由 Pydantic 强制 |
 | 中断重复副作用 | 恢复后重复写方案/反馈 | 中断节点纯函数；写入集中到 `commit_*`；`turn_id` 幂等 |
@@ -1668,7 +1942,7 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 5. 建 Alembic 迁移 001：知识库表 + 最小业务表 + pgvector/全文索引。
 6. 用 fake LLM 跑通阶段 1 图：追问 -> 方案 -> 选择 -> 反馈。
 7. 写 PDF 入库脚本，产出 `section_map.json` 和 `ingest_report.json`。
-8. 写 25 条检索评测集和 `run_retrieval.py`。
+8. 写 37 条中文检索评测集和 `run_retrieval.py`。
 9. 接入证据门控，完成“有证据 / 无证据 / 风险”三条演示路径。
 10. 加 Checkpointer 和一次 Time Travel 调试演示。
 
