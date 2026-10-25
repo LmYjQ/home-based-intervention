@@ -1,7 +1,7 @@
 .PHONY: install db-up db-down migrate test dev demo feedback ingest ingest-no-embed \
         ingest-sections concepts search eval health clean \
         review-export review-mark review-apply review-list \
-        web web-install web-mock \
+        web web-install \
         drop-old-book ocr run-log
 
 PY := .venv/bin/python
@@ -28,18 +28,13 @@ dev:
 	.venv/bin/uvicorn rdi_agent.api.main:app --reload
 
 # ---- 前端手动测试台（frontend_rdi/，Vue 3 + Vite）----
-# 端口 5176。旧的 frontend/ 占着 5173/5174，那套是冻结遗留的，别混。
+# 端口 5173。前端只有这一套（旧的 frontend/ 已挪进 legacy/）。
 web-install:
 	cd frontend_rdi && npm install
 
 # 打真后端（make dev，8000 端口）。先起 make dev 和 make db-up。
 web:
 	cd frontend_rdi && npm run dev
-
-# 脱离数据库跑前端：mock 后端回放真后端抓下来的响应形状。
-# 用来看渲染逻辑对不对，不验证业务。
-web-mock:
-	cd frontend_rdi && npm run mock
 
 # 固定演示输入，走完 追问 → 方案 → 选择 → 反馈
 demo:

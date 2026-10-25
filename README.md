@@ -95,7 +95,7 @@ rdi_agent/
 
 ## 旧代码
 
-`asd_agent/`、`server.py`、`frontend/` 是**冻结的 legacy**，不再修改也不作为实现依据。
+`legacy/`（`asd_agent/` + `server.py` + `frontend/`）是**冻结的 legacy**，不再修改也不作为实现依据。
 它保留在仓库里只作参考；快照 tag 是 `snapshot-before-rebuild`。
 
 ## 版权

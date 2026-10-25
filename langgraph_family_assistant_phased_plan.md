@@ -182,11 +182,11 @@ git switch -c rebuild/rdi-agent
 3. `live / replay / capture` 三种模式。面试现场用 replay，零网络依赖。
 4. 每次调用返回 `LLMTrace`（耗时、重试、token、降级标记）。
 
-旧目录 `asd_agent/`、`server.py`、`frontend/` 冻结，不再修改。演示前可以移到 `legacy/` 或删除，但必须先打 tag。
+旧目录 `asd_agent/`、`server.py`、`frontend/` 冻结，不再修改。**已移到 `legacy/`**（tag `snapshot-before-rebuild` 里还有一份，随时能取回）。
 
 ### 2.3 新代码放在哪
 
-新代码只写 `rdi_agent/`，前端重写时放 `web/`，不复用旧 `frontend/` 的结构。
+新代码只写 `rdi_agent/`，前端重写时放 `frontend_rdi/`，不复用旧 `frontend/` 的结构。
 
 ---
 
@@ -1079,11 +1079,11 @@ def await_plan_selection(state: CoachState) -> dict:
 - 重试同一 `turn_id` 的请求不会重复创建方案或尝试。
 
 **已人工验证**（2026-10-22）：`make test` 全绿（109 passed），
-`make demo` 走完「追问 3 轮 → 3 张方案卡 → 选择 → 建 trial → 反馈」完整闭环。
+`make demo` 走完「追问 1 轮 → 3 张方案卡 → 选择 → 建 trial → 反馈」完整闭环。
 
 验证时发现并修掉一个**接口层 bug**：`send_message` / `select_plan` 用普通 dict 调
 `ainvoke`，而 LangGraph 里普通 dict **不恢复 `interrupt()`**、只会让图从 START 重跑。
-后果是 `followup_rounds` 永远为 0（本节的 3 轮兜底形同虚设）、
+后果是 `followup_rounds` 永远为 0（本节的轮数兜底形同虚设）、
 `commit_plan_selection` 不执行（trial 建不出来）。
 修法是按当前 pending interrupt 分流，用 `Command(resume=...)` 恢复。
 `tests/test_graph_flow.py` 直接调图、测不到这一层，所以另加了
@@ -1126,7 +1126,8 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
    而是 import 边界本身就做不到。
 2. **追问那圈回到 `parse_parent_input`**，不是接一个新节点。家长的回答要重新并进
    `CaseSummary` —— 事实是累积的，问一轮丢一轮就退化成单轮问答了。
-   收敛靠 `followup_rounds`，到 3 轮强制出方案（`MAX_FOLLOWUP_ROUNDS`），
+   收敛靠 `followup_rounds`，**只允许追问一轮**（`MAX_FOLLOWUP_ROUNDS = 1`），
+   答完强制出方案，
    且 `check_sufficiency` 会**覆盖模型"还要问"的判断**并记下理由。
 3. **候选卡在中断之前落库**（`status='proposed'`）。家长可能看到卡就关掉浏览器，
    这一轮的分析不该丢掉。真正的 `selected` 由 `commit_plan_selection` 改。

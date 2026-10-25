@@ -5,8 +5,6 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:mock": "MOCK=1 vite",
-    "mock": "python3 mock_server.py --port 8010",
     "build": "vite build",
     "preview": "vite preview"
   },
