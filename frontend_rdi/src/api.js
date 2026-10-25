@@ -67,6 +67,30 @@ export const api = {
 
   submitFeedback: (trialId, payload) =>
     request(`/api/trials/${trialId}/feedback`, { method: 'POST', body: payload }),
+
+  // ---- 长期记忆（阶段 3）----
+  listMemories: (childId, familyId, params = {}) => {
+    const query = new URLSearchParams({ family_id: familyId, ...params })
+    return request(`/api/children/${childId}/memories?${query}`)
+  },
+
+  confirmMemory: (childId, memoryId, payload) =>
+    request(`/api/children/${childId}/memories/${memoryId}/confirm`, {
+      method: 'POST',
+      body: payload,
+    }),
+
+  correctMemory: (childId, memoryId, payload) =>
+    request(`/api/children/${childId}/memories/${memoryId}`, {
+      method: 'PATCH',
+      body: payload,
+    }),
+
+  deleteMemory: (childId, memoryId, payload) =>
+    request(`/api/children/${childId}/memories/${memoryId}/delete`, {
+      method: 'POST',
+      body: payload,
+    }),
 }
 
 // 流式发消息（SSE）。

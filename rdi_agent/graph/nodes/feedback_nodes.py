@@ -26,7 +26,7 @@ async def capture_feedback(state: CoachState) -> dict[str, Any]:
     submission = FeedbackSubmission.model_validate(state["feedback"])
     async with session_scope() as session:
         repo = Repository(session)
-        _, created = await repo.save_feedback(
+        feedback_row, created = await repo.save_feedback(
             trial_id=submission.trial_id, submission=submission
         )
         trial = await repo.get_trial(submission.trial_id)
@@ -38,6 +38,8 @@ async def capture_feedback(state: CoachState) -> dict[str, Any]:
         "feedback": state["feedback"],
         "plan_title": title,
         "feedback_created": created,
+        # 记忆抽取要拿它溯源：这条观察是从哪次反馈来的
+        "feedback_db_id": str(feedback_row.id) if feedback_row is not None else "",
     }
 
 

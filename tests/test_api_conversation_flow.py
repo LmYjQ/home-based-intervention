@@ -36,6 +36,7 @@ from rdi_agent.schemas.conversation import (
     SufficiencyDecision,
 )
 from rdi_agent.schemas.evidence import EvidenceDecision
+from rdi_agent.schemas.memory import MemoryExtractionResult
 from rdi_agent.schemas.recommendation import (
     ParentAction,
     RecommendationCard,
@@ -202,6 +203,9 @@ def always_wants_more(monkeypatch):
             )
         elif model_cls is SafetyReviewCheck:
             payload = SafetyReviewCheck(passed=True, severity="none", concerns=[])
+        elif model_cls is MemoryExtractionResult:
+            # 这个用例测的是追问恢复语义，不测记忆写了什么。
+            payload = MemoryExtractionResult(candidates=[], notes=[])
         elif model_cls is LimitedAnswer:
             payload = LimitedAnswer(
                 answer="手上没有书里对应的内容。",
@@ -229,8 +233,9 @@ async def test_followup_resume_increments_rounds(no_retrieval, graph, always_wan
     """回答追问必须**恢复**中断，不能让图从 START 重跑。
 
     断言两件事：
-    1. 每次回答都让 `followup_rounds` +1（重跑的话它永远是 0）；
-    2. 第 3 轮之后图自己收手出方案（兜底真的生效了）。
+    1. 回答之后 `followup_rounds` 真的 +1（重跑的话它永远是 0）；
+    2. 兜底生效：`MAX_FOLLOWUP_ROUNDS = 1` 之后，家长答完一轮就出方案，
+       不会再问第二遍。
     """
     from rdi_agent.graph.runtime import config_for, get_graph
 
@@ -241,28 +246,19 @@ async def test_followup_resume_increments_rounds(no_retrieval, graph, always_wan
     )
     assert res["status"] == "awaiting_followup"
 
-    # 回答三轮：每轮都应让 followup_rounds 递增
-    for round_no in (2, 3):
-        res = await api.send_message(
-            cid,
-            api.SendMessageRequest(
-                message=f"第 {round_no} 轮补充信息", turn_id=f"t{round_no}"
-            ),
-        )
-        state = await get_graph().aget_state(config_for(cid))
-        assert state.values.get("followup_rounds") == round_no - 1, (
-            f"第 {round_no} 轮后 followup_rounds 应该是 {round_no - 1}，"
-            f"实际 {state.values.get('followup_rounds')} —— "
-            "多半是图被重跑了而不是从中断恢复"
-        )
-        assert res["status"] == "awaiting_followup"
-
-    # 第 4 条消息：这时 followup_rounds == 3，兜底应该强制收手
+    # 唯一的一轮追问，答完就出方案（MAX_FOLLOWUP_ROUNDS 现在是 1）
     res = await api.send_message(
-        cid, api.SendMessageRequest(message="第 4 轮补充信息", turn_id="t4")
+        cid,
+        api.SendMessageRequest(message="第 2 轮补充信息", turn_id="t2"),
+    )
+    state = await get_graph().aget_state(config_for(cid))
+    assert state.values.get("followup_rounds") == 1, (
+        f"答完一轮后 followup_rounds 应该是 1，"
+        f"实际 {state.values.get('followup_rounds')} —— "
+        "多半是图被重跑了而不是从中断恢复"
     )
     assert res["status"] == "awaiting_plan_selection", (
-        "追问 3 轮后应该强制出方案，实际状态："
+        "追问一轮后应该强制出方案，实际状态："
         f"{res['status']} —— MAX_FOLLOWUP_ROUNDS 兜底没生效"
     )
     assert len(res["plans"]) == 2

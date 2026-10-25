@@ -14,7 +14,10 @@ from langgraph.types import interrupt
 
 from rdi_agent import llm
 from rdi_agent import progress
+from rdi_agent.config import get_settings
 from rdi_agent.llm import LLMError
+from rdi_agent.memory import service as memory_service
+from rdi_agent.memory.ids import normalize_content
 from rdi_agent.graph.citations import validate_set_citations
 from rdi_agent.graph.state import CoachState
 from rdi_agent.prompts import chat as P
@@ -57,12 +60,64 @@ def _bundle_of(state: CoachState) -> EvidenceBundle | None:
 
 # --------------------------------------------------------------- 理解
 async def load_context(state: CoachState) -> dict[str, Any]:
-    """阶段 1 的上下文很薄：只取最小档案。
+    """装上这个孩子已有的记忆。
 
-    阶段 3 之后再接 observations / hypotheses 检索。返回空字典不是错误 ——
-    冷启动会话本来就没有历史档案。
+    冷启动会话本来就没有历史档案，返回空不是错误。
+    任何一步失败都退回薄上下文 —— **记忆读不出来，家长的问题还得回答**。
     """
-    return {"child_context": state.get("child_context") or {}}
+    base = dict(state.get("child_context") or {})
+    child_id = state.get("child_id") or ""
+    if not child_id or not get_settings().memory_enabled:
+        return {"child_context": base, "memory_context": {"disabled": True}}
+
+    try:
+        ctx = await memory_service.load_memory_context(
+            child_id=child_id,
+            query=state.get("user_message", ""),
+        )
+    except Exception as e:  # noqa: BLE001 - 记忆是增强项，不能拖垮整轮
+        return {
+            "child_context": base,
+            "memory_context": {
+                "degraded": True,
+                "error": f"{type(e).__name__}: {e}",
+            },
+        }
+
+    base.update(ctx.get("child_context_patch") or {})
+    return {
+        "child_context": base,
+        "memory_context": ctx.get("memory_context") or {},
+        "memory_forbidden_facts": ctx.get("forbidden_facts") or [],
+    }
+
+
+def _forbidden_terms(state: CoachState) -> list[str]:
+    """本轮已作废/已删除的事实，归一化后用于过滤。
+
+    归一化的原因：上一轮存进 ``case_summary`` 的是模型转述，
+    这一轮的家常话里可能是另一种空白/全半角写法。
+    """
+    return [
+        normalized
+        for normalized in (
+            normalize_content(x) for x in (state.get("memory_forbidden_facts") or [])
+        )
+        if normalized
+    ]
+
+
+def _is_forbidden(fact: str, forbidden: list[str]) -> bool:
+    """这条事实是不是已经被作废了。
+
+    只看"旧内容是这条事实的全部或一部分" —— 反过来（新事实是旧事实的
+    子串）会误杀，比如删掉"孩子 4 岁，喜欢恐龙"之后，
+    "喜欢恐龙"这条仍然有效。
+    """
+    normalized = normalize_content(fact)
+    if not normalized:
+        return False
+    return any(normalized == old or old in normalized for old in forbidden)
 
 
 async def parse_parent_input(state: CoachState) -> dict[str, Any]:
@@ -95,6 +150,9 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
     #   2. 这一轮模型新抽出来的事实。
     #   3. 家长明确答了的问答对 —— 结构化传进来的，**一定**要算进事实。
     previous = state.get("case_summary") or {}
+    forbidden = _forbidden_terms(state)
+    dropped = 0
+
     facts: list[str] = []
     for source in (
         previous.get("observed_facts") or [],
@@ -102,6 +160,10 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
     ):
         for value in source:
             text = str(value).strip()
+            if _is_forbidden(text, forbidden):
+                # 家长刚纠正过 / 刚删掉的事实，不能再并进本轮的事实清单。
+                dropped += 1
+                continue
             if text and text not in facts:
                 facts.append(text)
 
@@ -126,11 +188,14 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
             signals.append(text)
     data["risk_signals"] = signals
 
+    note = trace.brief()
+    if dropped:
+        note += f"；过滤掉 {dropped} 条已作废事实"
     return {
         "case_summary": data,
         # 答案已经并进事实了，清掉 —— 免得下一轮又并一遍。
         "followup_answers": [],
-        "trace_metadata": {"intake_parse": trace.brief()},
+        "trace_metadata": {"intake_parse": note},
     }
 
 
@@ -141,6 +206,7 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
         case_summary=state.get("case_summary") or {},
         followup_rounds=rounds,
         asked_questions=list(state.get("asked_questions") or []),
+        child_context=state.get("child_context"),
     )
     decision, trace = await llm.chat_json(
         system=system,
@@ -183,6 +249,7 @@ async def generate_followup(state: CoachState) -> dict[str, Any]:
         priority_questions=decision.get("priority_questions") or [],
         followup_rounds=rounds,
         asked_questions=list(state.get("asked_questions") or []),
+        child_context=state.get("child_context"),
     )
     result, trace = await llm.chat_json(
         system=system,

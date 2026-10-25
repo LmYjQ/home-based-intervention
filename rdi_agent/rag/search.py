@@ -21,38 +21,39 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from sqlalchemy import text
 
 from rdi_agent.db.engine import session_scope
+from rdi_agent.rag import keyword_backends
+from rdi_agent.rag.filters import (
+    CONTENT_FILTER,
+    REVIEW_FILTER,
+    SELECT_COLUMNS,
+    select_columns,
+)
 from rdi_agent.rag.ingest import embeddings
+
+# 高频词表现在住在 :mod:`rdi_agent.rag.terms`（关键词后端也要用）。
+# 这里 re-export ``ensure_high_freq_terms`` 和 ``_keyword_terms``，
+# 是因为调用方（``rag/retrieval.py``、``evals/run_retrieval.py``、
+# ``evals/calibrate_threshold.py``、``ingest/pipeline.py``）一贯用
+# ``search_mod.ensure_high_freq_terms()`` 调用 ——
+# 换了调用点就多一处「评测和线上走的不是同一套」的风险。
+from rdi_agent.rag.terms import ensure_high_freq_terms  # noqa: F401
+from rdi_agent.rag.terms import keyword_terms as _keyword_terms  # noqa: F401
 
 # RRF 的平滑常数。60 是原论文的经验值，对我们这个量级（几百条候选）够用。
 RRF_K = 60
 
-# 召回过滤（计划 §5.4）：标了 needs_correction 的片段不进召回。
-# 两路 SQL 共用这一句 —— 漏了其中一路，坏片段还是会从另一路冒出来。
-REVIEW_FILTER = "c.review_status <> 'needs_correction'"
-
-# 参考文献 / 脚注 / 推荐阅读不进召回。
-#
-# **为什么要按标题再判一次**：``knowledge_type='reference'`` 是入库时
-# ``ingest/chunk.py:classify()`` 打的标记，而它只认标题含 "references" 的章节。
-# "FOOTNOTES"（section_code=028_footnotes）因此没被标成 reference，
-# 会混进证据里 —— 给家长看一段脚注列表没有任何意义。
-# 所以这里除了看 knowledge_type，还按标题兜一层。
-#
-# 用标题规则而不是硬编码 section_code：书一换、版本一改，
-# 章节编号就变了，标题规则不用动。
-CONTENT_FILTER = """
-          AND c.knowledge_type <> 'reference'
-          AND s.title_original NOT ILIKE '%reference%'
-          AND s.title_original NOT ILIKE '%footnote%'
-          AND s.title_original NOT ILIKE '%recommended reading%'
-"""
+# 召回过滤和共用列现在住在 :mod:`rdi_agent.rag.filters` ——
+# 关键词后端（``keyword_backends.py``）也要用它们，
+# 放这里会 import 成环。
+# 这里仍然 re-export 一份，是为了让 ``search.REVIEW_FILTER`` 这种
+# 写法继续能用（测试和历史文档都这么引）。
+__all_filters__ = (REVIEW_FILTER, CONTENT_FILTER, SELECT_COLUMNS)
 
 # 向量路的余弦距离上限（越小越严）。
 #
@@ -161,31 +162,6 @@ def _snippet(text_value: str) -> str:
     return text_value[:_SNIPPET_LEN].rstrip() + "…"
 
 
-# 两路召回共用的列。写两遍就容易改漏一处 —— 上次加 review_status 过滤
-# 就差点只加到一路。
-_SELECT_COLUMNS = """
-        SELECT c.id, c.chunk_index, s.section_code, s.title_original,
-               c.pdf_page_start, c.pdf_page_end, c.content_original,
-               (c.parent_chunk_id IS NULL) AS is_parent,
-               c.knowledge_type, c.review_status
-        FROM knowledge_chunks c
-        JOIN book_sections s ON s.id = c.section_id
-"""
-
-
-def _select_columns(extra: str = "") -> str:
-    """两路召回共用的列。``extra`` 是这一路独有的列。
-
-    向量路要多取一个 ``similarity``（余弦相似度）。
-    """
-    if not extra:
-        return _SELECT_COLUMNS
-    return _SELECT_COLUMNS.replace(
-        "c.knowledge_type, c.review_status\n",
-        f"c.knowledge_type, c.review_status,\n{extra}\n",
-    )
-
-
 def _row_to_candidate(row: Any) -> _Candidate:
     similarity = row.get("similarity")
     return _Candidate(
@@ -230,7 +206,7 @@ async def _vector_candidates(
     也没法在门控层判断"这条能不能采信"。
     """
     sql = (
-        _select_columns(
+        select_columns(
             "               1 - (c.embedding <=> CAST(:qv AS vector)) AS similarity"
         )
         + """
@@ -271,248 +247,49 @@ async def expand_with_concepts(query: str) -> list[str]:
     return [h["canonical_name"] for h in hits]
 
 
-# tsquery 里能安全出现的词：汉字、字母、数字。
-#
-# **为什么要剔掉别的**：tsquery 的语法字符（``:`` 权重、``&`` ``|`` ``!``
-# 运算符、``(`` ``)`` 分组、``'`` 引号）出现在词里会让解析报错。
-# 指南正文里有 ``（一）`` 这类编号、``0~18 月龄`` 这类范围 ——
-# 剔掉之后留下 ``18 月龄``，虽然丢了分隔符但仍能命中。
-_TSQUERY_SAFE = re.compile(r"[^\w一-鿿]+")
-
-# **高频词的门槛**：出现在超过这个比例的块里的词，对排序没有区分度。
-#
-# **为什么需要它**：中文查询里最高频的词恰恰是最没信息量的那些。
-# 实测（扫全部 73 块）：
-#
-#   儿童 295  行为 288  干预 286  训练 119  能力 119  评估 94 ...
-#
-# 前三个词出现在**几乎每一块**里 —— 问"孩子有癫痫，还能做行为干预吗"，
-# 词表是 ``['孩子', '癫痫', '行为', '干预', '共患病']``，
-# 其中"孩子""行为""干预"三个是虚词。命中它们的块（讲挑战性行为、
-# 讲缺陷行为）排名虚高，把真正的答案（共存问题和共患病那一节）挤掉了。
-#
-# 所以排序时**先把高频词剔掉**，只用有区分度的词算命中数。
-#
-# **但不能把它们从查询里彻底删掉**：它们仍然参与**召回**
-# （命中就是命中，扩大候选池），只是不参与**排序**。
-# 彻底删的话，"孩子摔东西"这种查询会因为没有区分度词而召不回任何东西。
-#
-# 门槛取 30% —— 比"儿童/行为/干预"低得多，又不至于把"共患病"
-# 这种只出现在一两节的术语误判成高频词。
-HIGH_FREQ_RATIO = 0.30
-
-# 高频词表。由 :func:`_load_high_freq_terms` 在模块加载时从库里算出来。
-#
-# **为什么要从库里算而不是写死**：知识库换了内容，词频分布就变了。
-# 写死的话，改了入库内容还要记得改这里 —— 迟早会忘。
-_HIGH_FREQ_TERMS: set[str] = set()
-
-
-async def _load_high_freq_terms() -> set[str]:
-    """扫一遍知识库，算出高频词。
-
-    只统计 ``content_normalized``（分词后的形态）—— 和关键词路
-    匹配的是同一份文本，口径必须一致。
-    """
-    async with session_scope() as session:
-        total = (
-            await session.execute(
-                text("SELECT count(*) FROM knowledge_chunks")
-            )
-        ).scalar_one()
-        if not total:
-            return set()
-        rows = (
-            await session.execute(
-                text(
-                    """
-                    SELECT word, count(DISTINCT chunk_id) AS n
-                    FROM (
-                        SELECT id AS chunk_id,
-                               unnest(regexp_split_to_array(content_normalized, ' ')) AS word
-                        FROM knowledge_chunks
-                    ) t
-                    WHERE length(word) > 1
-                    GROUP BY word
-                    HAVING count(DISTINCT chunk_id) > :threshold
-                    """
-                ),
-                {"threshold": total * HIGH_FREQ_RATIO},
-            )
-        ).all()
-    return {word for word, _ in rows}
-
-
-def _keyword_terms(query: str) -> list[str]:
-    """把关键词查询切成 tsquery 能用的词。
-
-    输入是**已经分词过的**查询串（空格分隔的词），所以这里只是
-    把词挑出来、剔掉不安全字符、去重。
-
-    **去掉单字词**：``的`` ``了`` ``和`` 这类虚词没有检索价值 ——
-    它们在任何一段中文里都出现，命中它们等于没命中。
-    """
-    terms: list[str] = []
-    for raw in query.split():
-        cleaned = _TSQUERY_SAFE.sub("", raw).strip("_")
-        if not cleaned:
-            continue
-        # 单个汉字（或单字母）太弱，跳过
-        if len(cleaned) < 2:
-            continue
-        if cleaned not in terms:
-            terms.append(cleaned)
-    return terms
-
-
-async def ensure_high_freq_terms(*, force: bool = False) -> set[str]:
-    """确保高频词表已加载（幂等）。
-
-    **为什么在这里加载**：词频是**知识库内容**的属性 ——
-    换了内容，分布就变了。所以它不能写死在代码里，也不能在模块
-    导入时加载（那时候数据库连接可能还没准备好）。
-
-    **什么时候加载**：第一次检索时。加载之后缓存在模块变量里，
-    后续检索直接用 —— 每次检索都扫一遍库太浪费。
-
-    **怎么失效**：重新入库之后词频变了。``force=True`` 可以强制重算
-    （入库脚本调它）。或者直接重启进程 —— 检索服务本来就是长驻的。
-    """
-    global _HIGH_FREQ_TERMS
-    if _HIGH_FREQ_TERMS and not force:
-        return _HIGH_FREQ_TERMS
-    _HIGH_FREQ_TERMS = await _load_high_freq_terms()
-    return _HIGH_FREQ_TERMS
-
-
-def _discriminative_terms(terms: list[str]) -> list[str]:
-    """去掉高频词，留下有区分度的词。
-
-    **全被高频词占满时怎么办**：返回空列表 —— 调用方要能区分
-    "没有区分度词"（排序退化成按 ts_rank）和"有区分度词"。
-
-    退化不是错误：查询全是"孩子""干预"这种词时，本来就没什么可分的，
-    按 ts_rank 排已经是能做的最好的事了。
-    """
-    if not _HIGH_FREQ_TERMS:
-        return terms
-    kept = [t for t in terms if t not in _HIGH_FREQ_TERMS]
-    return kept
-
-
 async def _fts_candidates(
-    query: str, top_k: int, section_code: str | None
+    query: str,
+    top_k: int,
+    section_code: str | None,
+    *,
+    backend_name: str | None = None,
 ) -> list[_Candidate]:
-    """关键词召回。
+    """关键词召回。**走指定的后端**（默认取配置里的那个）。
 
     ``query`` 是**已经改写好的**关键词查询（``query_rewrite`` 负责桥接和分词）。
     这里**不再自己桥一次** —— 曾经两处各桥一遍，结果是同一个查询被桥接
     两次，而且两处的过滤规则还不一样（旧的没看 ``is_explicit_in_source``，
     会把知识库里不存在的词也塞进去）。
 
-    **中文的关键词路怎么走**：``content_tsv`` 是
-    ``to_tsvector('simple', content_normalized)`` 生成的。``simple`` 配置
-    按**空格**分词，所以入库时必须先把内容 jieba 分词（见
-    ``clean.normalize_zh``）—— 否则整段中文会变成一个 lexeme。
+    具体怎么查由 :mod:`rdi_agent.rag.keyword_backends` 里的后端决定 ——
+    换后端不用改这个函数。
 
-    查询这边同样要分词：查询串先 jieba 切成词，再拼成 OR 的 tsquery。
-
-    **为什么用 OR 而不是 websearch_to_tsquery**：``websearch_to_tsquery``
-    对多个词是 **AND** 语义（实测 ``websearch_to_tsquery('simple',
-    '挑战性行为 消退 辅助')`` → ``'挑战性行为' & '消退' & '辅助'``）。
-    关键词路要的是"命中其中任一个精确术语" —— AND 的话，
-    一段话要同时提到三个词才被捞出来，召回几乎为零。
-
-    所以这里**显式构造 OR 的 tsquery**：``to_tsquery('simple', 'a | b | c')``。
-
-    **词必须转义**：tsquery 里 ``:`` 是权重、``&`` ``|`` ``!`` 是运算符，
-    词里带这些字符会报语法错。所以用 ``quote_literal`` 之外的办法 ——
-    这里在 Python 侧把非字母数字汉字的字符剔掉，只留安全的词。
+    ``backend_name`` 显式传时**覆盖配置**。CLI 用它做「同一查询换后端对比」，
+    不用改环境变量、不用重启进程。
     """
-    terms = _keyword_terms(query)
-    if not terms:
-        return []
-
-    tsquery = " | ".join(f"'{t}'" for t in terms)
-    sql = (
-        _SELECT_COLUMNS
-        + """
-        WHERE c.content_tsv @@ to_tsquery('simple', :tsquery)
-          AND """
-        + REVIEW_FILTER
-        + CONTENT_FILTER
+    backend = keyword_backends.get_backend(backend_name or _configured_backend())
+    built = await backend.build_query(
+        query, top_k=top_k, section_code=section_code
     )
-    params: dict[str, Any] = {"tsquery": tsquery}
-    if section_code:
-        sql += " AND s.section_code = :section_code"
-        params["section_code"] = section_code
-    # ---- 排序的第一关键字：命中了几个**有区分度**的词 ----
-    #
-    # **为什么不用 ts_rank_cd 排第一**：它按**词频**排序，而中文查询里
-    # 最高频的词恰恰是最没信息量的那些 —— "儿童"出现在 295 块里、
-    # "行为" 288 块、"干预" 286 块（全文共 73 块）。
-    #
-    # 实测（"孩子做对了要怎么奖励"，命中"正强化"的那一块）：
-    # ts_rank_cd 排序下它排**第 10** —— 因为含"孩子"的块词频高，
-    # 排名虚高，把真正的答案压下去了。
-    #
-    # 改成"命中**区分度词**的数量降序"之后：命中词多 = 覆盖了查询里
-    # 那些**有信息量**的说法 = 更可能是答案。命中数相同时再按 ts_rank 排。
-    #
-    # **区分度词 = 剔掉高频词之后的词**（见 ``_discriminative_terms``）。
-    # 高频词仍然参与**召回**（命中就是命中），只是不参与**排序** ——
-    # 彻底删掉的话，"孩子摔东西"这种查询会因为没有区分度词而召不回东西。
-    #
-    # **全被高频词占满时**：区分度词为空，排序退化成纯 ts_rank。
-    # 这不是错误 —— 查询本来就是"孩子""干预"这种词时，没什么可分的。
-    disc = _discriminative_terms(terms)
-    if disc:
-        hit_count_sql = """
-            SELECT count(*) FROM unnest(ARRAY[
-                {terms}
-            ]) AS t(word)
-            WHERE c.content_tsv @@ to_tsquery('simple', word)
-        """.format(
-            terms=", ".join(f"'{t}'" for t in disc)
-        )
-        # **命中词的"信息量"之和** —— 长的词比短的词有信息量。
-        #
-        # 为什么需要这一层：命中词数相同时（都是 1 个），ts_rank 会按
-        # 词频排，而词频高的恰恰是虚词。实测（"能不能用手机APP或者线上
-        # 课程来干预"，期望章节 010 数智干预康复）：
-        #
-        #   区分度词 = [不能, 手机, APP, 或者, 线上, 课程, 数智干预康复]
-        #   只命中"数智干预康复"的块（信息量 6 字）
-        #   vs 只命中"课程"的块（信息量 2 字）
-        #
-        # 按 ts_rank 排，"课程"的块在前；按信息量排，"数智干预康复"在前 ——
-        # 后者才是答案。
-        weight_sql = """
-            SELECT COALESCE(sum(length(t.word)), 0)
-            FROM unnest(ARRAY[
-                {terms}
-            ]) AS t(word)
-            WHERE c.content_tsv @@ to_tsquery('simple', t.word)
-        """.format(
-            terms=", ".join(f"'{t}'" for t in disc)
-        )
-        sql += f" AND ({hit_count_sql}) > 0"
-        order_by = (
-            f" ORDER BY ({hit_count_sql}) DESC,"
-            f" ({weight_sql}) DESC,"
-            " ts_rank_cd(c.content_tsv, to_tsquery('simple', :tsquery)) DESC"
-        )
-    else:
-        order_by = (
-            " ORDER BY ts_rank_cd(c.content_tsv, to_tsquery('simple', :tsquery)) DESC"
-        )
-    sql += order_by + " LIMIT :k"
-    params["k"] = top_k
-
+    if built is None:
+        return []
+    sql, params = built
     out = await _run_candidate_query(sql, params)
     for rank, candidate in enumerate(out, start=1):
         candidate.fts_rank = rank
     return out
+
+
+def _configured_backend() -> str:
+    """配置里指定的关键词后端名。
+
+    **为什么每次都读配置而不是模块加载时取一次**：测试里会改配置
+    （``reset_settings``），缓存了就测不到切换效果。
+    配置本身是 ``pydantic-settings`` 的单例，读取开销可以忽略。
+    """
+    from rdi_agent.config import get_settings
+
+    return get_settings().keyword_backend
 
 
 def _rrf_merge(
@@ -568,11 +345,14 @@ async def search(
     section_code: str | None = None,
     use_vector: bool = True,
     kind: str = "child",
+    keyword_backend: str | None = None,
 ) -> list[SearchHit]:
     """检索。返回按 RRF 分数排好的结果。
 
     ``kind`` 默认只回子块：子块是召回单元，父块是它的上下文。父块和它的
     子块同时出现在结果里，等于同一段话显示两遍。
+
+    ``keyword_backend`` 显式传时覆盖配置里的后端名。
     """
     # 查询改写只做一次：语义路用原话，关键词路用桥接后的
     from rdi_agent.rag.query_rewrite import rewrite_query
@@ -582,7 +362,12 @@ async def search(
     if use_vector:
         query_vector = await embeddings.embed_query(queries.semantic_query)
         vector_hits = await _vector_candidates(query_vector, candidate_k, section_code)
-    fts_hits = await _fts_candidates(queries.keyword_query, candidate_k, section_code)
+    fts_hits = await _fts_candidates(
+        queries.keyword_query,
+        candidate_k,
+        section_code,
+        backend_name=keyword_backend,
+    )
 
     merged = _rrf_merge(vector_hits, fts_hits)
     if kind == "child":
@@ -626,7 +411,7 @@ async def load_candidates_by_ids(chunk_ids: list[str]) -> list[_Candidate]:
     if not chunk_ids:
         return []
     sql = (
-        _SELECT_COLUMNS
+        SELECT_COLUMNS
         + """
         WHERE c.id = ANY(CAST(:ids AS uuid[]))
         """
@@ -668,6 +453,14 @@ def main() -> None:
         default="child",
         help="只回子块（默认）/ 只回父块 / 都要",
     )
+    parser.add_argument(
+        "--keyword-backend",
+        default=None,
+        help=(
+            "关键词路的后端（默认取配置 settings.keyword_backend）。"
+            f"可选：{'、'.join(keyword_backends.available_backends())}"
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args()
 
@@ -679,6 +472,7 @@ def main() -> None:
             section_code=args.section,
             use_vector=not args.no_vector,
             kind=args.kind,
+            keyword_backend=args.keyword_backend,
         )
     )
     if args.json:

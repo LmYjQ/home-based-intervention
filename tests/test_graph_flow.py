@@ -16,7 +16,12 @@ from langgraph.types import Command
 
 from rdi_agent import llm
 from rdi_agent.graph.builder import build_graph
-from rdi_agent.graph.nodes import chat_nodes, retrieval_nodes, write_nodes
+from rdi_agent.graph.nodes import (
+    chat_nodes,
+    memory_nodes,
+    retrieval_nodes,
+    write_nodes,
+)
 from rdi_agent.graph.state import CoachState
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
@@ -28,6 +33,7 @@ from rdi_agent.schemas.conversation import (
 from rdi_agent.schemas.conversation import LimitedAnswer, SafetyReviewCheck
 from rdi_agent.schemas.evidence import EvidenceDecision
 from rdi_agent.schemas.feedback import FeedbackAnalysis
+from rdi_agent.schemas.memory import MemoryExtractionResult
 from rdi_agent.schemas.recommendation import (
     ParentAction,
     RecommendationCard,
@@ -171,7 +177,44 @@ FakeLLM.DEFAULTS = {
     EvidenceDecision: _DIRECT,
     SafetyReviewCheck: _SAFETY_OK,
     LimitedAnswer: _LIMITED,
+    # 阶段 3：默认"这一轮什么也没记"。个别用例要测记忆时自己覆盖。
+    MemoryExtractionResult: MemoryExtractionResult(candidates=[], notes=[]),
 }
+
+
+@pytest.fixture(autouse=True)
+def no_memory(monkeypatch):
+    """流程测试不碰长期记忆。
+
+    记忆节点要连 Postgres、要调模型，而这个文件测的是**图的走向和
+    中断/恢复语义**。记忆本身的行为由 ``tests/test_memory_*.py`` 覆盖。
+
+    **autouse 是有意的**：三个记忆节点现在夹在主链路上，
+    每加一个新流程用例都要记得关掉它 —— 迟早会漏。
+    """
+
+    async def fake_extract(state: CoachState) -> dict:
+        return {"memory_candidates": [], "memory_notes": []}
+
+    async def fake_merge(state: CoachState) -> dict:
+        return {"memory_update_result": {}}
+
+    async def fake_commit(state: CoachState) -> dict:
+        return {}
+
+    async def fake_load(**kwargs):
+        return {
+            "child_context_patch": {},
+            "memory_context": {},
+            "forbidden_facts": [],
+        }
+
+    monkeypatch.setattr(memory_nodes, "extract_memories", fake_extract)
+    monkeypatch.setattr(memory_nodes, "merge_memories", fake_merge)
+    monkeypatch.setattr(memory_nodes, "commit_memory", fake_commit)
+    monkeypatch.setattr(
+        chat_nodes.memory_service, "load_memory_context", fake_load
+    )
 
 
 @pytest.fixture
@@ -408,7 +451,7 @@ async def test_asked_questions_are_passed_to_prompt(patched_llm, no_writes, no_r
             seen.append(kwargs["user"])
         payload = FakeLLM.DEFAULTS.get(kwargs["model_cls"])
         if payload is None:
-            payload = patched_llm.script.get(kwargs["model_cls"])
+            payload = fake.script.get(kwargs["model_cls"])
         if payload is None:
             raise AssertionError(f"{kwargs['stage']} 没有预置答案")
         if isinstance(payload, list):
@@ -417,7 +460,7 @@ async def test_asked_questions_are_passed_to_prompt(patched_llm, no_writes, no_r
             payload = payload[min(i, len(payload) - 1)]
         return payload, llm.LLMTrace(stage=kwargs["stage"], model="fake", source="fake")
 
-    patched_llm(
+    fake = patched_llm(
         {
             CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
             SufficiencyDecision: SufficiencyDecision(

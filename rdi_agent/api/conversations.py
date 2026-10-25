@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.repositories.case import Repository
+from rdi_agent.db.repositories.memory import list_memories as list_memories_repo
 from rdi_agent.graph.runtime import config_for, get_graph
 from rdi_agent.schemas.feedback import FeedbackSubmission
 
@@ -36,6 +37,12 @@ router = APIRouter(prefix="/api", tags=["conversations"])
 # ------------------------------------------------------------------ 请求体
 class CreateConversationRequest(BaseModel):
     family_id: str | None = None
+    # **复用已有孩子**：传了就用这个孩子开新会话。
+    #
+    # 没有它，验收第 1 条（"第二轮咨询会主动使用第一轮的事实"）
+    # 根本演示不出来 —— 每次建会话都新建一个孩子，
+    # 上一轮的长期记忆就永远挂在另一个 child_id 上。
+    child_id: str | None = None
     display_label: str = "孩子"
     age_band: str | None = None
 
@@ -269,18 +276,34 @@ async def _ensure_identity(
 # ------------------------------------------------------------------ 接口
 @router.post("/conversations")
 async def create_conversation(req: CreateConversationRequest) -> dict[str, Any]:
-    """建会话。conversation_id 里带上 family/child，省一张会话表。"""
+    """建会话。conversation_id 里带上 family/child，省一张会话表。
+
+    传了 ``child_id`` 就复用那个孩子（长期记忆挂在孩子上，
+    换会话不该换孩子）；没传才新建。
+    """
     async with session_scope() as session:
         repo = Repository(session)
-        # family_id 必须是 UUID —— children.family_id 是 UUID 列，
-        # 而且 conversation_id 靠 "." 分段解析出它，前缀 id 解析不出来。
-        family_id = req.family_id or str(uuid.uuid4())
-        child = await repo.ensure_child(
-            family_id=family_id,
-            display_label=req.display_label,
-            age_band=req.age_band,
-        )
-        child_id, family_uuid = str(child.id), str(child.family_id)
+        if req.child_id:
+            try:
+                uuid.UUID(req.child_id)
+            except ValueError:
+                raise HTTPException(400, "child_id 不是合法 UUID") from None
+            child = await repo.get_child(req.child_id)
+            if child is None:
+                raise HTTPException(404, "孩子档案不存在")
+            if req.family_id and str(child.family_id) != req.family_id:
+                raise HTTPException(403, "这个孩子不属于该家庭")
+            child_id, family_uuid = str(child.id), str(child.family_id)
+        else:
+            # family_id 必须是 UUID —— children.family_id 是 UUID 列，
+            # 而且 conversation_id 靠 "." 分段解析出它，前缀 id 解析不出来。
+            family_id = req.family_id or str(uuid.uuid4())
+            child = await repo.ensure_child(
+                family_id=family_id,
+                display_label=req.display_label,
+                age_band=req.age_band,
+            )
+            child_id, family_uuid = str(child.id), str(child.family_id)
 
     conversation_id = f"{family_uuid}.{child_id}.{uuid.uuid4().hex[:12]}"
     return {
@@ -429,6 +452,9 @@ def _turn_payload(conversation_id: str, result: dict[str, Any]) -> dict[str, Any
         "evidence_gaps": (result.get("evidence_bundle") or {}).get(
             "evidence_gaps"
         ) or [],
+        # 这一轮之后这个孩子记住了什么（前端"记忆区"直接用）
+        "memory": result.get("memory_context") or {},
+        "memory_notes": result.get("memory_notes") or [],
     }
 
 
@@ -589,6 +615,11 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
         interactions = await repo.list_interactions(conversation_id)
         plans = await repo.list_plans(conversation_id)
         context = await repo.child_context(child_id)
+        # 直接复用当前 session —— 另开一个 ``session_scope`` 会多占一条连接，
+        # 而且和这里的外层事务没有任何协同的必要。
+        memories = await list_memories_repo(
+            session, child_id=child_id, family_id=family_id
+        )
 
     # 从 Checkpointer 读当前 pending interrupt
     pending: dict[str, Any] | None = None
@@ -633,6 +664,10 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
         "selected_plan_id": values.get("selected_plan_id"),
         "evidence": _evidence_panel(values.get("evidence_bundle")),
         "evidence_decision": values.get("evidence_decision") or {},
+        # 记忆区：刷新页面后仍然能看到这个孩子记住了什么
+        "memories": (memories or {}).get("memories") or [],
+        "memory_counts": (memories or {}).get("counts") or {},
+        "memory_pending": (memories or {}).get("pending_confirmation", 0),
     }
 
 

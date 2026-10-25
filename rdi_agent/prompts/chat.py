@@ -49,6 +49,10 @@ def parse_parent_input(
   在幼儿园门口大哭不是风险信号，写进来会让家长白慌一场。
   没有就留空数组。
 - 家长没说的一律不要补。空数组是合法答案。
+
+关于 child_context 里的长期记忆：它是**背景**，不是这一轮的事实。
+这一轮的 observed_facts 只写家长在这轮说的话；已知事实由代码另行合并，
+不需要你抄一遍。已知事实和这一轮说法冲突时，按家长**最新**的说法写。
 """
     )
     payload = {
@@ -60,11 +64,29 @@ def parse_parent_input(
     return system, json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+# 长期记忆（阶段 3）的使用规则。
+#
+# **为什么单独抽出来**：追问（要不要再问）和生成建议（怎么用）两处
+# 都要遵守同一套口径。写两遍迟早会写得不一样 ——
+# 而"假设被当成事实"这种事，出一次就让家长觉得系统在给他孩子下结论。
+_MEMORY_RULES = """
+**关于 known_facts / known_preferences / known_contexts**：
+这些是以前几轮里确认过的信息。**已经知道的事不要再问一遍** ——
+换个说法问同一件事，家长会觉得在被反复盘问。
+如果 case_summary 和这里冲突，**以这里为准**（那是家长确认或纠正过的）。
+
+**关于 active_hypotheses**：这些是**还没验证的猜测**，不是事实。
+不要当成已知情况，也不要基于它给确定性判断。可以用它来决定"还该问什么"，
+但不能把它写进给家长的建议里当作结论。
+"""
+
+
 def check_sufficiency(
     *,
     case_summary: dict[str, Any],
     followup_rounds: int,
     asked_questions: list[str] | None = None,
+    child_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """判断信息够不够生成一份有用的建议。返回 (system, user)。"""
     system = (
@@ -89,12 +111,20 @@ def check_sufficiency(
 家长回答完这一轮之后就出方案，不再问第二遍。
 在信息不完美的情况下给出一份标注了不确定性的建议，好过继续追问下去。
 """
+        + _MEMORY_RULES
     ).format(rounds=followup_rounds)
+    context = child_context or {}
     user = json.dumps(
         {
             "case_summary": case_summary,
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
+            "known_facts": context.get("confirmed_facts") or [],
+            "known_preferences": context.get("preferences") or [],
+            "known_contexts": context.get("known_contexts") or [],
+            "active_hypotheses": (context.get("memories") or {}).get(
+                "hypotheses", []
+            ),
         },
         ensure_ascii=False,
         indent=2,
@@ -108,6 +138,7 @@ def generate_followup(
     priority_questions: list[str],
     followup_rounds: int,
     asked_questions: list[str] | None = None,
+    child_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """把候选问题收敛成最多 3 个给家长看的问法，每个带点选选项。返回 (system, user)。"""
     system = (
@@ -145,13 +176,21 @@ def generate_followup(
   这一题会退化成自由输入。这比硬凑几个废话选项好。
 - 全部用中文，措辞和 question 里的口吻保持一致。
 """
+        + _MEMORY_RULES
     ).format(rounds=followup_rounds)
+    context = child_context or {}
     user = json.dumps(
         {
             "case_summary": case_summary,
             "priority_questions": priority_questions,
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
+            "known_facts": context.get("confirmed_facts") or [],
+            "known_preferences": context.get("preferences") or [],
+            "known_contexts": context.get("known_contexts") or [],
+            "active_hypotheses": (context.get("memories") or {}).get(
+                "hypotheses", []
+            ),
         },
         ensure_ascii=False,
         indent=2,
@@ -272,6 +311,19 @@ def build_recommendation(
 - recommended：恰好一张设为 true，其余 false。推荐那张要标清推荐理由。
 
 不要诊断，不要强迫孩子，不要把一次行为说成"他就是这样的人"。
+
+**怎么用 child_context 里的长期记忆**：
+
+- confirmed_facts / preferences：家长确认过的事，可以当作背景用。
+  preferences 里说"不希望怎样"的，建议里**不要**违背。
+- memories.observations：每一条只是**某一次**发生的事，
+  可以拿来说明"你提到过……"，但不能概括成孩子的特点。
+- memories.hypotheses：还没验证的猜测。要么不写，要么写成
+  "有可能……，但还需要再观察"。**不能**当结论，也不能写进
+  observed_facts。
+- memories.attempts：家长真试过的事。**不要**把系统建议过的事
+  说成家长已经做过 —— 那是两回事。
+- 已经作废或删除的记忆不会出现在这里，不要凭印象补回来。
 
 plan_id 用 plan_1 / plan_2 / plan_3 这种短 id，不要用随机数。
 """

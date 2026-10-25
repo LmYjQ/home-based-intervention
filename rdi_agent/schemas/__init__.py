@@ -21,9 +21,15 @@ from rdi_agent.schemas.feedback import (
     FeedbackSubmission,
 )
 from rdi_agent.schemas.memory import (
+    DecisionType,
+    MemoryAction,
     MemoryCandidate,
+    MemoryCandidateDraft,
+    MemoryDecision,
+    MemoryExtractionResult,
     MemoryType,
     MemoryUpdateResult,
+    SourceKind,
 )
 from rdi_agent.schemas.recommendation import (
     ApplicationLabel,
@@ -45,9 +51,15 @@ __all__ = [
     "FeedbackSubmission",
     "FollowupQuestion",
     "FollowupQuestions",
+    "DecisionType",
+    "MemoryAction",
     "MemoryCandidate",
+    "MemoryCandidateDraft",
+    "MemoryDecision",
+    "MemoryExtractionResult",
     "MemoryType",
     "MemoryUpdateResult",
+    "SourceKind",
     "NextStep",
     "ParentAction",
     "RecommendationCard",

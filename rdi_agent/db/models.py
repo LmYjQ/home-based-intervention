@@ -26,6 +26,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -330,7 +331,29 @@ class Observation(Base):
     """情境观察（L2）。只写"发生了什么"，不写"孩子就是XX型"。"""
 
     __tablename__ = "observations"
-    __table_args__ = (Index("idx_observations_child_time", "child_id", "observed_at"),)
+    __table_args__ = (
+        Index("idx_observations_child_time", "child_id", "observed_at"),
+        # 同一条观察重复抽到只留一行。谓词把已作废/已删除的排除掉 ——
+        # 以后同样的事再发生一次，是一条**新的**观察，不该被旧行挡住。
+        Index(
+            "uq_observations_child_content",
+            "child_id",
+            "content_hash",
+            unique=True,
+            postgresql_where=text(
+                "deleted_at IS NULL "
+                "AND status IN ('active', 'pending_confirmation') "
+                "AND content_hash IS NOT NULL"
+            ),
+        ),
+        Index(
+            "idx_observations_child_status_time",
+            "child_id",
+            "status",
+            "observed_at",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=_uuid
@@ -351,8 +374,36 @@ class Observation(Base):
     outcome: Mapped[str] = mapped_column(Text, default="")
     source_kind: Mapped[str] = mapped_column(String(32), default="parent_report")
     confidence: Mapped[float | None] = mapped_column()
+
+    # ---- 阶段 3：可追溯 / 可纠正 / 不重复 ----
+    #
+    # ``content_hash`` 是去重键（memory_type + 归一化内容），跨 turn 生效：
+    # 追问恢复会换新的 turn_id，按 turn 去重挡不住重复抽取。
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(
+        String(16), default="active", nullable=False
+    )
+    # 家长说"我们试过 X"记成观察时置 true。**不能**用系统给过的建议反推 ——
+    # "建议过"不等于"做过"，那是 trials 的事。
+    is_attempt: Mapped[bool] = mapped_column(default=False, nullable=False)
+    source_interaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    source_feedback_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("feedbacks.id", ondelete="SET NULL")
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(String(64))
+    # 家长原话，逐字。审核者靠它核对，没有它这条记忆不可信。
+    source_quote: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
+    superseded_by_memory_id: Mapped[str | None] = mapped_column(String(64))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -360,7 +411,27 @@ class Hypothesis(Base):
     """待验证假设（L3）。模型生成默认 status='candidate'，不能自动升级为事实。"""
 
     __tablename__ = "hypotheses"
-    __table_args__ = (Index("idx_hypotheses_child_status", "child_id", "status"),)
+    __table_args__ = (
+        Index("idx_hypotheses_child_status", "child_id", "status"),
+        Index(
+            "uq_hypotheses_child_content",
+            "child_id",
+            "content_hash",
+            unique=True,
+            postgresql_where=text(
+                "deleted_at IS NULL "
+                "AND status IN ('candidate', 'active', 'weakened') "
+                "AND content_hash IS NOT NULL"
+            ),
+        ),
+        Index(
+            "idx_hypotheses_child_status_updated",
+            "child_id",
+            "status",
+            "updated_at",
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=_uuid
@@ -376,8 +447,26 @@ class Hypothesis(Base):
     status: Mapped[str] = mapped_column(String(16), default="candidate")
     created_by: Mapped[str] = mapped_column(String(32), default="llm")
     last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # ---- 阶段 3 ----
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    source_interaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    source_feedback_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("feedbacks.id", ondelete="SET NULL")
+    )
+    source_turn_id: Mapped[str | None] = mapped_column(String(64))
+    source_quote: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
+    superseded_by_memory_id: Mapped[str | None] = mapped_column(String(64))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
 
@@ -385,6 +474,22 @@ class MemoryEvent(Base):
     """记忆变更审计。每次写入/修正/删除都留痕。"""
 
     __tablename__ = "memory_events"
+    __table_args__ = (
+        # 重放保护。**按动作而不是按内容**：同一个候选在同一轮里重放两次
+        # 只该留一条事件；换一轮再写是新的动作，要留痕。
+        Index(
+            "uq_memory_events_turn_candidate",
+            "child_id",
+            "source_conversation_id",
+            "source_turn_id",
+            "content_hash",
+            unique=True,
+            postgresql_where=text(
+                "source_turn_id IS NOT NULL AND content_hash IS NOT NULL"
+            ),
+        ),
+        Index("idx_memory_events_child_time", "child_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=_uuid
@@ -399,6 +504,8 @@ class MemoryEvent(Base):
     after_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     source_conversation_id: Mapped[str | None] = mapped_column(String(128))
     source_turn_id: Mapped[str | None] = mapped_column(String(64))
+    # 一次写入动作的身份。同一个候选在同一个 turn 里重放两次只留一条事件。
+    content_hash: Mapped[str | None] = mapped_column(String(64))
     confirmed_by_parent: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

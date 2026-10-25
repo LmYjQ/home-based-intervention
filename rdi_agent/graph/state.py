@@ -89,6 +89,17 @@ class CoachState(TypedDict, total=False):
     feedback_created: bool
     memory_candidates: list[dict[str, Any]]
     memory_update_result: dict[str, Any]
+    # 这一轮给前端"记忆区"看的内容（事实/观察/假设/尝试）
+    memory_context: dict[str, Any]
+    # 本轮被纠正/删除掉的旧事实原文。
+    #
+    # **只给代码用**：``parse_parent_input`` 拿它过滤掉累积事实里的旧值。
+    # 永远不进 prompt —— 那等于把家长删掉的隐私又喂回模型。
+    memory_forbidden_facts: list[str]
+    # 记忆节点的说明（降级原因等），给 trace 和排查用
+    memory_notes: list[str]
+    # 反馈记录落库后的 id，记忆抽取要拿它溯源
+    feedback_db_id: str
 
     # 运维
     error_code: str | None

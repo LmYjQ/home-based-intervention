@@ -1337,8 +1337,16 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
 - [x] **关键词路排序**：先按"命中了几个**有区分度**的词"降序，再按"命中词的信息量之和"降序
       （长的词更有信息量），最后才 `ts_rank_cd`。理由：`ts_rank_cd` 按词频排，
       而中文查询里最高频的词恰恰是最没信息量的那些。
-- [ ] 实现 `KeywordSearchBackend` 切换；`paradedb_bm25` 作为可选后端。
-      **本轮未做**：瓶颈不在后端，是中文同义表述（见下面「失败用例分析」）。
+- [x] 实现 `KeywordSearchBackend` 切换；`paradedb_bm25` 作为可选后端。
+      **2026-10-25 补做**：协议 + `PostgresFtsBackend` + 配置接线
+      （`rdi_agent/rag/keyword_backends.py`），`paradedb_bm25` **只留骨架未实现**。
+      **为什么不实现**：一是本地 PG 装不上 `pg_search` 扩展，写了也验证不了；
+      二是瓶颈本来就不在后端（见下面「失败用例分析」—— 5 条未命中是
+      中文同义表述召不回，换 BM25 改善不了排序，改善不了"压根没召回到"）。
+      换后端时**要把本项目的排序口径一起带过去**（命中区分度词数 → 信息量 → 引擎分），
+      否则中文排序会退化成按词频排。
+      **配了没实现的后端不能让它把检索链搞挂** —— 协议上有 `implemented` 标志，
+      `get_backend()` 遇到未实现的退回默认后端（`available_backends()` 只列能用的）。
 - [x] RRF 合并去重：`score = sum(1 / (60 + rank))`。
       **加权 RRF 试过，不采用**：关键词权重 ×2 会把 4 条原本命中的挤掉，
       recall@5 从 0.853 掉到 0.765（34 条全量扫过，不是手调 3 条）。
@@ -1362,8 +1370,79 @@ DDL。没有数据库就起不来 —— 这是故意的，见 `runtime.setup_gr
       **日志不进版本库**（`.gitignore`）：日志里逐条引用了指南正文片段，
       篇幅比指南全文还大（实测 144%）。指南全文都不进公开仓库，日志同理。
       需要时本地跑 `python -m tools.run_log` 就有。
-- [ ] 调参记录：chunk 大小、overlap、Top-K、是否重排，每次只改一个变量。
+- [x] 调参记录：chunk 大小、overlap、Top-K、是否重排，每次只改一个变量。
       **基线已存**（`evals/REPORT_v1.md`），后续每次改一个变量重跑一次做对比。
+      完整记录见下面的「调参记录」小节 —— **已跑的**和**没跑的**分开写，
+      别把没跑过的写成"已验证"。
+
+#### 调参记录
+
+> **规矩**：每次只改一个变量，改完重跑全量 34 条相关用例，
+> 把 recall@5 / MRR 记进表里。**没跑的项标"未跑"**，
+> 不要拿别处的数字来填。
+
+**基线**（中文指南这一版，`evals/REPORT_v3.md`）：
+recall@5 = **0.8529**（29/34），MRR = 0.5515，页码可定位 100%，硬凑率 0%。
+
+##### 已跑
+
+| # | 变量 | 取值 | recall@5 | MRR | 结论 |
+|---|---|---|---|---|---|
+| 1 | **相似度门槛**（`MAX_VECTOR_DISTANCE`） | 0.46 | — | — | 砍掉 5 块期望块，**不采用** |
+| | | 0.50 | — | — | 砍掉 2 块期望块，不采用 |
+| | | **0.52** | — | — | **采纳**（相关 34/34 全中，砍块最少） |
+| | | 0.54 | — | — | 与 0.52 同，**不优于** |
+| | | 0.56 | — | — | 与 0.52 同，不优于 |
+| 2 | **是否重排**（`bge-reranker-v2-m3`） | 关 | **0.8529** | 0.5515 | **基准** |
+| | | 开 | **0.8235** | 0.6382 | **Recall 掉、MRR 升** —— 重排把章节覆盖打散了。**默认关**（`rerank_in_graph=False`） |
+| 3 | **融合权重**（加权 RRF，关键词 ×2） | — | **0.7647** | 0.5471 | **更差** —— 挤掉 4 条原本命中的。不采用 |
+| 4 | **每章节限 1 块** | — | **0.7941** | 0.5083 | **更差**。不采用 |
+| 5 | 加权 + 限 1 块 | — | 0.8529 | 0.5711 | 持平，MRR 略升。**不采用**（复杂换不来 recall） |
+| 6 | **只走向量路**（关关键词路） | — | 0.7941 | 0.5804 | 单路不够 |
+| 7 | **只走关键词路**（关向量路） | — | 0.7353 | 0.4755 | 单路不够 |
+| 8 | **向量化输入**（`--embed-input`） | `normalized`（jieba 分词文本，默认） | 0.7941 | 0.5983 | 基准 |
+| | | `original`（自然原文） | 0.7941 | **0.6387** | **召回完全没变**，只有 MRR +0.04。**bge-m3 对分词文本不敏感** |
+| 9 | **定义意图识别**（加"相对于"等定义句式词） | 关 | 0.882 | — | — |
+| | | **开** | **0.912** | — | **采纳**（+0.03） |
+| 10 | **关键词路 OR 语义** | `websearch_to_tsquery`（AND） | 接近 0 | — | 一段话要同时提到三个词才被捞出来。**必须显式构造 OR** |
+| 11 | **高频词过滤** | >30% 块出现的词不参与排序 | — | — | 采纳。词频统计必须按 `count(DISTINCT chunk_id)` —— 用 `count(*)` 会算成 295（73 块的全集），阈值全乱 |
+
+**第 9 项的 0.882 / 0.912 是 26 条用例时的数字**（后来评测集扩到 37 条，
+基线也换成 0.8529 了）。跟现在的表不是同一口径，**不能横向比** ——
+它记录的是"加这个机制有效"这个结论，不是当前基线。
+
+##### 未跑（**别当成已验证**）
+
+| # | 变量 | 计划中的取值 | 状态 |
+|---|---|---|---|
+| A | **chunk 大小** | `CHILD_TARGET_CHARS` 500 / `CHILD_MAX_CHARS` 1100；父块 2400 / 3600 | **未跑**。中文指南的正文是**表格为主**（附件 2/3/4 三张大表），当前切块参数是照着**英文叙事书**调的，**没在中文表格语料上验证过**。改切块参数要重建整库向量 + 重新入库 + 重跑评测 |
+| B | **overlap** | `CHILD_OVERLAP_CHARS` 150 | **未跑**。曾经修过一个 bug（重叠"按整段搬运"，导致 12% 子块字符是纯重复，见 `docs/RAG_自建vs框架_逐项对照.md` §3.7），但**没做过参数扫描** |
+| C | **Top-K** | `top_k=5`（最终证据）、`candidate_k=30`（每路召回） | **未跑过扫描**。`top_k` 一直取 5，没试过 3 / 8 / 10。门控采信门槛 `DIRECT_MAX_DISTANCE` 跟 `top_k` 有耦合，一起改才算一个变量 |
+| D | **chunk 大小 + 中文表格** | — | **未跑**，但**这是最该跑的一项**。见下面「下一步」 |
+
+##### 下一步该跑哪一项
+
+**优先 A/D（chunk 大小 × 中文表格语料）**，不是 Top-K。
+
+理由：当前 5 条未命中（`early_intervention` / `intensity_hours` /
+`behavior_strategy_positive_reinforcement` / `behavior_strategy_differential` /
+`venue_staff`）**根因不是切块** —— 是中文同义表述对不上
+（"一周" vs "每周"、"哪里" vs "场地"），分词是精确匹配，
+向量路也救不回来（正确答案在向量路里排第 13）。
+**调 chunk 参数治不了这个。**
+
+但 chunk 参数**确实**有个未验证的隐患：中文指南的正文以表格为主，
+当前切块参数（500/1100 子块、150 重叠）是照英文叙事书调的。
+表格行被切碎的话，父块扩展捞回来的上下文可能是**半张表**。
+
+**跑法**（一次只改一个变量）：
+1. 只改 `CHILD_TARGET_CHARS`（比如 500 → 350），重建索引，跑评测；
+2. 再只改 `CHILD_OVERLAP_CHARS`（150 → 250），重建索引，跑评测；
+3. 每次改完都要重跑**全量 34 条**，不能手挑几条看效果 ——
+   前两次失败（加权 RRF、限 1 块）都是因为手调了几条就下结论。
+
+**注意**：改切块参数 = 重建整库向量 = **要用户手动跑**（`make ingest` 会外发 embedding），
+而且**人工标记要重核**（标记按内容哈希存的，内容变了哈希就变了）。
 
 #### 评测脚本的两个 bug（2026-10-24 修）
 
@@ -1512,24 +1591,53 @@ def route_after_evidence_gate(state: CoachState) -> str:
 
 #### 任务
 
-- [ ] 把 2B 的检索能力封装成节点，接入阶段 1 的图。
-- [ ] 实现 `evidence_gate` 的结构化输出和四条路由。
-- [ ] 修改 `build_recommendation`：有证据时使用证据，无证据时生成 `limited_answer`。
-- [ ] 实现引用校验器，并写“编造引用必须失败”的测试。
-- [ ] 实现 `safety_review` 和安全兜底话术。
-- [ ] 会话响应增加证据面板数据：章节、页码、摘要、来源标签、审核状态。
-- [ ] 更新 `RecommendationCard` 持久化：保存 `evidence_bundle_id` 和 citations。
-- [ ] 准备 5 条演示问题：直接证据、间接证据、无证据、信息不足、风险信号。
+- [x] 把 2B 的检索能力封装成节点，接入阶段 1 的图。
+      `rdi_agent/graph/nodes/retrieval_nodes.py`（8 个节点）：
+      `rewrite_query` → `retrieve_knowledge` → `rerank_and_expand` →
+      `evidence_gate` → `build_recommendation` / `build_limited_answer` →
+      `safety_review` → `render_answer`。
+- [x] 实现 `evidence_gate` 的结构化输出和四条路由。
+      `rdi_agent/graph/evidence_gate.py`：**规则优先，LLM 为辅** ——
+      证据包为空、家长报了严重风险信号、没有任何证据达到采信门槛，
+      这三条写死在代码里，LLM 说什么都不能推翻。
+- [x] 修改 `build_recommendation`：有证据时使用证据，无证据时生成 `limited_answer`。
+      引用校验失败 → 带错误信息重试一次 → 仍失败丢卡降级为 `limited_answer`，
+      trace 里记 `citation_validation_failed`。
+- [x] 实现引用校验器，并写“编造引用必须失败”的测试。
+      `rdi_agent/graph/citations.py` + `tests/test_citations.py`。
+      校验三件事：`source_id`（= `evidence_id`）在证据包里、章节对得上、页码对得上。
+- [x] 实现 `safety_review` 和安全兜底话术。
+      `rdi_agent/graph/safety.py`（24 个中文规则用例，句级匹配）
+      + `tests/test_safety.py`。
+- [x] 会话响应增加证据面板数据：章节、页码、摘要、来源标签、审核状态。
+      `rdi_agent/api/conversations.py::_evidence_panel`。
+- [x] 更新 `RecommendationCard` 持久化：保存 `evidence_bundle_id` 和 citations。
+      `rdi_agent/graph/nodes/write_nodes.py` + 迁移 `003_evidence_bundle_unique.py`。
+- [x] 准备 5 条演示问题：直接证据、间接证据、无证据、信息不足、风险信号。
+      用例写在 `evals/demo_paths.py`，**手动测的版本**在
+      `frontend_rdi/MANUAL_TEST.md` 第 10 节（家长自己在浏览器里点）。
 
 #### 验收
 
-- 直接证据问题：建议卡有真实章节和页码，能回到 PDF 核对。
-- 间接证据问题：明确写“这是可能参考”，不声称原书直接回答。
-- 无证据问题：明确说知识库没有足够依据，不出现虚构书名/章节/页码。
-- 编造 citation 的测试用例被校验器拦截。
-- 每张卡都有观察指标和停止条件。
-- 安全用例中不出现诊断、强迫或忽视不适的建议。
-- 回答中能区分“原书摘要”和“AI 应用转化”。
+| 验收项 | 怎么验 | 状态 |
+|---|---|---|
+| 直接证据问题：建议卡有真实章节和页码，能回到 PDF 核对 | `frontend_rdi/MANUAL_TEST.md` §10.1 | **待手动验收**（脚本在 `evals/demo_paths.py`） |
+| 间接证据问题：明确写“这是可能参考”，不声称原书直接回答 | 同上 §10.2 | **待手动验收** |
+| 无证据问题：明确说知识库没有足够依据，不出现虚构书名/章节/页码 | 同上 §10.3 | **待手动验收**（`evidence_status='none'` → `limited_answer`） |
+| 信息不足：先追问，不硬给建议 | 同上 §10.4 | **待手动验收** |
+| 风险信号：走专业支持，不继续给干预方案 | 同上 §10.5 | **待手动验收**（`serious_signals()` 命中 → `professional_support`） |
+| 编造 citation 的测试用例被校验器拦截 | `tests/test_citations.py` | ✅ 已落地 |
+| 每张卡都有观察指标和停止条件 | schema 强制（`RecommendationCard` 的 `field_validator`） | ✅ 已落地 |
+| 安全用例中不出现诊断、强迫或忽视不适的建议 | `tests/test_safety.py`（24 个中文规则用例） | ✅ 已落地 |
+| 回答中能区分“原书摘要”和“AI 应用转化” | `application_label`：`source_summary` / `ai_adaptation`（`expert_reviewed` 这一阶段没实现，出现就是 bug） | ✅ 已落地 |
+
+> **前五项要人在浏览器里点**（`frontend_rdi/MANUAL_TEST.md` §10 给了逐条
+> 「输入什么 → 预期看到什么」）。这是 2C 唯一还没验收完的部分 ——
+> 代码都在，但**没跑过真实场景**，不能算验收通过。
+>
+> **检索侧已回归**（2026-10-25）：`rag/keyword_backends.py` 重构后重跑全量评测，
+> 指标**一字未变**（Recall@5 = 0.8529 / MRR = 0.5515 / 硬凑率 0%），
+> 见 `evals/REPORT_v3.md` §2.1。
 
 #### 交付物
 
@@ -1605,15 +1713,47 @@ RAG 检索
 
 ### 10.6 任务
 
-- [ ] 建 `observations`、`hypotheses`、`memory_events` 表；补齐 `children.confirmed_facts_json` 等字段。
-- [ ] 定义 `ObservationDraft`、`HypothesisDraft`、`MemoryCandidate` 契约。
-- [ ] 实现 `extract_memories`：从用户输入和反馈中抽取候选，保留 `source_quote` 和 `source_turn_id`。
-- [ ] 实现 `merge_memories`：去重、冲突检测、`auto_commit / needs_confirmation / discard` 分类。
-- [ ] 实现 `commit_memory`：事务写入 + `memory_events`。
-- [ ] 实现 `load_context`：按 child、场景、时间、相关性加载，限制条数和 token。
-- [ ] API：列出、确认、纠正、删除记忆。
-- [ ] 幂等：同一 `(conversation_id, turn_id, candidate_hash)` 不重复写入。
-- [ ] 写测试：重复写入、事实纠正、假设被反例削弱、跨家庭隔离。
+- [x] 建 `observations`、`hypotheses`、`memory_events` 表；补齐 `children.confirmed_facts_json` 等字段。
+- [x] 定义 `MemoryCandidateDraft` / `MemoryExtractionResult`（给模型）/ `MemoryCandidate`（给代码）契约。
+- [x] 实现 `extract_memories`：从用户输入和反馈中抽取候选，保留 `source_quote` 和 `source_turn_id`。
+- [x] 实现 `merge_memories`：去重、冲突检测、`auto_commit / needs_confirmation / discard` 分类。
+- [x] 实现 `commit_memory`：事务写入 + `memory_events`。
+- [x] 实现 `load_context`：按 child、场景、时间、相关性加载，限制条数和 token。
+- [x] API：列出、确认、纠正、删除记忆。
+- [x] 幂等：同一 `(conversation_id, turn_id, candidate_hash)` 不重复写入。
+- [x] 写测试：重复写入、事实纠正、假设被反例削弱、跨家庭隔离。
+
+#### 交付记录（2026-10-25）
+
+| 项 | 落在哪 |
+|---|---|
+| 迁移 | `alembic/versions/005_memory_provenance.py` —— 溯源/软删列、部分唯一索引、`memory_events` 列宽 64→128 |
+| 纯规则 | `rdi_agent/memory/{ids,facts,relevance,merge}.py`（不连库、不调模型） |
+| 仓储 | `rdi_agent/db/repositories/memory.py` |
+| 编排 | `rdi_agent/memory/service.py` |
+| Prompt | `rdi_agent/prompts/memory.py` |
+| 节点 | `rdi_agent/graph/nodes/memory_nodes.py` |
+| API | `rdi_agent/api/memory.py`（4 个接口） |
+| 前端 | `frontend_rdi/src/components/MemoryPanel.vue` |
+| 测试 | `tests/test_memory_{merge,facts,graph,repository,api}.py` |
+
+**几个定下来的设计决定**（实施时踩出来的，写在这里免得下一个人重推一遍）：
+
+1. **抽取放在 `parse_parent_input` 之前**，不是之后。解析会把上一轮累积的
+   `observed_facts` 并进 `case_summary`；先解析再记忆的话，家长刚纠正的旧值
+   已经在本轮事实里了。先记忆，`commit_memory` 才能把"哪些旧值刚作废"交给
+   解析节点过滤。
+2. **事实仍存在 `children.confirmed_facts_json`**，但元素从字符串升级成对象
+   （id / 状态 / 原话 / 取代链接）。旧字符串照常读。JSONB 上建不了唯一索引，
+   写入靠 `SELECT ... FOR UPDATE` 锁孩子行串行化。
+3. **去重按内容哈希，不按 turn**。追问恢复会换新的 `turn_id`，
+   按 turn 去重挡不住重复抽取。`(conversation_id, turn_id, hash)` 只挡同一次请求的重放。
+4. **代码只能把模型的判断降级**。唯一例外是家长明确纠正旧事实
+   （有效 `replaces_memory_id` + 逐字原话 + 非推断）—— 不这么做的话，
+   保守的模型会让"纠正后不再沿用旧值"永远不生效。
+5. **模型推断只能成为 `hypothesis`（状态 `candidate`）**，永远不进事实。
+6. **反馈入口也接抽取**（计划 §10.3 的流程图），阶段 4 只做"分析 + 下一步"，
+   不用再改图。
 
 ### 10.7 验收
 

@@ -129,10 +129,78 @@ def _table_row_to_text(line: str) -> str:
     **``<br>`` 换成句号**：Markdown 里 ``<br>`` 表示单元格内的换行。
     留着它，向量模型会把它当成一串无意义的字符。换成句号之后，
     "1. xxx。<br>2. yyy。" 变成 "1. xxx。 2. yyy。" —— 句子边界清楚了。
+
+    **但不能无条件加句号**（这是踩过的坑）：指南的表格里大量是
+    "某句话。<br>下一句" 这种写法 —— 前一句**本来就带句号**，
+    无脑替换就变成 "某句话。。下一句"。
+
+    实测 73 块里有 11 块中招（共 56 处），全在附件 2/3/4 三张表里。
+    所以这里按"前面是不是已经有句末标点"来决定加不加，
+    而不是简单地 ``replace("<br>", "。 ")``。
     """
     cells = [c.strip() for c in line.strip("|").split("|")]
-    cleaned = [c.replace("<br>", "。 ").replace("**", "") for c in cells]
+    cleaned = [_br_to_period(c).replace("**", "") for c in cells]
     return " ".join(c for c in cleaned if c)
+
+
+# 句末标点。``<br>`` 前面是这些字符时，说明上一句已经收尾了，
+# 再加一个句号就会变成 "。。"。
+_SENTENCE_END = "。！？；.!?;"
+
+
+def _br_to_period(cell: str) -> str:
+    """单元格里的 ``<br>`` 换成句号，但**不重复加句号**。
+
+    **要复现库里的存量形态**：原来 ``replace("<br>", "。 ")`` 产出的是
+    "句号 + 空格"。库里的内容也是这个形态。所以这里保持"句号 + 空格"，
+    **只去掉重复的那个句号**。
+
+    为什么要这么讲究：改掉空格形态的话，**重新入库**产出的文本就跟
+    现在库里不一样 —— 切块边界跟着移，人工标记的内容哈希全部失效。
+    这不是洁癖，是让"修 bug"和"重建索引"这两件事不会互相打架。
+
+    规则（前一句收没尾）：
+
+    - ``xxx。<br>yyy`` → ``xxx。 yyy``（已有句号，去掉重复的，补空格）
+    - ``xxx<br>yyy``  → ``xxx。 yyy``（没句号，补一个 + 空格）
+    - ``<br>yyy``     → ``yyy``（开头就是换行，前面没内容）
+
+    最后再压一遍连续句号 —— OCR 文本里还可能有别处自己带进来的。
+    """
+    if "<br>" not in cell:
+        return cell
+
+    out: list[str] = []
+    for i, part in enumerate(cell.split("<br>")):
+        if i == 0:
+            out.append(part)
+            continue
+        prev = out[-1]
+        if not prev:
+            # ``<br>`` 就在开头，前面没内容
+            out.append(part)
+        elif prev[-1] in _SENTENCE_END:
+            # 前一句已经收尾了，别再加句号
+            out.append(part)
+        else:
+            # 前一句没收尾，补一个句号
+            out[-1] = prev + "。"
+            out.append(part)
+
+    # 每段之间留一个空格（跟原来 ``"。 "`` 的形态一致）
+    text = " ".join(out)
+
+    # 压掉重复的句号。两种形态都要处理：
+    #
+    #   - ``。。``   连续两个句号（``<br>`` 前面本来就有句号）
+    #   - ``。 。``  中间隔着空格（源文件里是 ``<br><br>``，双换行）
+    #
+    # 压完留一个空格：``。 。 `` → ``。 ``，
+    # 跟单 ``<br>`` 的形态一致（库里的存量就是这个形态）。
+    while "。。" in text:
+        text = text.replace("。。", "。")
+    text = re.sub(r"。\s+。", "。 ", text)
+    return text
 
 
 def read_raw_pages(md_dir: str | Path) -> list[tuple[int, str]]:

@@ -60,6 +60,34 @@ v3 是 34 条中文用例在 73 块上的结果 —— 语料规模差一个量�
 
 ---
 
+## 2.1 2026-10-25 重跑：KeywordSearchBackend 重构后指标不变
+
+2C 之后的 `rag/keyword_backends.py` 把关键词路的 SQL 从 `search.py` 里搬了出去
+（拆出 `filters.py` / `terms.py`，加了 `KeywordSearchBackend` 协议）。
+**改的是检索实现，按计划 §13 的纪律必须重跑评测对比。**
+
+| 指标 | 本报告（2026-10-24） | 重跑（2026-10-25） | 结论 |
+|---|---|---|---|
+| Recall@5 | 0.8529 | **0.8529** | 不变 |
+| MRR | 0.5515 | **0.5515** | 不变 |
+| 页码可定位率 | 100% | **100%** | 不变 |
+| 硬凑率（无关题） | 0% | **0%** | 不变 |
+| 必含术语命中率 | 64.71% | **64.71%** | 不变 |
+| 用例数 / 错误数 | 37 / 0 | 37 / 0 | 不变 |
+
+**结论：重构是行为中性的** —— 关键词路走的是同一个 `postgres_fts` 后端，
+SQL 只是换了个文件放。
+
+> 搬 `terms.py` / `filters.py` 的时候特意保留了 `search.py` 里的
+> `ensure_high_freq_terms` / `_keyword_terms` re-export ——
+> 历史上调用方（`rag/retrieval.py`、`evals/run_retrieval.py`、
+> `evals/calibrate_threshold.py`、`ingest/pipeline.py`）都是
+> `search_mod.ensure_high_freq_terms()` 这样调的。
+> 换了调用点就多一处「评测和线上走的不是同一套」的风险 ——
+> §3.2 那个 bug 就是这么来的。
+
+---
+
 ## 3. 评测脚本的两个 bug（这轮最值钱的发现）
 
 **v2 报的 0.88 是在这两个 bug 下跑出来的**：

@@ -2,7 +2,9 @@
 
 图有两条入口，用 ``route_entry`` 分流：
 
-    START → chat:    load_context → parse_parent_input → check_sufficiency
+    START → chat:    load_context → extract_memories → merge_memories
+                                  → commit_memory → parse_parent_input
+                                  → check_sufficiency
                                   ├─ 需要补充 → generate_followup
                                   │             → await_user_answer (interrupt)
                                   │             → parse_parent_input  （回到判断）
@@ -40,6 +42,7 @@ from langgraph.graph import END, START, StateGraph
 
 from rdi_agent.graph.nodes import chat_nodes as chat
 from rdi_agent.graph.nodes import feedback_nodes as fb
+from rdi_agent.graph.nodes import memory_nodes as mem
 from rdi_agent.graph.nodes import retrieval_nodes as ret
 from rdi_agent.graph.nodes import write_nodes as write
 from rdi_agent.graph.state import CoachState
@@ -52,6 +55,15 @@ def route_entry(state: CoachState) -> str:
 def build_graph(checkpointer: Any | None = None) -> Any:
     """返回编译好的 StateGraph。"""
     g = StateGraph(CoachState)
+
+    # ---- 长期记忆（阶段 3）----
+    #
+    # 顺序是**记忆在前、解析在后**：解析会把上一轮累积的事实并进
+    # case_summary，先记忆才能让本轮知道"哪些旧事实刚被作废"。
+    # 详见 memory_nodes.py 的模块说明。
+    g.add_node("extract_memories", mem.extract_memories)
+    g.add_node("merge_memories", mem.merge_memories)
+    g.add_node("commit_memory", mem.commit_memory)
 
     # ---- 聊天入口 ----
     g.add_node("load_context", chat.load_context)
@@ -87,7 +99,14 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         {"chat": "load_context", "feedback": "capture_feedback"},
     )
 
-    g.add_edge("load_context", "parse_parent_input")
+    g.add_edge("load_context", "extract_memories")
+    g.add_edge("extract_memories", "merge_memories")
+    g.add_edge("merge_memories", "commit_memory")
+    g.add_conditional_edges(
+        "commit_memory",
+        mem.route_after_memory,
+        {"chat": "parse_parent_input", "feedback": "next_step"},
+    )
     g.add_edge("parse_parent_input", "check_sufficiency")
     g.add_conditional_edges(
         "check_sufficiency",
@@ -105,8 +124,11 @@ def build_graph(checkpointer: Any | None = None) -> Any:
             "rewrite_query": "rewrite_query",
         },
     )
-    # 家长答完 → 重新并进 CaseSummary 再判断一次
-    g.add_edge("await_user_answer", "parse_parent_input")
+    # 家长答完 → **先过记忆**，再并进 CaseSummary
+    #
+    # 顺序不能反：家长的回答里可能就有一句纠正（"不对，他是五岁"），
+    # 先并进 case_summary 就再也拿不出来了。
+    g.add_edge("await_user_answer", "extract_memories")
 
     # ---- 检索链 ----
     g.add_edge("rewrite_query", "retrieve_knowledge")
@@ -149,7 +171,9 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_edge("commit_plan_selection", END)
 
     g.add_edge("capture_feedback", "analyze_feedback")
-    g.add_edge("analyze_feedback", "next_step")
+    # 反馈里"孩子反应 / 执行困难"正是观察的来源（计划 §10.3）。
+    # 放在分析之后、给下一步之前：分析结果一并喂给抽取做背景。
+    g.add_edge("analyze_feedback", "extract_memories")
     g.add_edge("next_step", END)
 
     return g.compile(checkpointer=checkpointer)

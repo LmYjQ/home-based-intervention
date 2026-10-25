@@ -63,6 +63,23 @@ class Settings(BaseSettings):
     memory_enabled: bool = True
     rerank_enabled: bool = True
 
+    # ---- 长期记忆（阶段 3）----
+    #
+    # **抽取超时给得比主模型短**：记忆抽取是"锦上添花"，
+    # 它慢不该拖住家长等回答。超时就这一轮不记，下一轮还有机会。
+    memory_extract_timeout_s: float = 30.0
+    memory_extract_max_attempts: int = 2
+    # 一轮最多处理几条候选。多了说明模型在凑数。
+    memory_max_candidates_per_turn: int = 6
+    # 一个孩子的活跃事实上限。到顶之后新的只能等家长确认，
+    # 免得档案被琐碎事实撑爆。
+    memory_max_active_facts: int = 50
+    # 进 prompt 的观察/假设条数（按与当前问题的相关度挑）
+    memory_context_max_observations: int = 5
+    memory_context_max_hypotheses: int = 4
+    # prompt 里记忆部分的字符预算。中文 1 token ≈ 1–1.5 字，2000 字 ≈ 1.5k token。
+    memory_context_max_chars: int = 2000
+
     # 图里要不要用重排。
     #
     # **默认关**：重排要把书里的片段发给外部 API（bge-reranker-v2-m3）。
@@ -79,8 +96,16 @@ class Settings(BaseSettings):
     summary_zh_enabled: bool = False
 
     # ---- 关键词检索后端 ----
+    #
     # postgres_fts（默认，Postgres 内置 tsvector + ts_rank_cd）
-    # paradedb_bm25（可选扩展，启用前需确认目标 Postgres 装得上 pg_search）
+    # paradedb_bm25（**未实现**，见 ``rag/keyword_backends.py`` 里的说明：
+    #   1. 本地 Postgres 装不上 pg_search 扩展，写了也验证不了；
+    #   2. 2B 评测测出当前瓶颈是中文同义表述召不回，换 BM25 改善不了）
+    #
+    # 配了不存在的名字**或配了还没实现的后端**（paradedb_bm25），
+    # 都会**静默退回** postgres_fts —— 检索链挂掉比"用默认后端跑"糟糕得多。
+    # 退化是可见的：``/health`` 同时报 ``keyword_backend``（实际生效的）和
+    # ``keyword_backend_configured``（配置里写的），两者不一致就是配错了。
     keyword_backend: str = "postgres_fts"
 
     # ---- 路径 ----

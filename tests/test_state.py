@@ -18,6 +18,11 @@ def test_state_fields():
         "candidate_plans",
         "selected_plan_id",
         "memory_candidates",
+        "memory_update_result",
+        "memory_context",
+        "memory_forbidden_facts",
+        "memory_notes",
+        "feedback_db_id",
         "error_code",
     ):
         assert key in CoachState.__annotations__

@@ -52,6 +52,7 @@ class ProgressEvent:
 # 措辞原则：不承诺结果、只描述当前在做什么。
 # 不写"正在生成建议"（可能最后生成失败），写"正在整理依据"。
 STAGE_LABELS: dict[str, str] = {
+    "memory_extract": "正在整理这次说的情况",
     "intake_parse": "正在理解你说的情况",
     "sufficiency": "正在判断信息够不够",
     "followup": "正在准备要问你的问题",

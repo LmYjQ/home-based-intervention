@@ -14,6 +14,7 @@ import PlanCard from './components/PlanCard.vue'
 import EvidencePanel from './components/EvidencePanel.vue'
 import FeedbackForm from './components/FeedbackForm.vue'
 import FollowupStepper from './components/FollowupStepper.vue'
+import MemoryPanel from './components/MemoryPanel.vue'
 
 // 快捷填入的演示回答。只问一轮（后端 MAX_FOLLOWUP_ROUNDS = 1），
 // 所以一条回答就把场景、行为、试过什么、目标都补齐了。
@@ -27,7 +28,13 @@ const health = ref(null)
 // 而 canSend 要求有 conversation_id，于是发送按钮一直是灰的。
 // 调试时刷新页面很常见（看报错、看原始响应），不能因此把会话丢了。
 const CONV_KEY = 'rdi.conversation_id'
+// 家庭/孩子 id 也存下来：长期记忆挂在**孩子**上，
+// 换会话不换孩子才能看到上一轮记住的东西。
+const FAMILY_KEY = 'rdi.family_id'
+const CHILD_KEY = 'rdi.child_id'
 const conversationId = ref(localStorage.getItem(CONV_KEY) || '')
+const familyId = ref(localStorage.getItem(FAMILY_KEY) || '')
+const childId = ref(localStorage.getItem(CHILD_KEY) || '')
 const displayLabel = ref('孩子')
 const ageBand = ref('3-4岁')
 
@@ -42,6 +49,10 @@ const evidenceGaps = ref([])
 const trialId = ref('')
 const finalMessage = ref('')
 const feedbackResult = ref(null)
+
+// 长期记忆（阶段 3）
+const memories = ref([])
+const memoryPending = ref(0)
 
 const input = ref('')
 const busy = ref(false)
@@ -159,13 +170,25 @@ function onProgress(ev) {
   })
 }
 
-async function createConversation() {
-  const data = await run(() =>
-    api.createConversation({ display_label: displayLabel.value, age_band: ageBand.value }),
-  )
+// 建会话。
+//
+// ``reuseChild=true`` 是**同一个孩子再开一个会话** —— 长期记忆挂在孩子上，
+// 验收"第二轮咨询会主动使用第一轮的事实"必须走这条路。
+// 新建孩子的话，上一轮记住的东西挂在另一个 child_id 上，永远看不到。
+async function createConversation(reuseChild = false) {
+  const payload =
+    reuseChild && childId.value
+      ? { family_id: familyId.value || undefined, child_id: childId.value }
+      : { display_label: displayLabel.value, age_band: ageBand.value }
+
+  const data = await run(() => api.createConversation(payload))
   if (!data) return
   conversationId.value = data.conversation_id
+  familyId.value = data.family_id
+  childId.value = data.child_id
   localStorage.setItem(CONV_KEY, data.conversation_id)
+  localStorage.setItem(FAMILY_KEY, data.family_id)
+  localStorage.setItem(CHILD_KEY, data.child_id)
   messages.value = []
   status.value = ''
   questions.value = []
@@ -177,6 +200,59 @@ async function createConversation() {
   evidenceDecision.value = {}
   evidenceGaps.value = []
   feedbackResult.value = null
+  memories.value = []
+  memoryPending.value = 0
+  await refreshMemories()
+}
+
+// ---- 长期记忆 ----
+function memoryActionPayload() {
+  return {
+    family_id: familyId.value,
+    conversation_id: conversationId.value || null,
+    turn_id: null,
+  }
+}
+
+async function refreshMemories() {
+  if (!childId.value || !familyId.value) {
+    memories.value = []
+    memoryPending.value = 0
+    return
+  }
+  try {
+    const data = await api.listMemories(childId.value, familyId.value)
+    memories.value = data.memories || []
+    memoryPending.value = data.pending_confirmation || 0
+  } catch {
+    // 记忆面板读不出来不该影响主流程 —— 家长的问题是主线。
+    memories.value = []
+    memoryPending.value = 0
+  }
+}
+
+async function onMemoryConfirm(item) {
+  const data = await run(() =>
+    api.confirmMemory(childId.value, item.memory_id, memoryActionPayload()),
+  )
+  if (data) await refreshMemories()
+}
+
+async function onMemoryCorrect({ memory, content }) {
+  const data = await run(() =>
+    api.correctMemory(childId.value, memory.memory_id, {
+      ...memoryActionPayload(),
+      content,
+    }),
+  )
+  if (data) await refreshMemories()
+}
+
+async function onMemoryDelete(item) {
+  const data = await run(() =>
+    api.deleteMemory(childId.value, item.memory_id, memoryActionPayload()),
+  )
+  if (data) await refreshMemories()
 }
 
 // 收集每张卡引用到的证据 id。
@@ -227,6 +303,9 @@ function applyTurn(data) {
   } else if (data.message) {
     push('bot', data.message)
   }
+
+  // 这一轮可能新记/纠正/删了记忆，面板跟着刷一次
+  refreshMemories()
 }
 
 async function send(text) {
@@ -292,6 +371,8 @@ async function refresh() {
   selectedPlanId.value = data.selected_plan_id || ''
   // GET 返回的 plans 是数据库里的已落库方案，和本轮的候选不是一回事
   if (data.plans?.length && !plans.value.length) plans.value = data.plans
+  memories.value = data.memories || []
+  memoryPending.value = data.memory_pending || 0
 }
 
 // 刷新页面后把上次那个会话接回来 ——
@@ -314,11 +395,18 @@ async function restoreSession() {
     return
   }
   status.value = data.status
+  // 刷新页面后 family/child 也要接回来 —— 记忆面板靠它拉数据
+  familyId.value = data.family_id || familyId.value
+  childId.value = data.child_id || childId.value
+  if (familyId.value) localStorage.setItem(FAMILY_KEY, familyId.value)
+  if (childId.value) localStorage.setItem(CHILD_KEY, childId.value)
   evidence.value = data.evidence || []
   evidenceDecision.value = data.evidence_decision || {}
   trialId.value = data.trial_id || ''
   selectedPlanId.value = data.selected_plan_id || ''
   if (data.plans?.length) plans.value = data.plans
+  memories.value = data.memories || []
+  memoryPending.value = data.memory_pending || 0
   // 把历史对话显示出来，家长刷新一次还能看到自己说过什么
   for (const it of data.interactions || []) {
     push(it.role === 'user' ? 'user' : 'bot', it.content)
@@ -392,8 +480,16 @@ watch([evidence, plans], () => {
               <label>年龄段</label>
               <input v-model="ageBand" />
             </div>
-            <button style="align-self:flex-end" @click="createConversation" :disabled="busy">
+            <button style="align-self:flex-end" @click="createConversation()" :disabled="busy">
               新建会话
+            </button>
+            <button
+              style="align-self:flex-end"
+              :disabled="busy || !childId"
+              :title="childId ? '同一个孩子开新会话，长期记忆会带过来' : '先建一个会话'"
+              @click="createConversation(true)"
+            >
+              同一孩子新会话
             </button>
           </div>
 
@@ -504,8 +600,17 @@ watch([evidence, plans], () => {
         </div>
       </div>
 
-      <!-- 右：证据与原始响应 -->
+      <!-- 右：记忆、证据与原始响应 -->
       <div>
+        <MemoryPanel
+          :memories="memories"
+          :pending="memoryPending"
+          :busy="busy"
+          @confirm="onMemoryConfirm"
+          @correct="onMemoryCorrect"
+          @delete="onMemoryDelete"
+        />
+
         <EvidencePanel :evidence="evidence" :decision="evidenceDecision" :gaps="evidenceGaps"
                        :cited-ids="citedIds" />
 

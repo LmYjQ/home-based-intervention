@@ -162,6 +162,7 @@ async def recall_candidates(
     candidate_k: int = DEFAULT_CANDIDATE_K,
     use_vector: bool = True,
     kind: str = "child",
+    keyword_backend: str | None = None,
 ) -> RecallOutcome:
     """双路召回 + RRF 合并。
 
@@ -170,6 +171,8 @@ async def recall_candidates(
 
     ``kind`` 默认只回子块：子块是召回单元，父块是它的上下文。
     父块和它的子块同时出现在结果里，等于同一段话显示两遍。
+
+    ``keyword_backend`` 显式传时覆盖配置里的关键词后端。
     """
     vector_hits: list[search_mod._Candidate] = []
     if use_vector:
@@ -179,7 +182,10 @@ async def recall_candidates(
         )
     await search_mod.ensure_high_freq_terms()
     fts_hits = await search_mod._fts_candidates(
-        queries.keyword_query, candidate_k, None
+        queries.keyword_query,
+        candidate_k,
+        None,
+        backend_name=keyword_backend,
     )
 
     merged = search_mod._rrf_merge(vector_hits, fts_hits)
@@ -188,8 +194,12 @@ async def recall_candidates(
     elif kind == "parent":
         merged = [c for c in merged if c.is_parent]
 
+    backend = search_mod.keyword_backends.get_backend(
+        keyword_backend or search_mod._configured_backend()
+    )
     notes = [
-        f"向量路 {len(vector_hits)} 条，关键词路 {len(fts_hits)} 条",
+        f"向量路 {len(vector_hits)} 条，"
+        f"关键词路 {len(fts_hits)} 条（后端 {backend.name}）",
         f"RRF 合并去重后 {len(merged)} 条",
     ]
     return RecallOutcome(
