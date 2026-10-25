@@ -21,32 +21,23 @@ from typing import Any
 from rdi_agent.db.engine import dispose_engine
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 
-# 固定演示输入：开场白 + 三轮追问的回答。
+# 固定演示输入：开场白 + **一轮**追问的回答。
 #
-# 为什么是三轮：计划的兜底是"追问到第 3 轮还问不齐就强制收手出方案"
-# （MAX_FOLLOWUP_ROUNDS）。所以演示要凑够三轮，才能走到"追问 → 方案"这一步 ——
-# 少一轮就停在追问，多一轮是浪费。
+# 为什么是一轮：只允许追问一轮（MAX_FOLLOWUP_ROUNDS = 1），
+# 家长答完这一轮就直接出方案。所以演示只需要一条回答。
 #
-# 三轮回答分别补齐 check_sufficiency 关心的四件事：
+# 这条回答把 check_sufficiency 关心的四件事一次补齐：
 # 场景（几点、在哪、持续多久）、孩子的具体行为、试过什么效果如何、家长的目标。
 DEMO_ANSWER_1 = (
     "早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，"
     "抱起来能好。送进去以后老师说她今天自己吃了早饭。"
-)
-DEMO_ANSWER_2 = (
-    "在家不这样，只有去幼儿园才哭。哭的时候脸涨得通红，说不出话。"
-    "试过提前十分钟出门，也试过抱着她走过去，都没什么用。"
-)
-DEMO_ANSWER_3 = (
-    "目标是能正常入园、别在门口哭半小时。她喜欢玩积木，在幼儿园午睡也正常。"
-    "只要别在门口堵着就行，晚十分钟到也接受。"
+    "在家不这样，只有去幼儿园才哭。试过提前十分钟出门，也试过抱着她走过去，都没什么用。"
+    "目标是能正常入园、别在门口哭半小时，晚十分钟到也接受。"
 )
 
 DEMO_MESSAGES = [
     "孩子 4 岁，最近不愿意去幼儿园，早上出门就哭。",
     DEMO_ANSWER_1,
-    DEMO_ANSWER_2,
-    DEMO_ANSWER_3,
 ]
 
 
@@ -119,7 +110,13 @@ async def _demo() -> None:
         if status == "awaiting_followup":
             print(f"\n【追问 {len(res['questions'])} 个】")
             for q in res["questions"]:
-                print(f"  ? {q}")
+                # questions 里是 dict（带选项），老数据可能是裸字符串。
+                if isinstance(q, dict):
+                    print(f"  ? {q.get('question', '')}")
+                    for opt in q.get("options") or []:
+                        print(f"      · {opt}")
+                else:
+                    print(f"  ? {q}")
             continue
         if status == "awaiting_plan_selection":
             plans = res["plans"]
@@ -183,7 +180,13 @@ async def _interactive() -> None:
         )
         if res["status"] == "awaiting_followup":
             for q in res["questions"]:
-                print(f"  ? {q}")
+                # questions 里是 dict（带选项），老数据可能是裸字符串。
+                if isinstance(q, dict):
+                    print(f"  ? {q.get('question', '')}")
+                    for opt in q.get("options") or []:
+                        print(f"      · {opt}")
+                else:
+                    print(f"  ? {q}")
             continue
         if res["status"] == "awaiting_plan_selection":
             _show_evidence(res.get("evidence") or [])

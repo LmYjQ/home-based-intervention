@@ -28,6 +28,7 @@ from rdi_agent.graph.nodes import retrieval_nodes
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
+    FollowupQuestion,
     FollowupQuestions,
     LimitedAnswer,
     RecommendationSet,
@@ -181,7 +182,9 @@ def always_wants_more(monkeypatch):
                 requires_followup=True, reasons=["还缺信息"]
             )
         elif model_cls is FollowupQuestions:
-            payload = FollowupQuestions(questions=["还缺什么？"])
+            payload = FollowupQuestions(
+                questions=[FollowupQuestion(question="还缺什么？", options=["不清楚"])]
+            )
         elif model_cls is RecommendationSet:
             payload = RecommendationSet(
                 plans=[_card("plan_1", True), _card("plan_2", False)]
@@ -266,6 +269,101 @@ async def test_followup_resume_increments_rounds(no_retrieval, graph, always_wan
 
 
 @pytest.mark.asyncio
+async def test_followup_answers_carry_question_text(no_retrieval, graph, always_wants_more):
+    """一轮追问可以带多个问题的回答，一起提交。
+
+    **为什么要带原问题**：图里 `parse_parent_input` 只吃一段文本。
+    不带问题的话，"在园更自在"和"换过老师"两段回答会互相串，
+    下游抽出来的事实就分不清哪句对应哪个问题了。
+    """
+    from rdi_agent.graph.runtime import config_for, get_graph
+
+    cid = await _new_conversation()
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
+    )
+    assert res["status"] == "awaiting_followup"
+
+    # 家长逐题作答，最后一起提交
+    res = await api.send_message(
+        cid,
+        api.SendMessageRequest(
+            message="",
+            turn_id="t2",
+            answers=[
+                api.FollowupAnswer(question="在园更自在吗？", answer="在家更自在"),
+                api.FollowupAnswer(question="换过老师吗？", answer="换过老师"),
+            ],
+        ),
+    )
+    state = await get_graph().aget_state(config_for(cid))
+    user_message = state.values.get("user_message") or ""
+    assert "在园更自在吗？" in user_message, (
+        f"回答里要带上原问题，实际 user_message={user_message!r}"
+    )
+    assert "在家更自在" in user_message
+    assert "换过老师吗？" in user_message
+    assert "换过老师" in user_message
+
+
+@pytest.mark.asyncio
+async def test_answers_reach_case_summary(no_retrieval, graph, always_wants_more):
+    """家长答的内容必须进 case_summary（走 API 入口）。
+
+    **为什么这条在 API 层测**：答案的传递要经过
+    ``_compose_answer_text``（拼文本）和 ``_structured_answers``（结构化）
+    两条路，图层单测测不到中间这一段。
+
+    实测模型会把整段问答丢掉 —— 家长答了"没有不愉快的经历"，
+    抽出来的 observed_facts 里还是没有。答案一丢，模型就以为这件事
+    没问过，换个说法再问一遍。结构化那条路就是为此存在的。
+    """
+    from rdi_agent.graph.runtime import config_for, get_graph
+
+    cid = await _new_conversation()
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
+    )
+    assert res["status"] == "awaiting_followup"
+
+    res = await api.send_message(
+        cid,
+        api.SendMessageRequest(
+            message="",
+            turn_id="t2",
+            answers=[
+                api.FollowupAnswer(
+                    question="在园有不开心的经历吗？", answer="没有这种情况"
+                ),
+            ],
+        ),
+    )
+    state = await get_graph().aget_state(config_for(cid))
+    facts = (state.values.get("case_summary") or {}).get("observed_facts") or []
+    assert any("没有这种情况" in f for f in facts), (
+        f"家长的回答没进 case_summary：{facts}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_followup_questions_carry_options(no_retrieval, graph, always_wants_more):
+    """接口要把每题的选项一起返回给前端。
+
+    前端要靠这个渲染点选按钮 —— 少了它就只剩自由输入了。
+    """
+    cid = await _new_conversation()
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
+    )
+    assert res["status"] == "awaiting_followup"
+    assert res["questions"], "追问时应该返回问题列表"
+    first = res["questions"][0]
+    assert "question" in first
+    assert "options" in first
+    assert first["options"], "测试替身配了选项，接口要原样带出来"
+
+
+@pytest.mark.asyncio
 async def test_select_plan_creates_trial(no_retrieval, graph, always_wants_more):
     """选方案必须真的建出 trial。
 
@@ -277,15 +375,14 @@ async def test_select_plan_creates_trial(no_retrieval, graph, always_wants_more)
     res = await api.send_message(
         cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
     )
-    for turn in (2, 3, 4):
-        res = await api.send_message(
-            cid, api.SendMessageRequest(message=f"补充信息 {turn}", turn_id=f"t{turn}")
-        )
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="补充信息 2", turn_id="t2")
+    )
     assert res["status"] == "awaiting_plan_selection"
 
     plan_id = next(p["plan_id"] for p in res["plans"] if p.get("recommended"))
     sel = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t5")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
     )
 
     assert sel["status"] == "completed"
@@ -312,17 +409,16 @@ async def test_select_plan_is_idempotent(no_retrieval, graph, always_wants_more)
     res = await api.send_message(
         cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
     )
-    for turn in (2, 3, 4):
-        res = await api.send_message(
-            cid, api.SendMessageRequest(message=f"补充信息 {turn}", turn_id=f"t{turn}")
-        )
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="补充信息 2", turn_id="t2")
+    )
     plan_id = next(p["plan_id"] for p in res["plans"] if p.get("recommended"))
 
     first = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t5")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
     )
     second = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t5")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
     )
     assert first["trial_id"] == second["trial_id"], "重发选了两次，建了两条 trial"
 

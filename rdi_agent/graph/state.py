@@ -27,7 +27,24 @@ class CoachState(TypedDict, total=False):
     child_context: dict[str, Any]
     case_summary: dict[str, Any]
     sufficiency_decision: dict[str, Any]
-    followup_questions: list[str]
+    # 一轮追问。每一项是 {"question": str, "options": [str], "why_asking": str}
+    followup_questions: list[dict[str, Any]]
+    # 家长对这一轮追问的回答，**结构化**存着：
+    # [{"question": str, "answer": str}, ...]
+    #
+    # **为什么不让模型自己抽**：实测模型会把整段问答丢掉 ——
+    # 家长明确答了"没有不愉快的经历"，抽出来的 observed_facts 里还是没有。
+    # 答案一丢，模型就以为这件事没问过，换个说法再问一遍。
+    # 事实的完整性由代码兜底，模型抽取只当补充来源。
+    followup_answers: list[dict[str, Any]]
+    # 已经追问过哪些问题（原文）。
+    #
+    # **为什么单独存**：模型只看得到 case_summary 和 priority_questions，
+    # 看不到"上一轮问过什么"。它不知道某件事已经问过，就会换个说法再问一遍
+    # （实测"在园是否有不愉快的经历"连问两次，就是这么来的）。
+    #
+    # 把问过的问题原文交给 prompt，模型才能避开它们。
+    asked_questions: list[str]
     # 已经追问几轮。到 MAX_FOLLOWUP_ROUNDS 就强制收手，否则会无限追问下去
     followup_rounds: int
     # generate_followup 发现没东西可问时，直接跳去出方案，省掉一次空中断

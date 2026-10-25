@@ -20,6 +20,7 @@ from rdi_agent.graph.nodes import chat_nodes, retrieval_nodes, write_nodes
 from rdi_agent.graph.state import CoachState
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
+    FollowupQuestion,
     FollowupQuestions,
     RecommendationSet,
     SufficiencyDecision,
@@ -283,7 +284,12 @@ async def test_insufficient_info_triggers_followup(patched_llm, no_writes, no_re
             SufficiencyDecision: SufficiencyDecision(
                 requires_followup=True, reasons=["不知道哭持续多久"]
             ),
-            FollowupQuestions: FollowupQuestions(questions=["哭大概持续多久？", "以前好转过吗？"]),
+            FollowupQuestions: FollowupQuestions(
+                questions=[
+                    FollowupQuestion(question="哭大概持续多久？", options=["几分钟", "半小时以上"]),
+                    FollowupQuestion(question="以前好转过吗？"),
+                ]
+            ),
         }
     )
     graph = build_graph(checkpointer=InMemorySaver())
@@ -335,7 +341,9 @@ async def test_answer_resumes_from_the_same_interrupt(
             ],
             EvidenceDecision: _DIRECT,
             SafetyReviewCheck: _SAFETY_OK,
-            FollowupQuestions: FollowupQuestions(questions=["哭多久？"]),
+            FollowupQuestions: FollowupQuestions(
+                questions=[FollowupQuestion(question="哭多久？", options=["几分钟"])]
+            ),
             RecommendationSet: RecommendationSet(
                 plans=[_card("plan_1", True), _card("plan_2", False)]
             ),
@@ -354,8 +362,11 @@ async def test_answer_resumes_from_the_same_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_followup_stops_after_three_rounds(patched_llm, no_writes, no_retrieval):
-    """追问 3 轮还不齐就必须出方案，不能无限问下去。"""
+async def test_followup_stops_after_one_round(patched_llm, no_writes, no_retrieval):
+    """只允许追问**一轮**。家长答完就必须出方案，不能再问第二遍。
+
+    模型永远说"不够" —— 靠 followup_rounds 兜底。
+    """
     fake = patched_llm(
         {
             CaseSummary: CaseSummary(observed_facts=["还是不清楚"]),
@@ -363,7 +374,9 @@ async def test_followup_stops_after_three_rounds(patched_llm, no_writes, no_retr
             SufficiencyDecision: SufficiencyDecision(
                 requires_followup=True, reasons=["还缺"]
             ),
-            FollowupQuestions: FollowupQuestions(questions=["还有呢？"]),
+            FollowupQuestions: FollowupQuestions(
+                questions=[FollowupQuestion(question="还有呢？")]
+            ),
             RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
         }
     )
@@ -374,15 +387,111 @@ async def test_followup_stops_after_three_rounds(patched_llm, no_writes, no_retr
     await graph.ainvoke(_state("还是不清楚"), config=cfg)
     assert _count_followups(fake) == 1
 
-    # 第 2、3 轮：各答一次
-    for _ in range(2):
-        await graph.ainvoke(Command(resume="还是不清楚"), config=cfg)
-    assert _count_followups(fake) == 3
-
-    # 第 3 轮答完就该出方案，而不是问第 4 次
+    # 答完这一轮就该出方案，而不是再问一轮
     result = await graph.ainvoke(Command(resume="还是不清楚"), config=cfg)
     assert _interrupt(result)["kind"] == "plan_selection"
-    assert _count_followups(fake) == 3
+    assert _count_followups(fake) == 1, "答完一轮还在追问"
+
+
+@pytest.mark.asyncio
+async def test_asked_questions_are_passed_to_prompt(patched_llm, no_writes, no_retrieval):
+    """问过的问题要出现在 prompt 里，模型才知道该避开哪些。
+
+    **为什么**：模型只看得到 case_summary 和 priority_questions，
+    看不到"上一轮问过什么"。它不知道某件事已经问过，就会换个说法再问一遍
+    （实测"在园是否有不愉快的经历"连问两次就是这么来的）。
+    """
+    seen: list[dict] = []
+
+    async def fake_chat_json(**kwargs):
+        if kwargs["model_cls"] is SufficiencyDecision:
+            seen.append(kwargs["user"])
+        payload = FakeLLM.DEFAULTS.get(kwargs["model_cls"])
+        if payload is None:
+            payload = patched_llm.script.get(kwargs["model_cls"])
+        if payload is None:
+            raise AssertionError(f"{kwargs['stage']} 没有预置答案")
+        if isinstance(payload, list):
+            i = getattr(fake_chat_json, "_i", 0)
+            fake_chat_json._i = i + 1
+            payload = payload[min(i, len(payload) - 1)]
+        return payload, llm.LLMTrace(stage=kwargs["stage"], model="fake", source="fake")
+
+    patched_llm(
+        {
+            CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
+            SufficiencyDecision: SufficiencyDecision(
+                requires_followup=True, reasons=["缺细节"]
+            ),
+            FollowupQuestions: FollowupQuestions(
+                questions=[FollowupQuestion(question="在园有不开心的经历吗？")]
+            ),
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
+            RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
+        }
+    )
+    import rdi_agent.graph.nodes.chat_nodes as chat_nodes
+
+    real = chat_nodes.llm.chat_json
+    chat_nodes.llm.chat_json = fake_chat_json
+    try:
+        graph = build_graph(checkpointer=InMemorySaver())
+        cfg = _cfg()
+        await graph.ainvoke(_state("上幼儿园前会哭"), config=cfg)
+        await graph.ainvoke(
+            Command(resume={"text": "没有", "answers": [
+                {"question": "在园有不开心的经历吗？", "answer": "没有"},
+            ]}),
+            config=cfg,
+        )
+    finally:
+        chat_nodes.llm.chat_json = real
+
+    assert seen, "check_sufficiency 没被调到"
+    assert "在园有不开心的经历吗？" in seen[-1], (
+        f"问过的问题没进 prompt，模型会再问一遍：{seen[-1][:400]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_answers_are_merged_into_case_summary(patched_llm, no_writes, no_retrieval):
+    """家长明确答了的东西，必须**进** case_summary。
+
+    **为什么**：实测模型会把整段问答丢掉 —— 家长答了"没有不愉快的经历"，
+    抽出来的 observed_facts 里还是没有。答案一丢，模型就以为这件事
+    没问过，换个说法再问一遍。所以答案由代码确定性并进去。
+    """
+    patched_llm(
+        {
+            CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
+            SufficiencyDecision: SufficiencyDecision(
+                requires_followup=True, reasons=["缺细节"]
+            ),
+            FollowupQuestions: FollowupQuestions(
+                questions=[FollowupQuestion(question="在园有不开心的经历吗？")]
+            ),
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
+            RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
+        }
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    cfg = _cfg()
+
+    await graph.ainvoke(_state("上幼儿园前会哭"), config=cfg)
+    result = await graph.ainvoke(
+        Command(resume={"text": "在园有不开心的经历吗？\n没有", "answers": [
+            {"question": "在园有不开心的经历吗？", "answer": "没有"},
+        ]}),
+        config=cfg,
+    )
+
+    facts = result["case_summary"]["observed_facts"]
+    assert any("没有" in f for f in facts), (
+        f"家长的回答没进 observed_facts：{facts} —— "
+        "答案一丢，模型就会换个说法再问一遍"
+    )
 
 
 def _count_followups(fake: FakeLLM) -> int:

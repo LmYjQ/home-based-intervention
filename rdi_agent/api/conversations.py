@@ -138,6 +138,29 @@ def _compose_answer_text(
 
 
 
+def _structured_answers(
+    answers: list[FollowupAnswer] | None,
+) -> list[dict[str, str]]:
+    """把每题一个回答变成结构化的问答对。
+
+    **为什么除了拼文本还要单独传一份结构化的**：
+    光有文本的话，"哪句回答的是哪道题"只能靠模型猜 ——
+    实测模型会把整段问答丢掉，家长答了"没有不愉快的经历"，
+    抽出来的事实里还是没有，于是换个说法又问一遍。
+
+    结构化的这份由代码直接并进 ``case_summary``，不指望模型抽。
+    """
+    result: list[dict[str, str]] = []
+    for a in answers or []:
+        ans = (a.answer or "").strip()
+        if not ans:
+            continue
+        result.append(
+            {"question": (a.question or "").strip(), "answer": ans}
+        )
+    return result
+
+
 async def _pending_interrupt(config: dict[str, Any]) -> dict[str, Any] | None:
     """当前 thread 停在哪个中断上。没有就返回 None。
 
@@ -293,6 +316,9 @@ async def _run_turn(conversation_id: str, req: SendMessageRequest) -> dict[str, 
 
     # 图看到的文本。有 answers 就用 answers 拼的（带上原问题，避免多题串味）。
     user_text = _compose_answer_text(req.answers, req.message)
+    # 结构化的问答对 —— 走图里的 followup_answers 通道。
+    # 文本那条路是给模型看的，这条路是给代码用的（保证答案不丢）。
+    structured_answers = _structured_answers(req.answers)
 
     async with session_scope() as session:
         repo = Repository(session)
@@ -316,8 +342,15 @@ async def _run_turn(conversation_id: str, req: SendMessageRequest) -> dict[str, 
         # 必须用 Command(resume=...) 恢复：普通 dict 会让图从 START 重跑，
         # await_user_answer 永远跑不完，followup_rounds 也就永远停在 0，
         # "追问 3 轮就收手"的兜底形同虚设。
+        # 恢复值带上结构化的问答对。
+        #
+        # **为什么不用裸字符串**：只有文本的话，答案要靠模型抽，
+        # 而实测模型会把它整段丢掉 —— 家长答过的事下一轮又被问一遍。
+        # 传 dict 的话，``await_user_answer`` 能把问答对原样放进 state，
+        # 由代码并进 case_summary。
+        resume_value: Any = {"text": user_text, "answers": structured_answers}
         result = await graph.ainvoke(
-            Command(resume=user_text, update={"turn_id": turn_id}),
+            Command(resume=resume_value, update={"turn_id": turn_id}),
             config=config,
         )
     else:

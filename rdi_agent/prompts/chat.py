@@ -64,6 +64,7 @@ def check_sufficiency(
     *,
     case_summary: dict[str, Any],
     followup_rounds: int,
+    asked_questions: list[str] | None = None,
 ) -> tuple[str, str]:
     """判断信息够不够生成一份有用的建议。返回 (system, user)。"""
     system = (
@@ -80,12 +81,21 @@ def check_sufficiency(
 缺什么就列进 priority_questions，用"还需要知道什么"的角度写，
 不要写成问卷式的封闭问题。最多列 5 个候选，真正的问法由下一步收敛。
 
-已经追问过 {rounds} 轮。追问到第 3 轮还问不齐，就该收手了 ——
+**已经问过的问题（asked_questions）不许再列进 priority_questions** ——
+问过的事要么家长已经答了（答案在 case_summary 里），要么家长答不上来
+（那再问一遍也问不出来）。换个说法问同一件事，家长会觉得在被反复盘问。
+
+已经追问过 {rounds} 轮。**只允许追问一轮** ——
+家长回答完这一轮之后就出方案，不再问第二遍。
 在信息不完美的情况下给出一份标注了不确定性的建议，好过继续追问下去。
 """
     ).format(rounds=followup_rounds)
     user = json.dumps(
-        {"case_summary": case_summary, "followup_rounds_done": followup_rounds},
+        {
+            "case_summary": case_summary,
+            "followup_rounds_done": followup_rounds,
+            "asked_questions": asked_questions or [],
+        },
         ensure_ascii=False,
         indent=2,
     )
@@ -97,6 +107,7 @@ def generate_followup(
     case_summary: dict[str, Any],
     priority_questions: list[str],
     followup_rounds: int,
+    asked_questions: list[str] | None = None,
 ) -> tuple[str, str]:
     """把候选问题收敛成最多 3 个给家长看的问法，每个带点选选项。返回 (system, user)。"""
     system = (
@@ -109,7 +120,11 @@ def generate_followup(
 - 用具体场景问，不要问"您觉得孩子有什么问题"这种没法回答的问题。
 - 每句话都能一句话答完，不要连环追问。
 - 如果候选问题其实不重要，就丢掉。
-- 第 {rounds} 轮之后不要再问了，除非不问就完全没法往下走。
+- **只问这一轮**。家长回答完就出方案，不会再有第二轮。
+- **已经问过的问题（asked_questions）绝对不许再问一遍** ——
+  哪怕换个说法、哪怕看起来更具体。家长答过的事答案就在 case_summary 里；
+  家长答不上来的事，再问一次还是答不上来，只会让家长觉得在被反复盘问。
+  要问就问**新的角度**（不是同一件事的另一种问法）。
 
 选项（options）怎么写 —— **这是给家长一键点的按钮**：
 - 每个问题配 2 到 4 个，宁缺毋滥。
@@ -136,6 +151,7 @@ def generate_followup(
             "case_summary": case_summary,
             "priority_questions": priority_questions,
             "followup_rounds_done": followup_rounds,
+            "asked_questions": asked_questions or [],
         },
         ensure_ascii=False,
         indent=2,

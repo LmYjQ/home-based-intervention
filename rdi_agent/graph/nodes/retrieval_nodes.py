@@ -291,6 +291,7 @@ async def generate_evidence_followup(state: CoachState) -> dict[str, Any]:
         case_summary=state.get("case_summary") or {},
         priority_questions=list(decision.get("missing_information") or []),
         followup_rounds=int(state.get("evidence_followup_rounds") or 0),
+        asked_questions=list(state.get("asked_questions") or []),
     )
     result, trace = await llm.chat_json(
         system=system,

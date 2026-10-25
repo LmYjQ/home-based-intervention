@@ -35,8 +35,14 @@ from rdi_agent.schemas.evidence import EvidenceBundle, EvidenceDecision, Evidenc
 # → 检索 → 门控又说"缺信息" → 死循环。
 # 第二次到门控时这个计数已经是 1，门控必然落到 limited_answer。
 #
-# 第二次到门控时这个计数已经是 1，门控必然落到 limited_answer。
-MAX_EVIDENCE_FOLLOWUP_ROUNDS = 1
+#
+# **现在是 0**（2026-10-25 改，原值 1）。
+#
+# 家长只被允许回答**一轮**追问。门控的追问是第二个圈 ——
+# 家长答完第一轮，流程进检索，门控再说"缺信息"就又问一轮，
+# 那还是"答完还在追问"。所以门控不再追问：证据不够就直接给有限回答
+# （``limited_answer``），把缺口写在 ``evidence_gaps`` 里让家长看见。
+MAX_EVIDENCE_FOLLOWUP_ROUNDS = 0
 
 
 def usable_evidence(bundle: EvidenceBundle) -> list[EvidenceItem]:

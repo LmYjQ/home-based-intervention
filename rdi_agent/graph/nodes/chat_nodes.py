@@ -13,6 +13,7 @@ from typing import Any
 from langgraph.types import interrupt
 
 from rdi_agent import llm
+from rdi_agent import progress
 from rdi_agent.llm import LLMError
 from rdi_agent.graph.citations import validate_set_citations
 from rdi_agent.graph.state import CoachState
@@ -26,8 +27,21 @@ from rdi_agent.schemas.conversation import (
 )
 from rdi_agent.schemas.recommendation import RecommendationCard
 
-# 追问到第几轮就强制收手。3 是计划 §8.4 定的上限。
-MAX_FOLLOWUP_ROUNDS = 3
+# 追问到第几轮就强制收手。
+#
+# **只有一轮**（2026-10-25 改，原值 3）。
+#
+# 一轮 = 最多 3 个问题，家长**一起答完**，然后就强制进下一步（出方案）。
+# 原来允许 3 轮，实践下来两个后果：
+#   1. 家长答完第一轮，模型很可能把"没答上来"当成"还没问过"，
+#      于是把同一个问题换个说法再问一遍（实测就是"在幼儿园是否有不愉快的经历"
+#      连问两次）；
+#   2. 家长体验上是"填表"而不是"咨询"—— 计划 §"过度追问"那条
+#      明确说"家长感觉在填量表"是要防的。
+#
+# 信息不够也要出方案 —— 建议卡里有 uncertainty_notes，方案本身就会标出
+# 哪里不确定，这比多问一轮有用。
+MAX_FOLLOWUP_ROUNDS = 1
 
 
 def _bundle_of(state: CoachState) -> EvidenceBundle | None:
@@ -66,8 +80,56 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
         stage="intake_parse",
         temperature=0.0,
     )
+    data = summary.model_dump(mode="json")
+
+    # 事实的完整性**由代码兜底**，模型抽取只当补充来源。
+    #
+    # **为什么不能只靠模型抽**：实测模型会把整段问答丢掉 ——
+    # 家长答了"没有不愉快的经历"，抽出来的 observed_facts 里还是没有。
+    # 答案一丢，下一轮模型就以为这件事没问过，于是换个说法再问一遍
+    # （实测连着问了两遍"在幼儿园是否有不愉快的经历"）。
+    #
+    # 三份来源，**加**在一起（不是覆盖）：
+    #   1. 上一轮累积的事实 —— 事实是累积的，问一轮丢一轮就退化成单轮问答；
+    #      模型偶尔也会漏掉 previous_summary 里的旧事实。
+    #   2. 这一轮模型新抽出来的事实。
+    #   3. 家长明确答了的问答对 —— 结构化传进来的，**一定**要算进事实。
+    previous = state.get("case_summary") or {}
+    facts: list[str] = []
+    for source in (
+        previous.get("observed_facts") or [],
+        data.get("observed_facts") or [],
+    ):
+        for value in source:
+            text = str(value).strip()
+            if text and text not in facts:
+                facts.append(text)
+
+    for item in state.get("followup_answers") or []:
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if not answer:
+            continue
+        if question:
+            line = f"家长对「{question}」的回答：{answer}"
+        else:
+            line = f"家长补充：{answer}"
+        if line not in facts:
+            facts.append(line)
+    data["observed_facts"] = facts
+
+    # 风险信号**绝不能丢** —— 丢一次就可能漏掉"该找专业人士"的信号。
+    signals = list(data.get("risk_signals") or [])
+    for value in previous.get("risk_signals") or []:
+        text = str(value).strip()
+        if text and text not in signals:
+            signals.append(text)
+    data["risk_signals"] = signals
+
     return {
-        "case_summary": summary.model_dump(mode="json"),
+        "case_summary": data,
+        # 答案已经并进事实了，清掉 —— 免得下一轮又并一遍。
+        "followup_answers": [],
         "trace_metadata": {"intake_parse": trace.brief()},
     }
 
@@ -78,6 +140,7 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
     system, user = P.check_sufficiency(
         case_summary=state.get("case_summary") or {},
         followup_rounds=rounds,
+        asked_questions=list(state.get("asked_questions") or []),
     )
     decision, trace = await llm.chat_json(
         system=system,
@@ -119,6 +182,7 @@ async def generate_followup(state: CoachState) -> dict[str, Any]:
         case_summary=state.get("case_summary") or {},
         priority_questions=decision.get("priority_questions") or [],
         followup_rounds=rounds,
+        asked_questions=list(state.get("asked_questions") or []),
     )
     result, trace = await llm.chat_json(
         system=system,
@@ -132,7 +196,9 @@ async def generate_followup(state: CoachState) -> dict[str, Any]:
         # 候选问题被全部丢掉了，说明已经没什么可问的，直接进方案。
         return {"followup_questions": [], "route_override": "rewrite_query"}
     return {
-        "followup_questions": result.questions,
+        # 转成 dict 再存：state 要能序列化（checkpointer 存的是 JSON），
+        # 前端拿到的也是 dict。
+        "followup_questions": [q.model_dump(mode="json") for q in result.questions],
         "trace_metadata": {"followup": trace.brief()},
     }
 
@@ -150,20 +216,64 @@ def route_after_followup(state: CoachState) -> str:
     return "await_user_answer"
 
 
+def _unpack_resume(value: Any) -> tuple[str, list[dict[str, str]]]:
+    """把恢复值拆成 (给模型看的文本, 结构化的问答对)。
+
+    **为什么要结构化**：恢复值光是一段文本的话，"哪句回答的是哪道题"
+    就只能靠模型猜。实测模型会把整段问答丢掉 ——
+    家长明确答了"没有不愉快的经历"，抽出来的 ``observed_facts``
+    里还是只有开场白那句话，于是下一轮它以为这件事没问过，又问了一遍。
+
+    问答对走结构化通道（``followup_answers``），由代码确定性地并进
+    ``case_summary``，不指望模型抽。
+    """
+    if isinstance(value, dict):
+        text = str(value.get("text") or "")
+        raw_answers = value.get("answers") or []
+    elif isinstance(value, list):  # 老形状：家长直接发数组回来
+        return "\n".join(str(x) for x in value), []
+    else:
+        return str(value), []
+
+    answers: list[dict[str, str]] = []
+    for item in raw_answers:
+        if not isinstance(item, dict):
+            continue
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if not answer:
+            continue
+        answers.append({"question": question, "answer": answer})
+    return text, answers
+
+
 async def await_user_answer(state: CoachState) -> dict[str, Any]:
     """中断点一：等家长回答追问。
 
     纯函数：只接 resume 值、只回 state。不碰数据库、不调 LLM ——
     这个节点在恢复时会重跑，任何副作用都会重复发生。
     """
+    # 打点：问题已经生成完了，正在等家长回答。
+    # 不打的话家长看到"正在准备要问你的问题"之后进度条就不动了 ——
+    # 实际上问题早就好了，只是在等**人**回答。
+    progress.emit("await_answer")
     answer = interrupt({"kind": "followup", "questions": state.get("followup_questions", [])})
-    if isinstance(answer, list):  # 家长直接发数组回来
-        text = "\n".join(str(x) for x in answer)
-    else:
-        text = str(answer)
+    text, answers = _unpack_resume(answer)
+    # 记下这一轮问过的问题 —— 下一轮生成问题时要把它们排掉。
+    asked = list(state.get("asked_questions") or [])
+    for item in state.get("followup_questions") or []:
+        question = str(item.get("question") or "").strip()
+        if question and question not in asked:
+            asked.append(question)
     return {
         "user_message": text,
+        "followup_answers": answers,
         "followup_questions": [],
+        "asked_questions": asked,
+        # route_override 是 generate_followup 留下的路由提示。
+        # 家长已经答完了，这一轮不追问 —— 清掉它，
+        # 免得后面某个节点读到过期的"跳过追问"标记。
+        "route_override": "",
         "followup_rounds": int(state.get("followup_rounds") or 0) + 1,
     }
 
@@ -293,6 +403,9 @@ async def _generate_cards(
 
 async def present_plans(state: CoachState) -> dict[str, Any]:
     """中断点二：把候选卡交给家长选。纯函数，同上。"""
+    # 打点：这一步之前家长等的是"安全检查"，之后就该看到卡了。
+    # 少了这一条，进度条会停在"正在做安全检查"然后突然蹦出三张卡。
+    progress.emit("present_plans")
     selection = interrupt({"kind": "plan_selection", "plans": state.get("candidate_plans", [])})
     plan_id = selection.get("plan_id") if isinstance(selection, dict) else str(selection)
     return {"selected_plan_id": plan_id}
