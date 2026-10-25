@@ -224,7 +224,13 @@ def print_case(r: dict[str, Any]) -> None:
         if t["questions"]:
             print(f"   【追问 {len(t['questions'])} 个】")
             for q in t["questions"]:
-                print(f"     ? {q}")
+                # questions 里是 dict（带选项），老数据可能是裸字符串。
+                if isinstance(q, dict):
+                    print(f"     ? {q.get('question', '')}")
+                    for opt in q.get("options") or []:
+                        print(f"         · {opt}")
+                else:
+                    print(f"     ? {q}")
         if t["answer"]:
             print(f"   【助手】")
             for line in t["answer"].splitlines():

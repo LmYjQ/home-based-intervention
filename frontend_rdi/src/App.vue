@@ -8,21 +8,26 @@
 //
 // 走通的顺序：建会话 → 发消息（可能停在追问）→ 答完追问
 // → 停在方案选择 → 选一张 → trial 落库 → 录反馈。
-import { computed, onMounted, ref } from 'vue'
-import { api } from './api.js'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { api, streamMessage } from './api.js'
 import PlanCard from './components/PlanCard.vue'
 import EvidencePanel from './components/EvidencePanel.vue'
 import FeedbackForm from './components/FeedbackForm.vue'
+import FollowupStepper from './components/FollowupStepper.vue'
 
+// 快捷填入的演示回答。只问一轮（后端 MAX_FOLLOWUP_ROUNDS = 1），
+// 所以一条回答就把场景、行为、试过什么、目标都补齐了。
 const DEMO_ANSWERS = [
-  '早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，抱起来能好。送进去以后老师说她今天自己吃了早饭。',
-  '在家不这样，只有去幼儿园才哭。哭的时候脸涨得通红，说不出话。试过提前十分钟出门，也试过抱着她走过去，都没什么用。',
-  '目标是能正常入园、别在门口哭半小时。她喜欢玩积木，在幼儿园午睡也正常。只要别在门口堵着就行，晚十分钟到也接受。',
+  '早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，抱起来能好。在家不这样，只有去幼儿园才哭。试过提前十分钟出门，也试过抱着她走过去，都没什么用。目标是能正常入园、别在门口哭半小时，晚十分钟到也接受。',
 ]
 
 // ---- 状态 ----
 const health = ref(null)
-const conversationId = ref('')
+// 会话 id 存一下 —— 刷新页面后它就没了，
+// 而 canSend 要求有 conversation_id，于是发送按钮一直是灰的。
+// 调试时刷新页面很常见（看报错、看原始响应），不能因此把会话丢了。
+const CONV_KEY = 'rdi.conversation_id'
+const conversationId = ref(localStorage.getItem(CONV_KEY) || '')
 const displayLabel = ref('孩子')
 const ageBand = ref('3-4岁')
 
@@ -42,6 +47,21 @@ const input = ref('')
 const busy = ref(false)
 const error = ref('')
 const lastRaw = ref(null)
+// 追问作答组件的实例 —— 新一轮追问来时要重置它的内部状态
+const stepper = ref(null)
+
+// 进度（方案 A：流式推进度，不流半截答案）
+//
+// 记的是**已经走过的步骤**，不只是当前那一步 —— 家长能看到
+// "理解 → 判断 → 检索 → 整理建议"这条线，知道系统在往哪儿走。
+const progressSteps = ref([])
+
+// 建议卡引用到的证据 id 集合 —— 右侧证据面板靠它标"已引用"。
+//
+// **为什么需要它**：卡上的引用和右侧的证据说的是同一段东西，
+// 但分属两个组件，谁也不认识谁。把 id 收集上来传下去，
+// 右侧才能标出"这 8 条里有 2 条真被用了"。
+const citedIds = ref([])
 
 // ---- 派生 ----
 // 只认后端真的声明过的状态，别猜。
@@ -99,12 +119,53 @@ async function run(fn, { keepMsgs = true } = {}) {
   }
 }
 
+// 跑一轮带进度提示的请求。
+//
+// 走 SSE 端点：每收到一条 progress 就更新提示条。
+// 出错时退回非流式请求 —— 流式端点不该是唯一的路，
+// 万一代理不支持 SSE，流程还得能走通。
+async function runStreaming(fn) {
+  busy.value = true
+  error.value = ''
+  progressSteps.value = []
+  try {
+    const data = await fn()
+    lastRaw.value = data
+    return data
+  } catch (e) {
+    error.value = e.message
+    lastRaw.value = { error: e.message }
+    return null
+  } finally {
+    busy.value = false
+    // 提示条留一会儿再消失 —— 立刻消失的话家长根本来不及看。
+    setTimeout(() => {
+      progressSteps.value = []
+    }, 1200)
+  }
+}
+
+function onProgress(ev) {
+  // 同一个 stage 可能出现多次（重试）—— 只记一条，但把重试次数带上。
+  const existing = progressSteps.value.find((s) => s.stage === ev.stage)
+  if (existing) {
+    existing.attempt = ev.attempt
+    return
+  }
+  progressSteps.value.push({
+    stage: ev.stage,
+    label: ev.label,
+    attempt: ev.attempt,
+  })
+}
+
 async function createConversation() {
   const data = await run(() =>
     api.createConversation({ display_label: displayLabel.value, age_band: ageBand.value }),
   )
   if (!data) return
   conversationId.value = data.conversation_id
+  localStorage.setItem(CONV_KEY, data.conversation_id)
   messages.value = []
   status.value = ''
   questions.value = []
@@ -116,6 +177,35 @@ async function createConversation() {
   evidenceDecision.value = {}
   evidenceGaps.value = []
   feedbackResult.value = null
+}
+
+// 收集每张卡引用到的证据 id。
+//
+// 卡组件用 defineExpose 把 citedIds 露出来 —— 它比父组件自己
+// 再算一遍靠谱：那边已经解析过引用和证据的对应关系了。
+const planRefs = new Map()
+
+function registerPlan(plan, el) {
+  if (!el) {
+    planRefs.delete(plan.plan_id)
+    return
+  }
+  planRefs.set(plan.plan_id, el)
+  syncCitedIds()
+}
+
+function syncCitedIds() {
+  const ids = new Set()
+  for (const el of planRefs.values()) {
+    for (const id of el?.citedIds || []) ids.add(id)
+  }
+  const next = [...ids]
+  // **必须比对再赋值**：每次都赋一个新数组的话，
+  // citedIds 变化 → 重渲染 → registerPlan → syncCitedIds → 又赋新数组
+  // → 无限递归。Vue 会报 "Maximum recursive updates exceeded"。
+  const prev = citedIds.value
+  if (prev.length === next.length && next.every((id, i) => prev[i] === id)) return
+  citedIds.value = next
 }
 
 function applyTurn(data) {
@@ -130,7 +220,10 @@ function applyTurn(data) {
   if (data.plans?.length) plans.value = data.plans
 
   if (data.status === 'awaiting_followup') {
-    push('bot', (data.questions || []).map((q, i) => `${i + 1}. ${q}`).join('\n'))
+    // 消息区只留个引子 —— 具体题目由 FollowupStepper 渲染，
+    // 不然消息区会有一份、stepper 又有一份，重复得看不清。
+    push('bot', `（${questions.value.length} 个问题）`)
+    stepper.value?.reset()
   } else if (data.message) {
     push('bot', data.message)
   }
@@ -142,18 +235,31 @@ async function send(text) {
   input.value = ''
   push('user', msg)
 
-  const data = await run(() => api.sendMessage(conversationId.value, { message: msg }))
+  const data = await runStreaming(() =>
+    streamMessage(conversationId.value, { message: msg }, { onProgress }),
+  )
   if (data) applyTurn(data)
 }
 
-async function answerFollowups() {
-  const msg = input.value.trim()
-  if (!msg) return
-  const data = await run(() => api.sendMessage(conversationId.value, { message: msg }))
-  if (data) {
-    input.value = ''
-    applyTurn(data)
-  }
+// 提交一轮追问的回答。
+//
+// answers 是 [{question, answer}, ...] —— 每条带原问题，
+// 后端拼成给图看的文本时不会把多题串味。
+async function submitAnswers(answers) {
+  if (!answers?.length) return
+  const summary = answers
+    .map((a) => `${a.question}\n${a.answer}`)
+    .join('\n\n')
+  push('user', summary)
+
+  const data = await runStreaming(() =>
+    streamMessage(
+      conversationId.value,
+      { message: '', answers },
+      { onProgress },
+    ),
+  )
+  if (data) applyTurn(data)
 }
 
 async function selectPlan(planId) {
@@ -182,11 +288,62 @@ async function refresh() {
   status.value = data.status
   evidence.value = data.evidence || []
   evidenceDecision.value = data.evidence_decision || {}
+  trialId.value = data.trial_id || ''
+  selectedPlanId.value = data.selected_plan_id || ''
   // GET 返回的 plans 是数据库里的已落库方案，和本轮的候选不是一回事
   if (data.plans?.length && !plans.value.length) plans.value = data.plans
 }
 
-onMounted(checkHealth)
+// 刷新页面后把上次那个会话接回来 ——
+// 光有 conversation_id 不够，还要把状态、消息、追问题重新填上。
+async function restoreSession() {
+  if (!conversationId.value) return
+  // 这里不用 run()：恢复失败不是"操作出错"，不该在页面上弹红条。
+  let data = null
+  try {
+    data = await api.getConversation(conversationId.value)
+  } catch {
+    data = null
+  }
+  if (!data) {
+    // 存的 id 后端认不出来（比如换了数据库、或者是从 mock 那边留下的）——
+    // 清掉它，不然这个页面会一直卡在"发送按钮是灰的"状态。
+    localStorage.removeItem(CONV_KEY)
+    conversationId.value = ''
+    status.value = ''
+    return
+  }
+  status.value = data.status
+  evidence.value = data.evidence || []
+  evidenceDecision.value = data.evidence_decision || {}
+  trialId.value = data.trial_id || ''
+  selectedPlanId.value = data.selected_plan_id || ''
+  if (data.plans?.length) plans.value = data.plans
+  // 把历史对话显示出来，家长刷新一次还能看到自己说过什么
+  for (const it of data.interactions || []) {
+    push(it.role === 'user' ? 'user' : 'bot', it.content)
+  }
+  // 停在追问中断上时，题目要从 pending_interrupt 里取出来重新渲染
+  const pending = data.pending_interrupt
+  if (pending?.kind === 'followup') {
+    questions.value = pending.questions || []
+  }
+}
+
+onMounted(() => {
+  checkHealth()
+  restoreSession()
+})
+
+// 证据或方案卡变了，"哪些证据被引用了"要重新算一遍。
+//
+// **为什么要 watch**：卡组件的 citedIds 是从 props 算出来的，
+// 而证据面板的序号是按 evidence 数组的位置算的 ——
+// 证据晚到一步（先出卡后出证据）的话，卡里的"第 N 条"就指错了。
+// 所以两边都变了就得重算。
+watch([evidence, plans], () => {
+  nextTick(syncCitedIds)
+}, { deep: true })
 </script>
 
 <template>
@@ -250,35 +407,52 @@ onMounted(checkHealth)
             </div>
           </div>
 
-          <div v-if="awaitingFollowup && questions.length" class="card"
-               style="background:var(--panel-2);margin:0 0 12px">
-            <h4 style="margin-bottom:6px">要回答的问题</h4>
-            <ul style="margin:0;padding-left:18px">
-              <li v-for="(q, i) in questions" :key="i">{{ q }}</li>
-            </ul>
+          <!-- 进度（方案 A）：推的是"在做什么"，不是半截答案 -->
+          <div v-if="busy && progressSteps.length" class="progress">
+            <div v-for="(s, i) in progressSteps" :key="s.stage" class="prog-step"
+                 :class="{ last: i === progressSteps.length - 1 }">
+              <span class="dot"></span>
+              <span>{{ s.label }}</span>
+              <span v-if="s.attempt > 1" class="small muted">（第 {{ s.attempt }} 次尝试）</span>
+            </div>
+          </div>
+          <div v-else-if="busy" class="progress">
+            <div class="prog-step last">
+              <span class="dot"></span>
+              <span>正在开始…</span>
+            </div>
           </div>
 
-          <div class="field">
-            <label>{{ awaitingFollowup ? '回答追问' : '描述孩子的情况' }}</label>
+          <!-- 追问：逐题作答，左右切换，最后一次性提交 -->
+          <FollowupStepper
+            v-if="awaitingFollowup && questions.length"
+            ref="stepper"
+            :questions="questions"
+            :busy="busy"
+            @submit="submitAnswers"
+          />
+
+          <div v-else class="field">
+            <label>描述孩子的情况</label>
             <textarea v-model="input"
-                      @keydown.enter.exact.prevent="awaitingFollowup ? answerFollowups() : send()"
-                      :placeholder="awaitingFollowup ? 'Enter 直接提交' : 'Enter 直接发送'" />
+                      @keydown.enter.exact.prevent="send()"
+                      placeholder="Enter 直接发送" />
           </div>
 
-          <div class="row">
+          <div v-if="!awaitingFollowup" class="row">
             <button class="primary"
                     :disabled="!canSend || !input.trim()"
-                    @click="awaitingFollowup ? answerFollowups() : send()">
-              {{ busy ? '处理中…（LLM 可能要 30-90s）' : awaitingFollowup ? '提交回答' : '发送' }}
+                    @click="send()">
+              {{ busy ? '处理中…' : '发送' }}
             </button>
             <span v-if="busy" class="small muted">图在跑，别重复点</span>
           </div>
 
-          <details style="margin-top:10px">
+          <details v-if="!awaitingFollowup" style="margin-top:10px">
             <summary>快捷填入演示答案（回车逐条提交）</summary>
             <button v-for="(a, i) in DEMO_ANSWERS" :key="i" class="small"
                     style="margin:2px 4px 2px 0"
-                    @click="input = a; answerFollowups()">
+                    @click="input = a; send()">
               第 {{ i + 1 }} 条
             </button>
           </details>
@@ -292,6 +466,8 @@ onMounted(checkHealth)
             <span v-if="selectedPlanId" class="badge accent">已选 {{ selectedPlanId }}</span>
           </header>
           <PlanCard v-for="p in plans" :key="p.plan_id" :plan="p"
+                    :ref="(el) => registerPlan(p, el)"
+                    :evidence="evidence"
                     :selectable="awaitingPlanSelection"
                     :selected="p.plan_id === selectedPlanId"
                     @select="selectPlan" />
@@ -330,7 +506,8 @@ onMounted(checkHealth)
 
       <!-- 右：证据与原始响应 -->
       <div>
-        <EvidencePanel :evidence="evidence" :decision="evidenceDecision" :gaps="evidenceGaps" />
+        <EvidencePanel :evidence="evidence" :decision="evidenceDecision" :gaps="evidenceGaps"
+                       :cited-ids="citedIds" />
 
         <div class="card" v-if="lastRaw">
           <header>

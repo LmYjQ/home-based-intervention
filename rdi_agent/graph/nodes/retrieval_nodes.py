@@ -23,6 +23,7 @@ from typing import Any
 
 from rdi_agent import llm
 from rdi_agent.config import get_settings
+from rdi_agent import progress
 from rdi_agent.graph import evidence_gate as gate
 from rdi_agent.graph.evidence_gate import route_after_evidence_gate  # noqa: F401
 from rdi_agent.graph.safety import BLOCKED_FALLBACK, review_safety
@@ -105,6 +106,7 @@ async def rewrite_query(state: CoachState) -> dict[str, Any]:
         state.get("case_summary") or {},
         state.get("user_message", ""),
     )
+    progress.emit("rewrite_query")
     queries = await rag_rewrite_query(text)
     return {
         "retrieval_queries": queries.to_dict(),
@@ -126,6 +128,9 @@ async def retrieve_knowledge(state: CoachState) -> dict[str, Any]:
     if not queries.semantic_query:
         return {"retrieval_candidates": [], "trace_metadata": {"retrieve": "查询为空，跳过召回"}}
 
+    # 召回要走 embedding + 数据库查询，实测好几秒 —— 不打点的话
+    # 家长会以为卡死了。
+    progress.emit("retrieve")
     recall = await rag_retrieval.recall_candidates(
         queries, candidate_k=rag_retrieval.DEFAULT_CANDIDATE_K, use_vector=True
     )
@@ -185,6 +190,8 @@ async def rerank_and_expand(state: CoachState) -> dict[str, Any]:
         ordered.append(candidate)
 
     settings = get_settings()
+    # 重排要调外部 API（rerank 开了的话），是最慢的一步之一。
+    progress.emit("rerank")
     built = await rag_retrieval.build_evidence_bundle(
         ordered,
         queries,
@@ -240,6 +247,12 @@ async def evidence_gate(state: CoachState) -> dict[str, Any]:
     if forced is not None:
         decision = forced
         trace = f"规则判定：{decision.evidence_status}（未调用模型）"
+        # 规则判死时**不调 LLM**，所以 chat_json 的打点不会触发 ——
+        # 得在这儿自己打一个。
+        #
+        # **注意别打两次**：走 else 分支时 chat_json 会打，
+        # 这里再打就是重复事件了。所以打点只放在这一支。
+        progress.emit("evidence_gate")
     else:
         system, user = P.evidence_gate(
             case_summary=case_summary,
@@ -288,7 +301,8 @@ async def generate_evidence_followup(state: CoachState) -> dict[str, Any]:
         temperature=0.3,
     )
     return {
-        "followup_questions": result.questions,
+        # 转成 dict 再存：state 要能序列化，前端拿到的也是 dict。
+        "followup_questions": [q.model_dump(mode="json") for q in result.questions],
         "trace_metadata": {"evidence_followup": trace.brief()},
     }
 
@@ -336,6 +350,13 @@ async def safety_review(state: CoachState) -> dict[str, Any]:
     answer_text = state.get("final_answer") or ""
 
     review = review_safety(cards, bundle, answer_text)
+
+    # 规则层直接判"blocked"/"needs_human_review"时**不调 LLM** ——
+    # 那一支得自己打点，否则家长看不到"安全检查"这一步。
+    #
+    # **注意别打两次**：走 pass 分支时 chat_json 自己会打。
+    if review.result != "pass":
+        progress.emit("safety_review")
 
     if review.result == "pass":
         content = _review_content(state, cards, answer_text)
@@ -403,7 +424,11 @@ def render_answer(state: CoachState) -> dict[str, Any]:
     """渲染给家长看的回答。**纯函数**，不调 LLM。
 
     输出确定、可复现，也省一次模型往返。
+
+    **注意**：这是纯函数（不调 LLM），所以 ``llm.chat_json`` 的进度钩子
+    抓不到它。要让前端看到"正在整理最终回复"这一步，得在这儿手动打点。
     """
+    progress.emit("render")
     review = state.get("safety_review") or {}
     if review.get("result") == "blocked":
         return {

@@ -5,11 +5,21 @@
 // may_quote_to_user 恒为 false（这本书授权未核实），
 // 所以家长只能看到"依据的是哪几页的什么大意"，拿不到原文。
 // 这个面板存在的意义就是让人核对"这个建议到底有没有依据"。
-defineProps({
+//
+// **每条证据带序号**：建议卡上的引用会写"见右侧证据第 N 条"，
+// 两边靠这个号对上。不带序号的话，家长只能自己在两堆文字里
+// 找同一个 UUID —— 那不叫可核对，叫让人放弃核对。
+import { computed } from 'vue'
+
+const props = defineProps({
   evidence: { type: Array, default: () => [] },
   decision: { type: Object, default: () => ({}) },
   gaps: { type: Array, default: () => [] },
+  // 被建议卡引用到的 evidence_id。命中的标出来。
+  citedIds: { type: Array, default: () => [] },
 })
+
+const cited = computed(() => new Set(props.citedIds || []))
 </script>
 
 <template>
@@ -17,6 +27,7 @@ defineProps({
     <header>
       <h3>证据</h3>
       <span class="badge">{{ evidence.length }} 条</span>
+      <span v-if="cited.size" class="badge accent">{{ cited.size }} 条被引用</span>
       <span v-if="decision.evidence_status" class="badge accent">
         {{ decision.evidence_status }}
       </span>
@@ -32,13 +43,15 @@ defineProps({
 
     <div v-if="!evidence.length" class="small muted">本轮没有取到证据。</div>
 
-    <div v-for="e in evidence" :key="e.evidence_id" class="ev">
+    <div v-for="(e, i) in evidence" :key="e.evidence_id" class="ev" :class="{ used: cited.has(e.evidence_id) }">
       <div class="row">
+        <span class="idx">{{ i + 1 }}</span>
         <strong>{{ e.title }}</strong>
         <span v-if="e.section_title" class="badge">{{ e.section_title }}</span>
         <span class="badge" :class="e.review_status === 'reviewed' ? 'ok' : ''">
           {{ e.review_status || 'unreviewed' }}
         </span>
+        <span v-if="cited.has(e.evidence_id)" class="badge accent">已引用</span>
       </div>
       <div class="small muted">
         p.{{ e.pdf_page_start }}–{{ e.pdf_page_end }}
@@ -76,6 +89,15 @@ defineProps({
 <style scoped>
 .ev { border-top: 1px solid var(--line); padding: 9px 0; }
 .ev:first-of-type { border-top: none; }
+/* 被建议卡引用到的证据 —— 左边描一道边，一眼能认出"这几条真被用了"。 */
+.ev.used { border-left: 2px solid var(--accent); padding-left: 9px; margin-left: -11px; }
+.idx {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  font-size: 11px; color: var(--fg-dim);
+}
+.ev.used .idx { background: #101c2e; border-color: #274570; color: var(--accent); }
 ul { margin: 4px 0 0; padding-left: 18px; }
 code { font-size: 11px; }
 </style>

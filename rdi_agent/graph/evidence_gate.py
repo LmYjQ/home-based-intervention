@@ -34,6 +34,8 @@ from rdi_agent.schemas.evidence import EvidenceBundle, EvidenceDecision, Evidenc
 # 门控说"缺信息" → 追问 → 回到 ``check_sufficiency``（模型说够了）
 # → 检索 → 门控又说"缺信息" → 死循环。
 # 第二次到门控时这个计数已经是 1，门控必然落到 limited_answer。
+#
+# 第二次到门控时这个计数已经是 1，门控必然落到 limited_answer。
 MAX_EVIDENCE_FOLLOWUP_ROUNDS = 1
 
 

@@ -15,10 +15,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
@@ -37,11 +40,33 @@ class CreateConversationRequest(BaseModel):
     age_band: str | None = None
 
 
+class FollowupAnswer(BaseModel):
+    """家长对**某一个**追问的回答。
+
+    ``answer`` 是家长点选的选项原文，或者自己写的字 ——
+    两者在前端是互斥的（写了字，选项就作废），
+    所以这里不需要再区分"点的"还是"写的"。
+    """
+
+    # 原问题文本。用来把答案和问题对上，也方便留痕。
+    question: str
+    answer: str
+
+
 class SendMessageRequest(BaseModel):
     message: str
     # 幂等键：同一个 turn_id 重发不会重复写业务记录
     turn_id: str | None = None
     debug: bool = False
+    # 一轮追问里每个问题的回答。
+    #
+    # **为什么要有它**：一轮追问有多个问题，家长是**逐题作答、最后一起提交**的。
+    # 只传一个扁平的 message，就分不清哪段话是回答哪个问题的 ——
+    # 下游 parse_parent_input 只能靠猜，多题回答会串。
+    #
+    # 有 answers 时，``message`` 可以是空的；接口会用 answers 拼出给
+    # 图看的文本。两者都传则以 answers 为准。
+    answers: list[FollowupAnswer] | None = None
 
 
 class SelectPlanRequest(BaseModel):
@@ -66,6 +91,51 @@ def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
     first = interrupts[0]
     value = getattr(first, "value", None)
     return value if isinstance(value, dict) else {"raw": str(value)}
+
+
+def _question_texts(questions: list[Any]) -> list[str]:
+    """把一轮追问统一成"纯问题文本"列表。
+
+    ``followup_questions`` 里存的是 dict（带选项），
+    但有两处只想要问题本身：
+      - 存助手消息（interactions.content 是纯文本列）
+      - 兼容老数据：``questions`` 里也可能是裸字符串
+    """
+    texts: list[str] = []
+    for q in questions or []:
+        if isinstance(q, dict):
+            texts.append(str(q.get("question") or "").strip())
+        else:
+            texts.append(str(q).strip())
+    return [t for t in texts if t]
+
+
+def _compose_answer_text(
+    answers: list[FollowupAnswer] | None,
+    message: str,
+) -> str:
+    """把"每题一个回答"拼成给图看的一段文本。
+
+    图里 ``parse_parent_input`` 只吃一段文本，所以这里要拼。
+    **带上原问题** —— 不带的话，多题回答会互相串：
+    下游看到"在家更自在、换过老师"，分不清哪个说的是哪个。
+    """
+    if not answers:
+        return message
+    lines = []
+    for a in answers:
+        ans = (a.answer or "").strip()
+        if not ans:
+            continue
+        q = (a.question or "").strip()
+        lines.append(f"{q}\n{ans}" if q else ans)
+    if not lines:
+        return message
+    joined = "\n\n".join(lines)
+    # message 里家长自己额外说的话（如果有）也带上
+    extra = (message or "").strip()
+    return f"{joined}\n\n{extra}" if extra else joined
+
 
 
 async def _pending_interrupt(config: dict[str, Any]) -> dict[str, Any] | None:
@@ -95,6 +165,13 @@ def _status_of(
     证据不够（limited_answer）或者家长报告了风险信号
     （needs_professional_support）。这两种都要和"正常完成"区分开，
     否则前端会把"我没给建议"当成"建议生成完了"。
+
+    **判断依据要看 ``answer_mode``，不是只看 ``evidence_decision``**：
+    证据门控判的是 "recommend"（证据够），但建议卡生成可能整体失败
+    （schema 连着几次不合规、引用校验全挂）—— 这时图走的是
+    ``build_limited_answer``，家长拿到的是一段文字而不是方案卡。
+    只看 evidence_decision 会把这种情况报成 "completed"，
+    前端就以为流程正常跑完了，家长一脸莫名其妙。
     """
     if interrupt_payload is not None:
         kind = interrupt_payload.get("kind")
@@ -102,9 +179,13 @@ def _status_of(
             "followup": "awaiting_followup",
             "plan_selection": "awaiting_plan_selection",
         }.get(kind, "interrupted")
-    decision = (result or {}).get("evidence_decision") or {}
+    values = result or {}
+    decision = values.get("evidence_decision") or {}
     if decision.get("high_risk"):
         return "needs_professional_support"
+    # 图走到了有限回答这一路 —— 不管是因为证据不够，还是因为生成建议卡失败了。
+    if values.get("answer_mode") in ("limited", "risk"):
+        return "needs_professional_support" if values.get("answer_mode") == "risk" else "limited_answer"
     if decision.get("decision") == "limited_answer":
         return "limited_answer"
     return "completed"
@@ -189,9 +270,29 @@ async def create_conversation(req: CreateConversationRequest) -> dict[str, Any]:
 
 @router.post("/conversations/{conversation_id}/messages")
 async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[str, Any]:
-    """发一条消息。可能在追问或方案选择处停下。"""
+    """发一条消息。可能在追问或方案选择处停下。
+
+    **回答追问**时，请求体里可以带 ``answers``（每题一个回答）。
+    带了就用 answers 拼出给图看的文本；不带就退回 ``message``。
+
+    **这是非流式版本**。想看进度用 ``/messages/stream``（SSE）——
+    两边跑的是同一套逻辑（``_run_turn``），只是后者边跑边推事件。
+    """
+    result = await _run_turn(conversation_id, req)
+    return _turn_payload(conversation_id, result)
+
+
+async def _run_turn(conversation_id: str, req: SendMessageRequest) -> dict[str, Any]:
+    """跑一轮对话，返回图的原始返回值。
+
+    **流式和非流式共用这一份逻辑** —— 两边必须产出完全一样的结果，
+    否则手测时看到的和线上跑的就不是一回事了。
+    """
     family_id, child_id = await _ensure_identity(conversation_id)
     turn_id = req.turn_id or _new_id("turn")
+
+    # 图看到的文本。有 answers 就用 answers 拼的（带上原问题，避免多题串味）。
+    user_text = _compose_answer_text(req.answers, req.message)
 
     async with session_scope() as session:
         repo = Repository(session)
@@ -200,7 +301,7 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
             thread_id=conversation_id,
             turn_id=turn_id,
             role="user",
-            content=req.message,
+            content=user_text,
             family_id=family_id,
             child_id=child_id,
         )
@@ -216,7 +317,7 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
         # await_user_answer 永远跑不完，followup_rounds 也就永远停在 0，
         # "追问 3 轮就收手"的兜底形同虚设。
         result = await graph.ainvoke(
-            Command(resume=req.message, update={"turn_id": turn_id}),
+            Command(resume=user_text, update={"turn_id": turn_id}),
             config=config,
         )
     else:
@@ -228,24 +329,15 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
                 "family_id": family_id,
                 "child_id": child_id,
                 "turn_id": turn_id,
-                "user_message": req.message,
+                "user_message": user_text,
                 "child_context": context,
                 "debug": req.debug,
             },
             config=config,
         )
 
-    interrupt_payload = _interrupt_payload(result)
-    status = _status_of(interrupt_payload, result)
-    evidence = _evidence_panel(result.get("evidence_bundle"))
-    decision = result.get("evidence_decision") or {}
-
     # 助手侧也记一条，方便 GET 查回完整对话。
-    assistant_text = result.get("final_answer") or ""
-    if status == "awaiting_followup":
-        assistant_text = "\n".join(interrupt_payload.get("questions", []))
-    elif status == "awaiting_plan_selection":
-        assistant_text = result.get("final_answer") or ""
+    assistant_text = _assistant_text(result)
     if assistant_text:
         async with session_scope() as session:
             await Repository(session).record_interaction(
@@ -258,9 +350,35 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
                 child_id=child_id,
             )
 
+    result["_assistant_text"] = assistant_text
+    result["_turn_id"] = turn_id
+    return result
+
+
+def _assistant_text(result: dict[str, Any]) -> str:
+    """这一轮存进对话记录的助手文本。
+
+    追问那一轮存的是**问题文本**（纯文本列存不了 dict），
+    具体题目由前端用 ``questions`` 里的结构重新渲染。
+    """
+    interrupt_payload = _interrupt_payload(result)
+    status = _status_of(interrupt_payload, result)
+    if status == "awaiting_followup":
+        return "\n".join(_question_texts((interrupt_payload or {}).get("questions", [])))
+    return result.get("final_answer") or ""
+
+
+def _turn_payload(conversation_id: str, result: dict[str, Any]) -> dict[str, Any]:
+    """把图的返回值翻译成接口响应。"""
+    interrupt_payload = _interrupt_payload(result)
+    status = _status_of(interrupt_payload, result)
+    evidence = _evidence_panel(result.get("evidence_bundle"))
+    decision = result.get("evidence_decision") or {}
+    assistant_text = result.get("_assistant_text") or result.get("final_answer") or ""
+
     return {
         "conversation_id": conversation_id,
-        "turn_id": turn_id,
+        "turn_id": result.get("_turn_id"),
         "status": status,
         "questions": (interrupt_payload or {}).get("questions", []),
         "plans": (interrupt_payload or {}).get("plans", []),
@@ -279,6 +397,110 @@ async def send_message(conversation_id: str, req: SendMessageRequest) -> dict[st
             "evidence_gaps"
         ) or [],
     }
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+async def send_message_stream(
+    conversation_id: str, req: SendMessageRequest
+) -> StreamingResponse:
+    """发一条消息，**边跑边推进度**（SSE）。
+
+    **推的是什么**：进度事件（"正在检索指南…"），不是答案正文。
+    答案要等图跑完才有一个完整形态 —— 抽取类调用走的是
+    ``json_schema`` 严格约束解码，模型必须保证 JSON 语法合法才能吐
+    token，中途吐出来的是半截 JSON，家长也看不懂。
+
+    所以这条流解决的是"它卡在哪儿"，不是"字一个字出来"。
+
+    **和 ``/messages`` 的关系**：跑的是同一套逻辑（``_run_turn``），
+    最后推的 ``result`` 事件和非流式接口的 body **字段完全一样**。
+    前端拿它替换掉普通请求即可。
+
+    事件格式（``text/event-stream``）：
+
+    - ``event: progress`` —— 进度，data 是 ``{stage, label, kind, attempt}``
+    - ``event: result``   —— 最终结果，data 和 ``/messages`` 的 body 一样
+    - ``event: error``    —— 出错，data 是 ``{message}``
+    """
+    # 先把身份校验跑一遍 —— 错了要立刻返回 4xx，
+    # 不能已经开流了再报错（SSE 里发错误，前端只能看到流里的一条消息）。
+    await _ensure_identity(conversation_id)
+
+    async def event_source():
+        from rdi_agent.progress import spawn_with_progress
+
+        # 进度事件和最终结果走同一个出口队列 ——
+        # 分两个队列的话要处理"结果先于进度到达"的乱序问题。
+        outbox: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        def put(event: str, data: dict[str, Any]) -> None:
+            outbox.put_nowait({"event": event, "data": data})
+
+        async def run_graph() -> None:
+            """跑图，把进度和结果都塞进出站队列。"""
+            try:
+                task, progress_queue = spawn_with_progress(
+                    _run_turn(conversation_id, req)
+                )
+                # 一个 task 跑图，另一个把进度转成 SSE 事件。
+                pump_task = asyncio.create_task(pump(progress_queue))
+                try:
+                    result = await task
+                finally:
+                    pump_task.cancel()
+                put("result", _turn_payload(conversation_id, result))
+            except Exception as exc:  # noqa: BLE001 - 错误要发给前端，不是吞掉
+                put("error", {"message": f"{type(exc).__name__}: {exc}"})
+            finally:
+                outbox.put_nowait(None)  # 哨兵：告诉消费方"完了"
+
+        async def pump(progress_queue) -> None:
+            """把进度事件转成 SSE。"""
+            while True:
+                event = await progress_queue.get()
+                put(
+                    "progress",
+                    {
+                        "stage": event.stage,
+                        "label": event.label,
+                        "kind": event.kind,
+                        "detail": event.detail,
+                        "attempt": event.attempt,
+                    },
+                )
+
+        runner = asyncio.create_task(run_graph())
+        try:
+            while True:
+                item = await outbox.get()
+                if item is None:
+                    break
+                yield _sse(item["event"], item["data"])
+        finally:
+            # 客户端断线时取消图 —— 不然后台白跑一遍 LLM。
+            if not runner.done():
+                runner.cancel()
+
+    return StreamingResponse(
+        event_source(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # 关掉 nginx 的缓冲，否则 SSE 会被攒着一起发。
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _sse(event: str, data: dict[str, Any]) -> str:
+    """一条 SSE 事件。
+
+    ``data`` 必须是单行 JSON —— SSE 的 ``data:`` 每行一个字段，
+    多行的话要按行拆开写。这里 json.dumps 不换行，所以是单行。
+    """
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
 
 
 @router.post("/conversations/{conversation_id}/select-plan")
@@ -354,6 +576,15 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
     except RuntimeError:
         values = {}
 
+    # 停在选方案中断上时，**用中断里那份候选卡**。
+    #
+    # **为什么**：数据库里的 plans 是落库后的行（status/recommended 这些
+    # 字段是后来改的），而中断里的是"当时给家长看的那三张卡"——
+    # 引用、家长可以做的事、观察指标都在里面。刷新页面后前端要
+    # 把卡原样接回来，用落库那份会丢掉引用。
+    if pending and pending.get("kind") == "plan_selection" and pending.get("plans"):
+        plans = list(pending["plans"])
+
     return {
         "conversation_id": conversation_id,
         "family_id": family_id,
@@ -363,6 +594,10 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
         "pending_interrupt": pending,
         "interactions": interactions,
         "plans": plans,
+        # 选了方案之后 trial 才落库。刷新页面后前端要靠它把反馈表单接回来 ——
+        # 少了这个字段，刷新一次反馈表单就没了，家长以为没提交成功。
+        "trial_id": values.get("trial_id"),
+        "selected_plan_id": values.get("selected_plan_id"),
         "evidence": _evidence_panel(values.get("evidence_bundle")),
         "evidence_decision": values.get("evidence_decision") or {},
     }

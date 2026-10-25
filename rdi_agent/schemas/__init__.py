@@ -2,7 +2,9 @@
 
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
+    MAX_FOLLOWUP_OPTIONS,
     MAX_FOLLOWUP_QUESTIONS,
+    FollowupQuestion,
     FollowupQuestions,
     NextStep,
     RecommendationSet,
@@ -31,6 +33,7 @@ from rdi_agent.schemas.recommendation import (
 )
 
 __all__ = [
+    "MAX_FOLLOWUP_OPTIONS",
     "MAX_FOLLOWUP_QUESTIONS",
     "ApplicationLabel",
     "CaseSummary",
@@ -40,6 +43,7 @@ __all__ = [
     "EvidenceItem",
     "FeedbackAnalysis",
     "FeedbackSubmission",
+    "FollowupQuestion",
     "FollowupQuestions",
     "MemoryCandidate",
     "MemoryType",

@@ -31,6 +31,25 @@ def _require_recommended(schema: dict) -> None:
         required.append("recommended")
 
 
+def _require_source_citations(schema: dict) -> None:
+    """把 ``source_citations`` 也塞进 required。
+
+    **为什么**：这个字段有默认值（空列表），所以结构化输出允许模型整张卡
+    都不写它。实测模型会这么干 —— 它把 ``application_label`` 填成
+    ``source_summary``（"这是指南里说的"），却不给出任何引用。
+
+    然后 ``source_summary_needs_citation`` 校验器直接抛错，
+    **三张卡一起废掉**，整轮退化成有限回答：家长辛辛苦苦答完三轮追问，
+    最后只拿到一段没有出处的文字。
+
+    要求"字段必须出现"不等于"必须有引用" —— 空数组是合法答案，
+    对应"这张卡是应用转化，不是指南原文"。
+    """
+    required = schema.get("required")
+    if isinstance(required, list) and "source_citations" not in required:
+        required.append("source_citations")
+
+
 class SourceCitation(BaseModel):
     source_id: str
     source_type: Literal[
@@ -69,7 +88,10 @@ class RecommendationCard(BaseModel):
     # 只在 json_schema 里要求模型必须显式表态。
     model_config = ConfigDict(
         extra="forbid",
-        json_schema_extra=_require_recommended,
+        json_schema_extra=lambda schema: (
+            _require_recommended(schema),
+            _require_source_citations(schema),
+        ),
     )
 
     plan_id: str

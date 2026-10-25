@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from openai import AsyncOpenAI
+from openai import APITimeoutError
 from pydantic import BaseModel, ValidationError
 
 from rdi_agent.config import get_settings
@@ -255,6 +256,15 @@ async def chat_json(
         trace.attempt = attempt
         if on_step:
             on_step(f"{stage} · 第{attempt}次尝试")
+        # 进度事件（方案 A）。**每个调用点都自动吃到** ——
+        # 不用逐个改 10 个 chat_json 调用点，接上就是全局的。
+        #
+        # 延迟 import：``progress`` 不依赖本模块，但顶层 import 会把
+        # 循环依赖的风险引进来的那一条路。函数内 import 零成本
+        # （模块已缓存），且避免了"谁先被 import"的顺序问题。
+        from rdi_agent.progress import emit as _emit_progress
+
+        _emit_progress(stage, attempt=attempt)
         t0 = time.time()
         try:
             resp = await client(timeout_s).chat.completions.create(
@@ -268,7 +278,20 @@ async def chat_json(
             msg = f"{type(e).__name__}: {e}"
             trace.latency_ms = int((time.time() - t0) * 1000)
             trace.retries.append(msg[:120])
-            if "api_key" in msg.lower() or "connection" in msg.lower() or attempt >= max_attempts:
+            # 超时和"连不上"要分开说。
+            #
+            # 超时是这个 provider 的常态（同一 prompt 实测 2.8s~55s），
+            # 报成"连不上模型"会让人以为是 key 或网络坏了，
+            # 去查错的方向。超时就是慢，重试就行。
+            is_timeout = isinstance(e, (APITimeoutError, asyncio.TimeoutError)) or "timeout" in msg.lower()
+            if attempt >= max_attempts:
+                if is_timeout:
+                    raise LLMError(
+                        f"{stage} 连续 {attempt} 次超时（每次 {timeout_s or get_settings().llm_timeout_s:.0f}s）："
+                        "模型侧排队，不是 key 或网络问题"
+                    ) from e
+                raise LLMUnavailable(f"{stage} 连不上模型：{msg}") from e
+            if "api_key" in msg.lower() or "connection" in msg.lower():
                 raise LLMUnavailable(f"{stage} 连不上模型：{msg}") from e
             await asyncio.sleep(min(2**attempt, 8))
             continue

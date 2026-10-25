@@ -38,7 +38,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("llm_base_url", "siliconflow_base_url"),
     )
     llm_model: str = "Qwen/Qwen2.5-7B-Instruct"
-    llm_timeout_s: float = 20.0
+    # 超时要留够余量。
+    #
+    # **实测**：同一个 prompt、同一批参数，模型延迟在 2.8s ~ 55s 之间跳
+    # （provider 侧的排队，不是我们的 prompt 大）。20s 的默认值碰上
+    # 一次慢的就被打断；60s 也只是刚好压在慢的那条线上 ——
+    # 连续三次慢就整轮 500 了。
+    #
+    # 给到 120s：单次慢调用能扛住，三次重试最坏 6 分钟，
+    # 但换来的是"慢"而不是"挂"。宁可慢，不要把家长的问题判成模型挂了。
+    llm_timeout_s: float = 120.0
     llm_max_attempts: int = 3
     # live / replay / capture
     demo_mode: str = "live"

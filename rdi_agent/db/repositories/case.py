@@ -303,6 +303,20 @@ class Repository:
         return await self.session.get(Plan, uuid.UUID(str(plan_id)))
 
     async def list_plans(self, conversation_id: str) -> list[dict[str, Any]]:
+        """这个会话的方案卡。
+
+        **返回整张卡**（``plan_json`` 展开在顶层），不只是摘要字段。
+
+        **为什么**：前端刷新页面后靠这个接口把方案卡接回来。
+        之前只返回 plan_id / title / status / recommended / application_label，
+        前端把这份数据直接喂给 ``PlanCard`` 组件渲染 ——
+        于是卡上只剩标题，**引用、家长可以做的事、观察指标全没了**，
+        看起来像"引用被清空了"。
+
+        顶层同时保留那几个摘要字段（历史上就是这么用的，
+        ``test_api_conversation_flow`` 也这么断言），
+        整张卡的内容放在 ``card`` 下面。
+        """
         rows = (
             await self.session.execute(
                 select(Plan)
@@ -310,17 +324,22 @@ class Repository:
                 .order_by(Plan.created_at)
             )
         ).scalars().all()
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for r in rows:
+            card = dict(r.plan_json or {})
+            item = {
                 "db_plan_id": str(r.id),
-                "plan_id": (r.plan_json or {}).get("plan_id"),
-                "title": (r.plan_json or {}).get("title"),
+                "plan_id": card.get("plan_id"),
+                "title": card.get("title"),
                 "status": r.status,
                 "recommended": r.recommended,
                 "application_label": r.application_label,
+                # 整张卡。前面那几个字段是为了兼容，card 才是完整的。
+                **card,
+                "card": card,
             }
-            for r in rows
-        ]
+            result.append(item)
+        return result
 
     async def get_trial(self, trial_id: str) -> Trial | None:
         return await self.session.get(Trial, uuid.UUID(str(trial_id)))
