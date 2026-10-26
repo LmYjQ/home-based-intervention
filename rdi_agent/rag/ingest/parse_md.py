@@ -2,7 +2,7 @@
 
 **为什么要有这条路径**：这份指南是**扫描件**，PDF 里没有文字层
 （``fitz`` 抽出来是空字符串）。``parse_pdf`` 对它完全无效 ——
-它按页抽文字，扫��� PDF 抽出来是空的。
+它按页抽文字，扫描 PDF 抽出来是空的。
 
 所以入库源改成 Markdown：``data/ocr/guideline2026/page_001.md`` …
 ``page_025.md``，一个文件对应 PDF 的一页。这样：
@@ -35,6 +35,9 @@ _HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 # 表格分隔行：| --- | --- |
 _TABLE_SEPARATOR = re.compile(r"^\|[\s:\-|]+\|$")
 
+# 句末标点。这些结尾的句子是完整的，不该跟下一页粘在一起。
+_SENTENCE_END_CHARS = "。！？"
+
 
 @dataclass
 class PageRecord:
@@ -62,6 +65,13 @@ class Block:
     kind: str  # heading / paragraph / table / list_item
     text: str
     level: int = 0  # 标题层级（1-6），非标题为 0
+    # 跨页合并后这个块覆盖到的最后一页。0 = 和 page 一样。
+    page_end: int = 0
+
+    @property
+    def last_page(self) -> int:
+        """这个块结束在第几页。"""
+        return self.page_end or self.page
 
 
 def _iter_pages(md_dir: Path) -> list[tuple[int, Path]]:
@@ -83,6 +93,17 @@ def _is_table_row(line: str) -> bool:
 
 def parse_blocks(text: str, page: int) -> list[Block]:
     """把一页的 Markdown 拆成块。
+
+    **一行 = 一段**（切分规则就是这么定的）：
+
+    - 标题行 -> ``kind="heading"``，层级记在 ``level`` 里
+    - 表格行 -> ``kind="table"``，管道符去掉、单元格用空格连
+    - 正文行 -> ``kind="paragraph"``
+
+    **``<br>`` 也分段**：Markdown 里 ``<br>`` 表示换行，
+    正文行里有几个 ``<br>`` 就切成几段。
+    （**表格行例外** —— 格子里的内容不拆，见
+    :func:`_table_row_to_segments`。）
 
     表格的每一行是**一个块** —— 指南的附件 1–4 全是宽表格，
     一行是一整条干预要点（"年龄 → 干预目标 → 干预内容 → 干预重点"），
@@ -111,36 +132,40 @@ def parse_blocks(text: str, page: int) -> list[Block]:
             # 表格行转成可读文本：``| 正强化 | 以物质性... |``
             # -> ``正强化 以物质性...``。
             # 管道符留着会让向量和分词都读到一堆无意义的符号。
-            blocks.append(
-                Block(page=page, kind="table", text=_table_row_to_text(line))
-            )
+            for segment in _table_row_to_segments(line):
+                blocks.append(Block(page=page, kind="table", text=segment))
             continue
-        blocks.append(Block(page=page, kind="paragraph", text=line))
+        for segment in _split_br(line):
+            blocks.append(
+                Block(page=page, kind="paragraph", text=segment.replace("**", ""))
+            )
     return blocks
 
 
-def _table_row_to_text(line: str) -> str:
-    """表格行 -> 纯文本。
+def _split_br(text: str) -> list[str]:
+    """按 ``<br>`` 切成几段。"""
+    return [part.strip() for part in text.split("<br>") if part.strip()]
+
+
+def _table_row_to_segments(line: str) -> list[str]:
+    """表格行 -> **一段**（格子里的内容不拆）。
+
+    **一行表格 = 一个子块**：一行就是一条完整的干预要点
+    （"年龄 → 干预目标 → 干预内容 → 干预重点"）。按行切，
+    召回粒度才对得上"针对 X 阶段的干预要点"这种问题。
 
     **保留单元格的语义单元**：``| 0~18 月龄 | 促进感知觉... |`` 变成
-    ``0~18 月龄 促进感知觉...`` —— 单元格之间用一个空格，不切断
-    单元内部的语义。
+    ``0~18 月龄 促进感知觉...`` —— 单元格之间用一个空格，
+    不切断单元内部的语义。
 
-    **``<br>`` 换成句号**：Markdown 里 ``<br>`` 表示单元格内的换行。
-    留着它，向量模型会把它当成一串无意义的字符。换成句号之后，
-    "1. xxx。<br>2. yyy。" 变成 "1. xxx。 2. yyy。" —— 句子边界清楚了。
-
-    **但不能无条件加句号**（这是踩过的坑）：指南的表格里大量是
-    "某句话。<br>下一句" 这种写法 —— 前一句**本来就带句号**，
-    无脑替换就变成 "某句话。。下一句"。
-
-    实测 73 块里有 11 块中招（共 56 处），全在附件 2/3/4 三张表里。
-    所以这里按"前面是不是已经有句末标点"来决定加不加，
-    而不是简单地 ``replace("<br>", "。 ")``。
+    **格子里的 ``<br>`` 也不拆**：它表示格子内部的换行，
+    换成句号（``…。<br>下一句`` -> ``…。 下一句``）保留句子边界，
+    但整个格子还是一整块 —— 拆开会让一条要点散成几块。
     """
     cells = [c.strip() for c in line.strip("|").split("|")]
     cleaned = [_br_to_period(c).replace("**", "") for c in cells]
-    return " ".join(c for c in cleaned if c)
+    text = " ".join(c for c in cleaned if c)
+    return [text] if text else []
 
 
 # 句末标点。``<br>`` 前面是这些字符时，说明上一句已经收尾了，
@@ -149,23 +174,16 @@ _SENTENCE_END = "。！？；.!?;"
 
 
 def _br_to_period(cell: str) -> str:
-    """单元格里的 ``<br>`` 换成句号，但**不重复加句号**。
-
-    **要复现库里的存量形态**：原来 ``replace("<br>", "。 ")`` 产出的是
-    "句号 + 空格"。库里的内容也是这个形态。所以这里保持"句号 + 空格"，
-    **只去掉重复的那个句号**。
-
-    为什么要这么讲究：改掉空格形态的话，**重新入库**产出的文本就跟
-    现在库里不一样 —— 切块边界跟着移，人工标记的内容哈希全部失效。
-    这不是洁癖，是让"修 bug"和"重建索引"这两件事不会互相打架。
+    """格子里的 ``<br>`` 换成句号，但**不重复加句号**。
 
     规则（前一句收没尾）：
 
-    - ``xxx。<br>yyy`` → ``xxx。 yyy``（已有句号，去掉重复的，补空格）
-    - ``xxx<br>yyy``  → ``xxx。 yyy``（没句号，补一个 + 空格）
-    - ``<br>yyy``     → ``yyy``（开头就是换行，前面没内容）
+    - ``xxx。<br>yyy`` -> ``xxx。 yyy``（已有句号，不重复加）
+    - ``xxx<br>yyy``  -> ``xxx。 yyy``（没句号，补一个）
+    - ``<br>yyy``     -> ``yyy``（开头就是换行，前面没内容）
 
-    最后再压一遍连续句号 —— OCR 文本里还可能有别处自己带进来的。
+    指南的表格里大量是"某句话。<br>下一句"这种写法，
+    无脑替换会变成 "某句话。。下一句"。
     """
     if "<br>" not in cell:
         return cell
@@ -187,20 +205,72 @@ def _br_to_period(cell: str) -> str:
             out[-1] = prev + "。"
             out.append(part)
 
-    # 每段之间留一个空格（跟原来 ``"。 "`` 的形态一致）
     text = " ".join(out)
 
-    # 压掉重复的句号。两种形态都要处理：
-    #
-    #   - ``。。``   连续两个句号（``<br>`` 前面本来就有句号）
-    #   - ``。 。``  中间隔着空格（源文件里是 ``<br><br>``，双换行）
-    #
-    # 压完留一个空格：``。 。 `` → ``。 ``，
-    # 跟单 ``<br>`` 的形态一致（库里的存量就是这个形态）。
+    # 压掉重复的句号（两种形态："。。" 和 "。 。"）
     while "。。" in text:
         text = text.replace("。。", "。")
     text = re.sub(r"。\s+。", "。 ", text)
     return text
+
+
+def _table_row_to_text(line: str) -> str:
+    """表格行 -> 纯文本（整行合成一段）。
+
+    只给"给人看的"那层用（``pages.jsonl``）—— 切分走
+    :func:`_table_row_to_segments`，那里 ``<br>`` 换成句号（不拆段）。
+    """
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    cleaned = [c.replace("<br>", " ").replace("**", "") for c in cells]
+    return " ".join(c for c in cleaned if c)
+
+
+def merge_page_breaks(blocks: list[Block]) -> tuple[list[Block], int]:
+    """跨页续接合并。
+
+    **规则**：每页的最后一段，如果最后一个字符不是句末标点，
+    就和下一页的第一段合并成一段。
+
+    **为什么**：扫描件的分页是按物理页切的，段落会被页边界切开
+    （page_003 结尾 ``…应结合儿童``，page_004 开头 ``的发展水平和兴趣…``）。
+    不合并的话，子块就是半句话，检索命中之后给家长看也是半句话。
+
+    **只合并「段落 → 段落」**：表格行不跟下一段合并（表格行以 ``|`` 结尾，
+    拼上去会串行），标题也不合并（标题是父块边界）。
+
+    返回 ``(合并后的块, 合并了几处)``。
+    """
+    if not blocks:
+        return [], 0
+
+    terminators = tuple(_SENTENCE_END_CHARS)
+    result: list[Block] = []
+    pending: Block | None = None  # 上一段没说完的段落，等着跟下一页续上
+    merged = 0
+
+    for block in blocks:
+        if (
+            pending is not None
+            and block.kind == "paragraph"
+            and pending.page != block.page
+        ):
+            # 跨页续接：把这一段接到没说完的那段后面
+            pending.text = pending.text + block.text
+            pending.page_end = block.last_page
+            merged += 1
+            if not pending.text.endswith(terminators):
+                # 还是没说完，继续等下一页
+                continue
+            pending = None
+            continue
+
+        result.append(block)
+        if block.kind == "paragraph" and not block.text.endswith(terminators):
+            pending = block
+        else:
+            pending = None
+
+    return result, merged
 
 
 def read_raw_pages(md_dir: str | Path) -> list[tuple[int, str]]:
@@ -283,7 +353,7 @@ def strip_markdown(text: str) -> str:
 
 
 def write_pages(records: list[PageRecord], out_path: str | Path) -> Path:
-    """把页记录落盘（``pages.jsonl``），和 ``parse_pdf.write_pages`` 一致。"""
+    """把页记录落盘（``pages.jsonl``），和 ``parse_pdf.write_pages`` 同一套。"""
     path = Path(out_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:

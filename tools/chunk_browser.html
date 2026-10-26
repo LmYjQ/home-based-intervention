@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>切块观察</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 16px 20px 60px; max-width: 1100px;
+  }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .bar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    padding: 10px 12px; border: 1px solid #8884; border-radius: 8px; margin-bottom: 14px;
+  }
+  button { padding: 5px 12px; cursor: pointer; }
+  input[type=search] { padding: 4px 8px; min-width: 200px; }
+  .stat { opacity: .7; font-size: 12px; }
+  .parent { border: 1px solid #8884; border-radius: 8px; margin-bottom: 8px; }
+  .head { cursor: pointer; padding: 8px 12px; display: flex; gap: 8px; align-items: baseline; }
+  .head:hover { background: #8881; }
+  .caret { display: inline-block; width: 12px; opacity: .6; }
+  .meta { opacity: .6; font-size: 12px; }
+  .body { padding: 0 12px 10px 32px; display: none; }
+  .parent.open .body { display: block; }
+  .parent.open .caret { transform: rotate(90deg); }
+  .child {
+    border-left: 3px solid #8884; padding: 6px 0 6px 10px; margin: 8px 0;
+  }
+  .child.deleted { opacity: .45; }
+  .child.deleted textarea { text-decoration: line-through; }
+  .child .meta { display: flex; gap: 10px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
+  textarea {
+    width: 100%; box-sizing: border-box; min-height: 58px; resize: vertical;
+    font: 13px/1.6 inherit; padding: 6px 8px; border: 1px solid #8884; border-radius: 6px;
+  }
+  .parenttext {
+    white-space: pre-wrap; background: #8881; padding: 6px 8px; border-radius: 6px;
+    font-size: 12px; opacity: .8; max-height: 120px; overflow: auto;
+  }
+  .hint { opacity: .6; font-size: 12px; margin: 8px 0 14px; }
+</style>
+</head>
+<body>
+<h1>切块观察</h1>
+
+<div class="bar">
+  <label>输出目录
+    <input type="file" id="dir" webkitdirectory directory multiple>
+  </label>
+  <button id="expandAll">全部展开</button>
+  <button id="collapseAll">全部收起</button>
+  <input type="search" id="q" placeholder="过滤标题 / 正文">
+  <button id="export">导出确认结果</button>
+  <span class="stat" id="stat"></span>
+</div>
+
+<div class="hint">
+  选 <code>data/index/chunk_preview</code> 这样的输出目录（里面有 manifest.json）。
+  默认只显示父块，点父块标题展开看子块。改完文本 / 标状态 / 勾删除，
+  最后点「导出确认结果」下载 confirmed_chunks.json，再跑
+  <code>make chunks-import</code>。
+</div>
+
+<div id="list"></div>
+
+<script>
+const STATES = ["unreviewed", "reviewed", "needs_correction"];
+let MANIFEST = null;
+let STATE = {};   // chunk_index -> {content, status, deleted}
+
+const list = document.getElementById('list');
+const stat = document.getElementById('stat');
+
+function h(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function childrenOf(parentIndex) {
+  return MANIFEST.chunks.filter(c => !c.is_parent && c.parent_chunk_index === parentIndex);
+}
+
+function parentText(parent) {
+  // 父块正文是拼出来的：标题 + 各个子块
+  const kids = childrenOf(parent.chunk_index);
+  const kept = kids.filter(c => !STATE[c.chunk_index].deleted);
+  return parent.title + "\n" + kept.map(c => STATE[c.chunk_index].content).join("\n");
+}
+
+function markDirty() {
+  refreshParentTexts();
+  updateStat();
+}
+
+function refreshParentTexts() {
+  document.querySelectorAll('.parenttext').forEach(node => {
+    const idx = Number(node.dataset.parent);
+    const parent = MANIFEST.parents.find(p => p.chunk_index === idx);
+    if (parent) node.textContent = parentText(parent);
+  });
+}
+
+function updateStat() {
+  if (!MANIFEST) { stat.textContent = ''; return; }
+  let edited = 0, deleted = 0, marked = 0;
+  for (const c of MANIFEST.chunks) {
+    const s = STATE[c.chunk_index];
+    if (s.deleted) deleted++;
+    else if (s.content !== c.content) edited++;
+    if (s.status !== 'unreviewed') marked++;
+  }
+  stat.textContent =
+    `父块 ${MANIFEST.parents.length} · 子块 ${MANIFEST.chunks.length - MANIFEST.parents.length}` +
+    ` · 改 ${edited} · 删 ${deleted} · 标 ${marked}`;
+}
+
+function childCard(chunk) {
+  const s = STATE[chunk.chunk_index];
+  const card = h('div', 'child');
+  if (s.deleted) card.classList.add('deleted');
+
+  const meta = h('div', 'meta');
+  meta.appendChild(h('span', 'meta', `#${chunk.chunk_index}`));
+  meta.appendChild(h('span', 'meta', `p${chunk.pdf_page_start}-${chunk.pdf_page_end}`));
+  meta.appendChild(h('span', 'meta', `${chunk.chars}字`));
+  meta.appendChild(h('span', 'meta', chunk.knowledge_type));
+
+  const sel = document.createElement('select');
+  for (const st of STATES) {
+    const opt = document.createElement('option');
+    opt.value = st; opt.textContent = st;
+    if (st === s.status) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => { s.status = sel.value; markDirty(); };
+  meta.appendChild(sel);
+
+  const delLabel = h('label', 'meta');
+  const del = document.createElement('input');
+  del.type = 'checkbox'; del.checked = s.deleted;
+  del.onchange = () => { s.deleted = del.checked; card.classList.toggle('deleted', del.checked); markDirty(); };
+  delLabel.appendChild(del);
+  delLabel.appendChild(document.createTextNode(' 删除'));
+  meta.appendChild(delLabel);
+
+  card.appendChild(meta);
+
+  const ta = document.createElement('textarea');
+  ta.value = s.content;
+  ta.oninput = () => { s.content = ta.value; markDirty(); };
+  card.appendChild(ta);
+
+  return card;
+}
+
+function parentCard(parent) {
+  const card = h('div', 'parent');
+  card.dataset.title = parent.title;
+
+  const head = h('div', 'head');
+  head.appendChild(h('span', 'caret', '▸'));
+  head.appendChild(h('b', '', parent.title));
+  head.appendChild(h('span', 'meta',
+    `L${parent.level} · p${parent.pdf_page_start}-${parent.pdf_page_end} · ${parent.child_count} 子块`));
+
+  const pdel = h('label', 'meta');
+  const del = document.createElement('input');
+  del.type = 'checkbox';
+  del.checked = STATE[parent.chunk_index].deleted;
+  del.onclick = e => e.stopPropagation();
+  del.onchange = () => {
+    STATE[parent.chunk_index].deleted = del.checked;
+    card.classList.toggle('deleted', del.checked);
+    markDirty();
+  };
+  pdel.appendChild(del);
+  pdel.appendChild(document.createTextNode(' 删整个父块'));
+  head.appendChild(pdel);
+
+  head.onclick = () => card.classList.toggle('open');
+  card.appendChild(head);
+
+  const body = h('div', 'body');
+  const ptext = h('div', 'parenttext');
+  ptext.dataset.parent = parent.chunk_index;
+  ptext.textContent = parentText(parent);
+  body.appendChild(ptext);
+  for (const c of childrenOf(parent.chunk_index)) body.appendChild(childCard(c));
+  card.appendChild(body);
+
+  if (del.checked) card.classList.add('deleted');
+  return card;
+}
+
+function render() {
+  list.innerHTML = '';
+  if (!MANIFEST) return;
+  const q = document.getElementById('q').value.trim();
+  for (const parent of MANIFEST.parents) {
+    const card = parentCard(parent);
+    if (q) {
+      const kids = childrenOf(parent.chunk_index);
+      const hit = parent.title.includes(q) ||
+        kids.some(c => STATE[c.chunk_index].content.includes(q));
+      card.style.display = hit ? '' : 'none';
+      if (hit && !parent.title.includes(q)) card.classList.add('open');
+    }
+    list.appendChild(card);
+  }
+  updateStat();
+}
+
+document.getElementById('dir').addEventListener('change', e => {
+  const files = Array.from(e.target.files || []);
+  const manifest = files.find(f => f.name === 'manifest.json');
+  if (!manifest) {
+    stat.textContent = '这个目录里没有 manifest.json —— 要选导出目录，不是分页源目录';
+    return;
+  }
+  manifest.text().then(text => {
+    MANIFEST = JSON.parse(text);
+    STATE = {};
+    for (const c of MANIFEST.chunks) {
+      STATE[c.chunk_index] = {content: c.content, status: 'unreviewed', deleted: false};
+    }
+    render();
+  });
+});
+
+document.getElementById('q').addEventListener('input', render);
+document.getElementById('expandAll').onclick = () =>
+  document.querySelectorAll('.parent').forEach(p => p.classList.add('open'));
+document.getElementById('collapseAll').onclick = () =>
+  document.querySelectorAll('.parent').forEach(p => p.classList.remove('open'));
+
+document.getElementById('export').onclick = () => {
+  if (!MANIFEST) { alert('先选一个输出目录'); return; }
+  const chunks = MANIFEST.chunks.map(c => {
+    const s = STATE[c.chunk_index];
+    const isParent = !!c.is_parent;
+    return {
+      chunk_index: c.chunk_index,
+      is_parent: isParent,
+      parent_chunk_index: c.parent_chunk_index,
+      section_code: c.section_code,
+      title: c.title,
+      level: c.level,
+      pdf_page_start: c.pdf_page_start,
+      pdf_page_end: c.pdf_page_end,
+      knowledge_type: c.knowledge_type,
+      original_content: c.content,
+      content: isParent ? parentText(MANIFEST.parents.find(p => p.chunk_index === c.chunk_index)) : s.content,
+      review_status: s.status,
+      deleted: s.deleted,
+    };
+  });
+  const data = {
+    source_id: MANIFEST.source_id,
+    pdf: MANIFEST.pdf,
+    total_pages: MANIFEST.total_pages || (MANIFEST.counts && MANIFEST.counts.pages) || 0,
+    generated_at: new Date().toISOString(),
+    parents: MANIFEST.parents,
+    chunks: chunks,
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type: 'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'confirmed_chunks.json';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+</script>
+</body>
+</html>

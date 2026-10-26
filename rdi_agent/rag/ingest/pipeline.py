@@ -35,8 +35,8 @@ from rdi_agent.db.engine import session_scope
 from rdi_agent.db.models import BookSection, KnowledgeChunk, KnowledgeSource
 from rdi_agent.rag.ingest import chunk as chunker
 from rdi_agent.rag import search as search_mod
-from rdi_agent.rag.ingest import embeddings, parse_md, review, sections_zh
-from rdi_agent.rag.ingest.sections import Section, SectionMap
+from rdi_agent.rag.ingest import confirmed, embeddings, parse_md, review
+from rdi_agent.rag.ingest.sections import SectionMap
 
 SOURCE_ID = "guideline2026"
 SOURCE_TITLE = "孤独症谱系障碍儿童干预康复指南（2026 年版）"
@@ -119,42 +119,10 @@ def _dir_hash(directory: Path) -> str:
     return h.hexdigest()
 
 
-def _section_pages(
-    section_map: SectionMap,
-    blocks: list[parse_md.Block],
-) -> list[tuple[Section, list[tuple[int, str]]]]:
-    """把正文块按章节归位。
-
-    **按块归，不按页归**：指南的一页里可能有多个标题（第 3 页同时有
-    "三、干预康复内容"和两个"（一）（二）"），按页归会把一页里
-    不同章节的内容混在一起 —— 章节名和正文对不上，引用会指错地方。
-
-    **表格行各自成段**：附件 1–4 全是宽表格，**一行就是一条完整的
-    干预要点**（"年龄 → 干预目标 → 干预内容 → 干预重点"）。
-    如果把整张表当成连续段落，子块会把 7 条策略（正强化 / 负强化 /
-    消退 / 负惩罚 / 辅助 / 反应中断 / 差别强化）挤进同一个块 ——
-    问"孩子做对了怎么奖励"时，这个大块和讲挑战性行为的块竞争，
-    正确的答案挤不进前 5 名。
-
-    所以这里把表格行用 ``\\n\\n`` 分隔 —— 切块器按空行分段，
-    表格行就成了独立的段落。
-    """
-    grouped = sections_zh.assign_blocks(blocks, section_map)
-    result: list[tuple[Section, list[tuple[int, str]]]] = []
-    for section, items in grouped:
-        parts: list[tuple[int, str]] = []
-        for page, text in items:
-            # 表格行已经在 parse_blocks 里是独立的 Block，
-            # 这里只要把同一页的多个块用空行连起来，让切块器能分开它们。
-            parts.append((page, text))
-        result.append((section, parts))
-    return result
-
-
 async def write_to_db(
     *,
     source: KnowledgeSource,
-    section_map: sections.SectionMap,
+    section_map: SectionMap,
     chunks: list[chunker.Chunk],
     vectors: list[list[float]] | None,
     marks: dict[int, str] | None = None,
@@ -292,7 +260,6 @@ async def run(
     *,
     md_dir: str | Path,
     source_id: str = SOURCE_ID,
-    rebuild_sections: bool = False,
     do_embed: bool = True,
     embed_input: str = EMBED_INPUT_NORMALIZED,
 ) -> IngestResult:
@@ -314,43 +281,30 @@ async def run(
     for page_no, raw in parse_md.read_raw_pages(md_dir):
         blocks.extend(parse_md.parse_blocks(raw, page_no))
 
-    # ---- 3. 章节树（人工改过就沿用）----
-    section_map_path = index_dir / "section_map.json"
-    section_map = None if rebuild_sections else sections_zh.load_section_map(
-        section_map_path
-    )
-    if section_map is None:
-        section_map = sections_zh.build_sections_zh(
-            blocks,
-            source_id=source_id,
-            total_pages=len(page_records),
-            pdf=str(md_dir),
-        )
-        sections_zh.write_section_map(section_map, section_map_path)
+    # ---- 3. 跨页续接合并 ----
+    #
+    # 扫描件的分页是按物理页切的，段落会被页边界切开
+    # （page_003 结尾 "…应结合儿童"，page_004 开头 "的发展水平和兴趣…"）。
+    # 每页最后一段不以句末标点收尾的，跟下一页第一段并成一段。
+    blocks, merged_page_breaks = parse_md.merge_page_breaks(blocks)
 
-    # ---- 4. 切块 ----
-    chunks: list[chunker.Chunk] = []
-    index = 0
-    for section, pages in _section_pages(section_map, blocks):
-        # 附件：指南的"附件 1–4"都是宽表格（不同年龄的干预要点、
-        # 行为干预策略、挑战性行为要点、共存问题要点）——
-        # 这部分是家长最用得上的实操内容。
-        #
-        # **表格行各自成块**（``atomic_items=True``）：一行就是一条完整的
-        # 干预要点。按字数攒子块的话，7 条策略会挤进同一个 543 字的块，
-        # 问"孩子做对了要怎么奖励"时正确��案挤不进前 5 名。
-        in_appendix = section.title.startswith("附件")
-        produced = chunker.chunk_section(
-            section_code=section.section_code,
-            section_title=section.title,
-            pages=pages,
-            in_appendix=in_appendix,
-            start_index=index,
-            language=SOURCE_LANGUAGE,
-            atomic_items=in_appendix,
-        )
-        chunks.extend(produced)
-        index += len(produced)
+    # ---- 4. 切块（父块=标题段，子块=一行一段）----
+    section_map, chunks = chunker.chunk_document(
+        blocks,
+        source_id=source_id,
+        pdf=str(md_dir),
+        total_pages=len(page_records),
+        language=SOURCE_LANGUAGE,
+    )
+
+    # 人工在网页上确认过的结果（改文本 / 删块 / 标记）在这里回填。
+    # 存在 sidecar 文件里，所以重建索引不会把人工确认冲掉。
+    confirmed_file = confirmed.load_confirmed(
+        index_dir / confirmed.CONFIRMED_FILE_NAME
+    )
+    chunks, confirmed_marks, confirmed_stats = confirmed.apply_confirmed(
+        chunks, confirmed_file
+    )
 
     # ---- 5. 向量化 ----
     vectors: list[list[float]] | None = None
@@ -371,6 +325,8 @@ async def run(
     review_file = review.load_review_file(index_dir / review.REVIEW_FILE_NAME)
     marks_applied = review.apply_marks_to_chunks(chunks, review_file)
     stale_marks = review.unmatched_marks(chunks, review_file)
+    # 网页上人工标的标记优先（那是最新的确认）
+    marks_applied.update(confirmed_marks)
     source = KnowledgeSource(
         source_id=source_id,
         source_type="guideline",
@@ -439,10 +395,16 @@ async def run(
             "stale": stale_marks,
         },
         "chunker": {
-            "parent_target_chars": chunker.PARENT_TARGET_CHARS,
-            "child_target_chars": chunker.CHILD_TARGET_CHARS,
-            "child_overlap_chars": chunker.CHILD_OVERLAP_CHARS,
+            "rule": "parent=heading, child=one line, <br> splits, page tail merges",
             "language": SOURCE_LANGUAGE,
+        },
+        "merged_page_breaks": merged_page_breaks,
+        "confirmed": {
+            "file": confirmed.CONFIRMED_FILE_NAME,
+            "applied": confirmed_stats.get("applied", 0),
+            "edited": confirmed_stats.get("edited", 0),
+            "deleted": confirmed_stats.get("deleted", 0),
+            "unmatched": confirmed_stats.get("unmatched", []),
         },
         "rights_status": RIGHTS_STATUS,
     }
@@ -474,11 +436,6 @@ def main() -> None:
     )
     parser.add_argument("--source-id", default=SOURCE_ID)
     parser.add_argument(
-        "--rebuild-sections",
-        action="store_true",
-        help="重新生成 section_map.json（会丢掉人工改过的边界）",
-    )
-    parser.add_argument(
         "--no-embed", action="store_true", help="只切块不向量化（调试用）"
     )
     parser.add_argument(
@@ -496,7 +453,6 @@ def main() -> None:
         run(
             md_dir=args.md_dir,
             source_id=args.source_id,
-            rebuild_sections=args.rebuild_sections,
             do_embed=not args.no_embed,
             embed_input=args.embed_input,
         )

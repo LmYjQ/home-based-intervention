@@ -1,6 +1,7 @@
 .PHONY: install db-up db-down migrate test dev demo feedback ingest ingest-no-embed \
-        ingest-sections concepts search eval health clean \
+        concepts search eval health clean \
         review-export review-mark review-apply review-list \
+        chunks-export chunks-view chunks-import \
         web web-install \
         drop-old-book ocr run-log
 
@@ -64,10 +65,24 @@ ingest:
 ingest-no-embed:
 	$(PY) -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026 --no-embed
 
-# 重新生成章节树（会丢掉人工改过的边界）
-ingest-sections:
-	$(PY) -m rdi_agent.rag.ingest.pipeline --md-dir data/ocr/guideline2026 \
-		--rebuild-sections --no-embed
+# ---- 切块观察 / 导入 ----
+#
+# 切分结果先导出到本地目录，用 tools/chunk_browser.html 看一眼
+# （默认只显示父块，展开看子块），改完文本 / 标状态 / 删块之后
+# 导出 confirmed_chunks.json，再 make chunks-import 写回库。
+
+# 导出切分结果（不连库、不调 embedding，纯离线）
+chunks-export:
+	$(PY) -m tools.export_chunks --md-dir data/ocr/guideline2026 \
+		--out $(or $(OUT),data/index/chunk_preview)
+
+# 打开观察网页（选 chunks-export 出来的目录）
+chunks-view:
+	open tools/chunk_browser.html
+
+# 一键导入确认结果（标记 + 改文本 + 删块）
+chunks-import:
+	$(PY) -m tools.import_chunks --file $(or $(FILE),data/index/confirmed_chunks.json)
 
 # 写入核心术语表（中文口语 -> 指南里的规范术语）
 concepts:
