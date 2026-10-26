@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat)",
+      "Bash(.venv/bin/python /tmp/patch_cli.py)",
+      "Bash(.venv/bin/python -c \"import rdi_agent.cli, rdi_agent.api.conversations; print\\('import ok'\\)\")",
+      "Bash(.venv/bin/pytest -q)"
+    ]
+  }
+}

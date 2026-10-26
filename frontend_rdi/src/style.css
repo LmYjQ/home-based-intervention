@@ -1,0 +1,165 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1e222b;
+  --line: #2a2f3a;
+  --fg: #e6e8ee;
+  --fg-dim: #99a0b0;
+  --accent: #6ea8fe;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --err: #f87171;
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+button {
+  font-family: inherit;
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--fg);
+  cursor: pointer;
+}
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
+
+input, textarea {
+  font-family: inherit;
+  font-size: 13px;
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: #0c0e13;
+  color: var(--fg);
+}
+textarea { resize: vertical; min-height: 64px; }
+
+pre {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 340px;
+  overflow: auto;
+}
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; }
+h3 { font-size: 14px; }
+h4 { font-size: 13px; color: var(--fg-dim); }
+
+.app { max-width: 1180px; margin: 0 auto; padding: 20px 20px 80px; }
+
+.topbar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--line);
+}
+.topbar h1 { font-size: 16px; }
+.spacer { flex: 1; }
+
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 20px;
+  font-size: 11px; border: 1px solid var(--line); background: var(--panel-2);
+  color: var(--fg-dim); white-space: nowrap;
+}
+.badge.ok { color: var(--ok); border-color: #24503a; background: #12241a; }
+.badge.warn { color: var(--warn); border-color: #56451c; background: #241d10; }
+.badge.err { color: var(--err); border-color: #5c2a2a; background: #261414; }
+.badge.accent { color: var(--accent); border-color: #274570; background: #101c2e; }
+
+.cols { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 14px; margin-bottom: 14px;
+}
+.card > header { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+
+.field { margin-bottom: 10px; }
+.field label { display: block; font-size: 12px; color: var(--fg-dim); margin-bottom: 4px; }
+
+.msgs { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.msg { border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; }
+.msg.user { background: #14243b; border: 1px solid #274570; }
+.msg.bot { background: var(--panel-2); border: 1px solid var(--line); }
+.msg .who { font-size: 11px; color: var(--fg-dim); margin-bottom: 4px; }
+
+/* 进度条（方案 A）。
+ *
+ * 显示的是**走过的步骤**，不是转圈动画 ——
+ * 家长看到"正在检索指南"比看到一个转圈的圆有用得多：
+ * 他知道系统在干什么，也知道没卡死。
+ */
+.progress {
+  border: 1px solid var(--line); background: var(--panel-2);
+  border-radius: 10px; padding: 10px 12px; margin-bottom: 12px;
+}
+.prog-step {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12.5px; color: var(--fg-dim); padding: 2px 0;
+}
+.prog-step.last { color: var(--fg); }
+.prog-step .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--fg-dim); flex: none;
+}
+.prog-step.last .dot {
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .45; transform: scale(.8); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .prog-step.last .dot { animation: none; }
+}
+
+.plan {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 13px; margin-bottom: 12px; background: var(--panel-2);
+}
+.plan.rec { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(110,168,254,.25); }
+.plan h4 { color: var(--fg); margin-bottom: 8px; }
+.plan section { margin-top: 10px; }
+.plan ul { margin: 4px 0 0; padding-left: 18px; }
+.plan li { margin-bottom: 3px; }
+
+.err-box {
+  border: 1px solid #5c2a2a; background: #261414; color: #fecaca;
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+  white-space: pre-wrap; font-size: 12.5px;
+}
+.notice {
+  border: 1px solid #56451c; background: #241d10; color: #fde68a;
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 12.5px;
+}
+
+details { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+details > summary { cursor: pointer; font-size: 12px; color: var(--fg-dim); }
+details[open] > summary { margin-bottom: 8px; }
+
+.kv { display: grid; grid-template-columns: 110px 1fr; gap: 4px 10px; font-size: 12.5px; }
+.kv dt { color: var(--fg-dim); }
+.kv dd { margin: 0; }
+
+.muted { color: var(--fg-dim); }
+.small { font-size: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }

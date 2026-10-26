@@ -1,0 +1,29 @@
+# 迁移 Job：必须先于 Deployment rollout 完成。
+# 用法：
+#   kubectl apply -f deploy/k8s/
+#   kubectl wait --for=condition=complete job/rdi-agent-migrate --timeout=300s
+#   kubectl apply -f deploy/k8s/deployment.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rdi-agent-migrate
+  labels:
+    app: rdi-agent
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: rdi-agent
+        role: migrate
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: rdi-agent:latest
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef:
+                name: rdi-agent-config
+            - secretRef:
+                name: rdi-agent-secrets

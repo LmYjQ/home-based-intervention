@@ -1,0 +1,245 @@
+{
+  "source_id": "guideline2026",
+  "pdf": "/Users/qiyusama/Documents/code/ganyu/data/ocr/guideline2026",
+  "total_pages": 25,
+  "notes": [
+    "一、干预康复目的(p1) 与下一条同页，区间按 1 页计",
+    "（一）健康教育(p3) 与下一条同页，区间按 1 页计",
+    "（七）心理治疗(p11) 与下一条同页，区间按 1 页计",
+    "（九）随访(p12) 与下一条同页，区间按 1 页计",
+    "（二）干预康复人员(p13) 与下一条同页，区间按 1 页计"
+  ],
+  "sections": [
+    {
+      "section_code": "000_干预康复目的",
+      "title": "一、干预康复目的",
+      "toc_level": 1,
+      "pdf_page_start": 1,
+      "pdf_page_end": 1,
+      "order": 0,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "干预康复目的"
+    },
+    {
+      "section_code": "001_干预康复基本原则",
+      "title": "二、干预康复基本原则",
+      "toc_level": 1,
+      "pdf_page_start": 1,
+      "pdf_page_end": 2,
+      "order": 1,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "干预康复基本原则"
+    },
+    {
+      "section_code": "002_干预康复内容",
+      "title": "三、干预康复内容",
+      "toc_level": 1,
+      "pdf_page_start": 3,
+      "pdf_page_end": 11,
+      "order": 2,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "干预康复内容"
+    },
+    {
+      "section_code": "003_健康教育",
+      "title": "（一）健康教育",
+      "toc_level": 2,
+      "pdf_page_start": 3,
+      "pdf_page_end": 3,
+      "order": 3,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "健康教育"
+    },
+    {
+      "section_code": "004_针对缺陷行为的干预康复",
+      "title": "（二）针对缺陷行为的干预康复",
+      "toc_level": 2,
+      "pdf_page_start": 3,
+      "pdf_page_end": 5,
+      "order": 4,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "针对缺陷行为的干预康复"
+    },
+    {
+      "section_code": "005_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预",
+      "title": "（三）针对非适应性、非功能性的局限兴趣和重复刻板行为的干预",
+      "toc_level": 2,
+      "pdf_page_start": 6,
+      "pdf_page_end": 6,
+      "order": 5,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "针对非适应性、非功能性的局限兴趣和重复刻板行为的干预"
+    },
+    {
+      "section_code": "006_针对挑战性行为的干预",
+      "title": "（四）针对挑战性行为的干预",
+      "toc_level": 2,
+      "pdf_page_start": 7,
+      "pdf_page_end": 8,
+      "order": 6,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "针对挑战性行为的干预"
+    },
+    {
+      "section_code": "007_共存问题和共患病干预",
+      "title": "（五）共存问题和共患病干预",
+      "toc_level": 2,
+      "pdf_page_start": 9,
+      "pdf_page_end": 9,
+      "order": 7,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "共存问题和共患病干预"
+    },
+    {
+      "section_code": "008_家庭干预",
+      "title": "（六）家庭干预",
+      "toc_level": 2,
+      "pdf_page_start": 10,
+      "pdf_page_end": 10,
+      "order": 8,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "家庭干预"
+    },
+    {
+      "section_code": "009_心理治疗",
+      "title": "（七）心理治疗",
+      "toc_level": 2,
+      "pdf_page_start": 11,
+      "pdf_page_end": 11,
+      "order": 9,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "心理治疗"
+    },
+    {
+      "section_code": "010_数智干预康复",
+      "title": "（八）数智干预康复",
+      "toc_level": 2,
+      "pdf_page_start": 11,
+      "pdf_page_end": 11,
+      "order": 10,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "数智干预康复"
+    },
+    {
+      "section_code": "011_随访",
+      "title": "（九）随访",
+      "toc_level": 2,
+      "pdf_page_start": 12,
+      "pdf_page_end": 12,
+      "order": 11,
+      "parent_code": "002_干预康复内容",
+      "note": null,
+      "title_zh": "随访"
+    },
+    {
+      "section_code": "012_干预康复场地和人员",
+      "title": "四、干预康复场地和人员",
+      "toc_level": 1,
+      "pdf_page_start": 12,
+      "pdf_page_end": 12,
+      "order": 12,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "干预康复场地和人员"
+    },
+    {
+      "section_code": "013_干预康复场地",
+      "title": "（一）干预康复场地",
+      "toc_level": 2,
+      "pdf_page_start": 12,
+      "pdf_page_end": 12,
+      "order": 13,
+      "parent_code": "012_干预康复场地和人员",
+      "note": null,
+      "title_zh": "干预康复场地"
+    },
+    {
+      "section_code": "014_干预康复人员",
+      "title": "（二）干预康复人员",
+      "toc_level": 2,
+      "pdf_page_start": 13,
+      "pdf_page_end": 13,
+      "order": 14,
+      "parent_code": "012_干预康复场地和人员",
+      "note": null,
+      "title_zh": "干预康复人员"
+    },
+    {
+      "section_code": "015_质量控制",
+      "title": "五、质量控制",
+      "toc_level": 1,
+      "pdf_page_start": 13,
+      "pdf_page_end": 13,
+      "order": 15,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "质量控制"
+    },
+    {
+      "section_code": "016_名词解释",
+      "title": "六、名词解释",
+      "toc_level": 1,
+      "pdf_page_start": 14,
+      "pdf_page_end": 15,
+      "order": 16,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "名词解释"
+    },
+    {
+      "section_code": "017_不同年龄和能力水平的孤独症儿童干预要点",
+      "title": "附件 1 不同年龄和能力水平的孤独症儿童干预要点",
+      "toc_level": 1,
+      "pdf_page_start": 16,
+      "pdf_page_end": 19,
+      "order": 17,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "不同年龄和能力水平的孤独症儿童干预要点"
+    },
+    {
+      "section_code": "018_常用于孤独症儿童的行为干预策略",
+      "title": "附件 2 常用于孤独症儿童的行为干预策略",
+      "toc_level": 1,
+      "pdf_page_start": 20,
+      "pdf_page_end": 20,
+      "order": 18,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "常用于孤独症儿童的行为干预策略"
+    },
+    {
+      "section_code": "019_挑战性行为干预要点",
+      "title": "附件 3 挑战性行为干预要点",
+      "toc_level": 1,
+      "pdf_page_start": 21,
+      "pdf_page_end": 23,
+      "order": 19,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "挑战性行为干预要点"
+    },
+    {
+      "section_code": "020_常见共存问题干预要点",
+      "title": "附件 4 常见共存问题干预要点",
+      "toc_level": 1,
+      "pdf_page_start": 24,
+      "pdf_page_end": 25,
+      "order": 20,
+      "parent_code": null,
+      "note": null,
+      "title_zh": "常见共存问题干预要点"
+    }
+  ]
+}

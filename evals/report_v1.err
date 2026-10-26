@@ -1,0 +1,3 @@
+配置：top_k=5 candidate_k=30 vector=True rerank=False parent=True
+
+完整记录：evals/report_v1.json

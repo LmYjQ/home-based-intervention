@@ -1,0 +1,123 @@
+// 全项目唯一的 fetch 出口。组件里不出现 URL 字面量。
+//
+// ★ 这里刻意不做任何业务计算：
+//   quality 由后端 feedback.quality_for() 算好后返回，前端只显示。
+//   前端再算一遍就出现了第二套口径，而状态机的升级闸门拿平均 quality
+//   比 0.5 / 0.75 —— 两套口径必然打架（阶段 4b 的坑）。
+
+const BASE = ''   // 走 vite proxy，同源，不需要处理 CORS
+
+async function req(path, opts = {}) {
+  const res = await fetch(BASE + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  })
+  if (!res.ok) {
+    let detail = res.statusText
+    try { detail = (await res.json()).detail || detail } catch { /* 非 JSON 错误体 */ }
+    throw new Error(detail)
+  }
+  return res.json()
+}
+
+export const api = {
+  health: () => req('/api/health'),
+  setNoLlm: (no_llm) => req(`/api/config?no_llm=${no_llm}`, { method: 'POST' }),
+
+  state: (cid) => req(`/api/state/${cid}`),
+  profile: (body) => req('/api/profile', { method: 'POST', body: JSON.stringify(body) }),
+  // 慢路径，走 job + SSE。force=true 让后端忽略已生成的那份重新排。
+  card: (body) => req('/api/card', { method: 'POST', body: JSON.stringify(body) }),
+
+  feedbacks: (body) => req('/api/feedbacks', { method: 'POST', body: JSON.stringify(body) }),
+  close: (cid, on) => req(`/api/close/${cid}?on=${on}`, { method: 'POST' }),
+  summaries: (cid) => req(`/api/summaries/${cid}`),
+  progress: (cid) => req(`/api/progress/${cid}`),
+  transitions: (cid, item) =>
+    req(`/api/transitions/${cid}${item ? `?skill_item=${encodeURIComponent(item)}` : ''}`),
+
+  // ---- 观察链（Phase 1）----
+  // ★ run / resume 是**两阶段**：run 可能返回 phase:"clarify"（图停在
+  //   interrupt 上等家长回答），那不是错误是正常结果，要再调 resume。
+  //   两者的连续性靠 (child_id, date) → thread_id，不靠 job_id ——
+  //   前端不持有任何 interrupt 状态，那是服务端的事（刷新就没了）。
+  observeRun: (body) => req('/api/observe/run', { method: 'POST', body: JSON.stringify(body) }),
+  observeResume: (body) =>
+    req('/api/observe/resume', { method: 'POST', body: JSON.stringify(body) }),
+  // 刷新页面后靠它知道「还有个问题没答」—— 纯读 checkpoint，毫秒级
+  observeStatus: (cid, date) =>
+    req(`/api/observe/status?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+
+  // 草稿（存服务端 checkpoint，不是 localStorage）
+  draftGet: (cid, date) =>
+    req(`/api/draft?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+  draftPut: (body) => req('/api/draft', { method: 'PUT', body: JSON.stringify(body) }),
+  draftDelete: (cid, date) =>
+    req(`/api/draft?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`,
+        { method: 'DELETE' }),
+
+  // ---- 红旗（Phase 2）----
+  // ★ 返回的 `paused` 直接用后端给的，**不要在前端从 flags 推** ——
+  //   后端那个定义（存在 urgent 且未关闭）是 Phase 3 生成计划时读的同一条查询，
+  //   两套口径必然打架，而打架的后果是"横幅说暂停着、计划照生成"。
+  redFlags: (cid, status) =>
+    req(`/api/redflags?child_id=${encodeURIComponent(cid)}` +
+        (status ? `&status=${encodeURIComponent(status)}` : '')),
+  // 只发**目标状态**，能不能转由后端判（closed → acknowledged 会 409）。
+  redFlagSetStatus: (cid, id, status) =>
+    req(`/api/redflags/${id}/status?child_id=${encodeURIComponent(cid)}`,
+        { method: 'PATCH', body: JSON.stringify({ status }) }),
+
+  // ---- 计划链（Phase 3）----
+  // ★ 计划链**不是慢路径**（全程纯 Python 检索 + 装箱，零 LLM），
+  //   所以直接 req，不用 job + SSE。
+  //   run 可能返回 phase:"review"（图停在 ⚡ 审批 interrupt 上等家长），
+  //   那不是错误是正常结果 —— 与观察链的 clarify 同款的两阶段协议。
+  planRun: (body) => req('/api/plan/run', { method: 'POST', body: JSON.stringify(body) }),
+  planReview: (body) =>
+    req('/api/plan/review', { method: 'POST', body: JSON.stringify(body) }),
+  // 刷新页面后靠它知道「还有个计划等你批」—— 纯读 checkpoint，毫秒级
+  planStatus: (cid, date) =>
+    req(`/api/plan/status?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+  planVersions: (cid, date) =>
+    req(`/api/plan/versions?child_id=${encodeURIComponent(cid)}&date=${encodeURIComponent(date)}`),
+
+  // ---- 案例（阶段 2）----
+  // ★ 与观察链同款的两阶段协议：建案例 / 补充描述可能返回 phase="clarify"
+  //   （图停在 ⚡ interrupt 上等家长回答），那不是错误是正常结果。
+  //   连续性靠 case_id（→ thread_id），不靠 job_id。
+  caseCreate: (body) => req('/api/cases', { method: 'POST', body: JSON.stringify(body) }),
+  caseMessage: (cid, body) =>
+    req(`/api/cases/${encodeURIComponent(cid)}/messages`, { method: 'POST', body: JSON.stringify(body) }),
+  caseClarify: (cid, body) =>
+    req(`/api/cases/${encodeURIComponent(cid)}/clarify`, { method: 'POST', body: JSON.stringify(body) }),
+  caseGet: (cid) => req(`/api/cases/${encodeURIComponent(cid)}`),
+  caseList: (cid) => req(`/api/cases?child_id=${encodeURIComponent(cid)}`),
+  caseHistory: (cid) => req(`/api/cases/${encodeURIComponent(cid)}/history`),
+}
+
+// ★ 慢路径统一走 SSE。两条慢路径（建档 18-47s、出卡片 30-45s）共用这一份。
+//   返回 {steps, result, error}；onStep 每次收到一行进度就调一次。
+export function streamJob(jobId, onStep) {
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(`/api/jobs/${jobId}/stream`)
+    let last = null
+    es.onmessage = (ev) => {
+      const d = JSON.parse(ev.data)
+      if (d.text) onStep?.(d)
+      if (d.status && d.status !== 'running') {
+        last = d
+        es.close()
+        if (d.status === 'error') reject(new Error(d.error))
+        else resolve(d)
+      }
+    }
+    es.onerror = () => { es.close(); reject(new Error('SSE 断了（服务器可能重启）')) }
+  })
+}
+
+// 建档 → job_id → SSE 的两步合起来
+export async function runJob(path, body, onStep) {
+  const { job_id } = await req(path, { method: 'POST', body: JSON.stringify(body) })
+  return streamJob(job_id, onStep)
+}

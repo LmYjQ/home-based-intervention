@@ -1,0 +1,39 @@
+# 索引 Job：书籍入库（阶段 2A 用）。
+# 依赖对象存储里的 PDF，或先挂 PVC 放文档；跑完不占常驻资源。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rdi-agent-ingest
+  labels:
+    app: rdi-agent
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: rdi-agent
+        role: ingest
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: ingest
+          image: rdi-agent:latest
+          command:
+            - python
+            - -m
+            - rdi_agent.rag.ingest.pipeline
+            - --pdf
+            - /data/documents/the_rdi_book.pdf
+          volumeMounts:
+            - name: documents
+              mountPath: /data/documents
+              readOnly: true
+          envFrom:
+            - configMapRef:
+                name: rdi-agent-config
+            - secretRef:
+                name: rdi-agent-secrets
+      volumes:
+        - name: documents
+          persistentVolumeClaim:
+            claimName: rdi-documents
