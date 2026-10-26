@@ -23,6 +23,7 @@ from rdi_agent.graph.citations import (
     translate_short_ids,
     validate_cards,
 )
+from rdi_agent.graph.nodes.interrupt_utils import build_asked_qa, unpack_resume
 from rdi_agent.graph.state import CoachState
 from rdi_agent.prompts import chat as P
 from rdi_agent.schemas.case import CaseSummary
@@ -36,15 +37,26 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 
 # 追问到第几轮就强制收手。
 #
-# **只有一轮**（2026-10-25 改，原值 3）。
+# **两轮**（2026-10-26 改，原值 1）。
 #
-# 一轮 = 最多 3 个问题，家长**一起答完**，然后就强制进下一步（出方案）。
-# 原来允许 3 轮，实践下来两个后果：
-#   1. 家长答完第一轮，模型很可能把"没答上来"当成"还没问过"，
-#      于是把同一个问题换个说法再问一遍（实测就是"在幼儿园是否有不愉快的经历"
-#      连问两次）；
-#   2. 家长体验上是"填表"而不是"咨询"—— 计划 §"过度追问"那条
-#      明确说"家长感觉在填量表"是要防的。
+# 一轮 = 最多 3 个问题，家长**一起答完**，然后进下一轮判断。
+#
+# **为什么从 1 调回 2**：两轮够把场景补全（第一轮问"发生了什么"，
+# 第二轮问"具体什么样"），又不至于变成填表。
+#
+# **重复提问不是靠轮数上限解决的**（2026-10-26 修）——
+# 之前把轮数压到 1 只是把症状盖住了。真正的根因是**模型看不到
+# "问过的问题和家长的答案"**：
+#
+#   - 只有问题列表时，模型分不清"这件事问过了"和"问过了但没答上来"，
+#     两种情况它都会再问一遍（实测"孩子在幼儿园的表现和在家相比
+#     有没有什么不同"被问了两遍，第二次换个说法）。
+#   - 家长答了"换过老师"，模型不知道这个答案对不对题，
+#     就继续追着原问题问。
+#
+# 修法是把**问答对**（``asked_qa_pairs``）透传给 prompt，
+# 让模型基于**更新过的信息**往下走：
+# 答了就当问完了（要补就另起新角度），没答上来才换角度重问。
 #
 # 信息不够也要出方案 —— 建议卡里有 uncertainty_notes，方案本身就会标出
 # 哪里不确定，这比多问一轮有用。
@@ -209,7 +221,9 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
     system, user = P.check_sufficiency(
         case_summary=state.get("case_summary") or {},
         followup_rounds=rounds,
+        max_followup_rounds=MAX_FOLLOWUP_ROUNDS,
         asked_questions=list(state.get("asked_questions") or []),
+        asked_qa=list(state.get("asked_qa_pairs") or []),
         child_context=state.get("child_context"),
     )
     decision, trace = await llm.chat_json(
@@ -253,6 +267,7 @@ async def generate_followup(state: CoachState) -> dict[str, Any]:
         priority_questions=decision.get("priority_questions") or [],
         followup_rounds=rounds,
         asked_questions=list(state.get("asked_questions") or []),
+        asked_qa=list(state.get("asked_qa_pairs") or []),
         child_context=state.get("child_context"),
     )
     result, trace = await llm.chat_json(
@@ -287,37 +302,6 @@ def route_after_followup(state: CoachState) -> str:
     return "await_user_answer"
 
 
-def _unpack_resume(value: Any) -> tuple[str, list[dict[str, str]]]:
-    """把恢复值拆成 (给模型看的文本, 结构化的问答对)。
-
-    **为什么要结构化**：恢复值光是一段文本的话，"哪句回答的是哪道题"
-    就只能靠模型猜。实测模型会把整段问答丢掉 ——
-    家长明确答了"没有不愉快的经历"，抽出来的 ``observed_facts``
-    里还是只有开场白那句话，于是下一轮它以为这件事没问过，又问了一遍。
-
-    问答对走结构化通道（``followup_answers``），由代码确定性地并进
-    ``case_summary``，不指望模型抽。
-    """
-    if isinstance(value, dict):
-        text = str(value.get("text") or "")
-        raw_answers = value.get("answers") or []
-    elif isinstance(value, list):  # 老形状：家长直接发数组回来
-        return "\n".join(str(x) for x in value), []
-    else:
-        return str(value), []
-
-    answers: list[dict[str, str]] = []
-    for item in raw_answers:
-        if not isinstance(item, dict):
-            continue
-        question = str(item.get("question") or "").strip()
-        answer = str(item.get("answer") or "").strip()
-        if not answer:
-            continue
-        answers.append({"question": question, "answer": answer})
-    return text, answers
-
-
 async def await_user_answer(state: CoachState) -> dict[str, Any]:
     """中断点一：等家长回答追问。
 
@@ -329,18 +313,26 @@ async def await_user_answer(state: CoachState) -> dict[str, Any]:
     # 实际上问题早就好了，只是在等**人**回答。
     progress.emit("await_answer")
     answer = interrupt({"kind": "followup", "questions": state.get("followup_questions", [])})
-    text, answers = _unpack_resume(answer)
+    text, answers = unpack_resume(answer)
     # 记下这一轮问过的问题 —— 下一轮生成问题时要把它们排掉。
     asked = list(state.get("asked_questions") or [])
     for item in state.get("followup_questions") or []:
         question = str(item.get("question") or "").strip()
         if question and question not in asked:
             asked.append(question)
+    # 问过什么 + 家长答了什么，成对累积。
+    #
+    # **为什么要成对**：只给问题列表，模型分不清"问过了"和"问过了没答上来"，
+    # 两种都会再问一遍（实测"在园和在家表现有没有不同"被问了两遍）。
+    # 给了答案，模型才知道该基于新信息往下走，而不是把原问题换个说法重问。
+    asked_qa = list(state.get("asked_qa_pairs") or [])
+    asked_qa.extend(build_asked_qa(state.get("followup_questions") or [], answers))
     return {
         "user_message": text,
         "followup_answers": answers,
         "followup_questions": [],
         "asked_questions": asked,
+        "asked_qa_pairs": asked_qa,
         # route_override 是 generate_followup 留下的路由提示。
         # 家长已经答完了，这一轮不追问 —— 清掉它，
         # 免得后面某个节点读到过期的"跳过追问"标记。
@@ -447,6 +439,7 @@ async def _generate_cards(
         evidence=evidence,
         evidence_catalogue=catalogue,
         validation_errors=validation_errors,
+        asked_qa=list(state.get("asked_qa_pairs") or []),
     )
     result, trace = await llm.chat_json(
         system=system,

@@ -68,6 +68,10 @@ STAGE_LABELS: dict[str, str] = {
     "render": "正在整理最终回复",
     "summary_zh": "正在准备段落摘要",
     "feedback_analyze": "正在分析你的反馈",
+    "feedback_followup": "正在准备要问你的问题",
+    "await_feedback_answer": "问题已经好了，等你回答",
+    "feedback_adjustment": "正在根据指南调整这一步",
+    "finalize_feedback": "正在保存这次反馈",
     "next_step": "正在想下一步",
 }
 

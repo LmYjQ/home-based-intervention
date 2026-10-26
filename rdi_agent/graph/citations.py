@@ -439,6 +439,42 @@ def _resolve_short_id(value: str, mapping: dict[str, str]) -> str:
     return text
 
 
+def validate_evidence_notes(
+    notes: list[Any],
+    bundle: EvidenceBundle,
+    *,
+    require_binding: bool = False,
+) -> list[str]:
+    """校验"一段话 + 证据编号"的结构（反馈调整建议用）。
+
+    和片段级引用同一把尺子：编号必须真实存在，提到的指南术语必须
+    出现在**它引用的那条**证据里。返回错误列表。
+    """
+    index = {e.evidence_id: e for e in bundle.evidence}
+    errors: list[str] = []
+    for i, note in enumerate(notes, start=1):
+        text = str(getattr(note, "text", "") or "")
+        ids = list(getattr(note, "evidence_ids", None) or [])
+        errors += _check_fragment(
+            text,
+            ids,
+            index,
+            where=f"调整建议第 {i} 段",
+            require_binding=require_binding,
+        )
+    return errors
+
+
+def resolve_short_ids(
+    values: list[str], mapping: dict[str, str]
+) -> list[str]:
+    """把一组短编号（E1/E2）换成真实 evidence_id。
+
+    给非建议卡的结构用（比如反馈调整建议里的 ``evidence_notes``）。
+    """
+    return [_resolve_short_id(value, mapping) for value in values]
+
+
 def translate_short_ids(
     cards: list[RecommendationCard],
     mapping: dict[str, str],

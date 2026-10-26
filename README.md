@@ -11,11 +11,11 @@
 | 阶段 | 状态 |
 |---|---|
 | 阶段 0 重置与地基 | ✅ 已完成（2026-10-21） |
-| 阶段 1 最小业务闭环 | 🟡 代码完成，待手工验证 |
-| 阶段 2 书籍 RAG（2A/2B/2C） | ⬜ 未开始 |
-| 阶段 3 长期记忆 | ⬜ 未开始 |
-| 阶段 4 反馈与方案迭代 | ⬜ 未开始 |
-| 阶段 5 持久化与调试 | ⬜ 未开始 |
+| 阶段 1 最小业务闭环 | ✅ 已完成（2026-10-22） |
+| 阶段 2 指南 RAG（2A/2B/2C） | 🟡 代码完成；2C 演示路径待手工验收 |
+| 阶段 3 长期记忆 | ✅ 已完成（2026-10-25） |
+| 阶段 4 反馈与方案迭代 | 🟡 代码 + 测试完成，待手工验收 |
+| 阶段 5 持久化与调试 | 🟡 代码 + 测试完成，待手工验收 |
 | 阶段 6 工程化与演示 | ⬜ 未开始 |
 
 **唯一执行文档：[`langgraph_family_assistant_phased_plan.md`](langgraph_family_assistant_phased_plan.md)。**
@@ -40,8 +40,8 @@ uvicorn rdi_agent.api.main:app --reload
 curl -s localhost:8000/health | python -m json.tool
 ```
 
-`/health` 会逐项自检：数据库、pgvector 扩展、全文检索后端、模型配置、replay 状态。
-任何一项坏了都返回 503，body 里说清是哪一环。
+`/health` 会逐项自检：数据库、pgvector 扩展、全文检索后端、Checkpointer 表、
+模型配置、replay 状态。任何一项坏了都返回 503，body 里说清是哪一环。
 
 ## 常用命令
 
@@ -55,6 +55,9 @@ make demo        # 固定演示输入，跑完 追问 → 方案 → 选择 → 
 make cli         # 交互式对话
 make feedback    # 录入一次尝试的反馈
 make test        # 跑测试
+
+make clean-db         # 清空开发期测试数据（业务表 + Checkpointer，知识库不动）
+make clean-db DRY=1   # 只看会删多少，不真删
 ```
 
 ## 闭环怎么走

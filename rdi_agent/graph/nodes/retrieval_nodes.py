@@ -292,6 +292,7 @@ async def generate_evidence_followup(state: CoachState) -> dict[str, Any]:
         priority_questions=list(decision.get("missing_information") or []),
         followup_rounds=int(state.get("evidence_followup_rounds") or 0),
         asked_questions=list(state.get("asked_questions") or []),
+        asked_qa=list(state.get("asked_qa_pairs") or []),
     )
     result, trace = await llm.chat_json(
         system=system,
@@ -332,14 +333,20 @@ async def build_limited_answer(state: CoachState) -> dict[str, Any]:
         stage="build_limited_answer",
         temperature=0.5,
     )
+    parts = result.model_dump(mode="json")
     return {
         "candidate_plans": [],
-        "answer_parts": result.model_dump(mode="json"),
+        "answer_parts": parts,
+        # **这里必须把文本渲染出来**：safety_review 审的是
+        # ``state["final_answer"]``。只放 answer_parts 的话，风险路径
+        # 交给安全审查的是一段空字符串 —— 等于没审。
+        "final_answer": _render_limited(parts),
         "answer_mode": mode,
         # 标记"已经降级过一次"。
         # 没有这个标记，safety_review → fallback → build_limited_answer
         # → safety_review → fallback 会绕成死循环。
         "safety_fallback_used": True,
+        "route_after_render": "end",
         "trace_metadata": {"build_limited_answer": trace.brief()},
     }
 
@@ -441,8 +448,11 @@ def render_answer(state: CoachState) -> dict[str, Any]:
     cards = _cards_of(state)
     bundle = _bundle_of(state)
     parts = state.get("answer_parts") or {}
+    adjustment = state.get("feedback_adjustment") or {}
 
-    if cards:
+    if adjustment:
+        text = _render_feedback_adjustment(adjustment, bundle)
+    elif cards:
         text = _render_cards(cards, bundle)
     else:
         text = _render_limited(parts)
@@ -551,6 +561,80 @@ def _clean(text: str) -> str:
     return _FIELD_PREFIX.sub("", str(text or "")).strip()
 
 
+def _render_feedback_adjustment(
+    adjustment: dict[str, Any], bundle: EvidenceBundle | None
+) -> str:
+    """反馈调整建议的渲染。编号规则和 ``_render_cards`` 一致。"""
+    lines: list[str] = []
+    headline = str(adjustment.get("headline") or "").strip()
+    if headline:
+        lines.append(headline)
+    what_changed = str(adjustment.get("what_changed") or "").strip()
+    if what_changed:
+        lines.append(what_changed)
+
+    def section(title: str, key: str) -> None:
+        values = [str(x).strip() for x in (adjustment.get(key) or []) if str(x).strip()]
+        if not values:
+            return
+        lines.append("")
+        lines.append(title)
+        lines.extend(f"- {x}" for x in values)
+
+    section("继续做：", "keep_doing")
+    section("调整成：", "adjust_actions")
+    section("这周留意：", "observe")
+    section("出现这些就停：", "stop_if")
+
+    index = {e.evidence_id: e for e in (bundle.evidence if bundle else [])}
+    order: list[str] = []
+
+    def number_of(evidence_id: str) -> int | None:
+        if evidence_id not in index:
+            return None
+        if evidence_id not in order:
+            order.append(evidence_id)
+        return order.index(evidence_id) + 1
+
+    notes = adjustment.get("evidence_notes") or []
+    note_lines: list[str] = []
+    for note in notes:
+        text = str(note.get("text") or "").strip()
+        if not text:
+            continue
+        nums = [
+            n
+            for n in (number_of(x) for x in (note.get("evidence_ids") or []))
+            if n is not None
+        ]
+        markers = "".join(f"[{n}]" for n in nums)
+        note_lines.append(f"- {text}{markers}")
+
+    if note_lines:
+        lines.append("")
+        lines.append("这次的指南依据：")
+        lines.extend(note_lines)
+        if order:
+            lines.append("")
+            for n, evidence_id in enumerate(order, start=1):
+                item = index.get(evidence_id)
+                if item is None:
+                    continue
+                pages = ""
+                if item.pdf_page_start is not None:
+                    pages = f"，PDF 第 {item.pdf_page_start}-{item.pdf_page_end} 页"
+                lines.append(
+                    f"[{n}] 《{item.section_title or item.title}》{pages}：{item.summary}"
+                )
+    elif adjustment.get("evidence_gap_note"):
+        lines.append("")
+        lines.append(str(adjustment["evidence_gap_note"]))
+
+    section("什么时候该找专业人士：", "when_to_seek_professional_help")
+    section("还不确定的地方：", "uncertainty_notes")
+    return "\n".join(lines) if lines else "这次没能给出有依据的调整建议。"
+
+
 def _render_limited(parts: dict[str, Any]) -> str:
     lines: list[str] = []
     if parts.get("answer"):
@@ -589,7 +673,13 @@ def route_after_safety_review(state: CoachState) -> str:
 
 
 def route_after_render(state: CoachState) -> str:
-    """有建议卡就去让家长选，没有就结束。"""
+    """有建议卡就去让家长选，没有就结束。
+
+    反馈入口走 ``feedback_end``：先把这一轮的记忆抽完、再收尾落库，
+    不能直接 END（那样反馈分析和记忆都不会落库）。
+    """
+    if state.get("entrypoint") == "feedback":
+        return "feedback_end"
     if state.get("route_after_render") == "plans" and state.get("candidate_plans"):
         return "plans"
     return "end"

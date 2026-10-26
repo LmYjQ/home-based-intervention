@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -346,6 +346,8 @@ class Repository:
             conversation_id=conversation_id,
             target=target,
             status="accepted",
+            # 把版本钉在这次尝试上：方案以后被调整，历史反馈仍对应当时的版本。
+            plan_version=target_plan.plan_version,
             planned_context_json={"turn_id": turn_id},
         )
         self.session.add(trial)
@@ -411,6 +413,7 @@ class Repository:
                 trial_id=uuid.UUID(str(trial_id)),
                 turn_id=submission.turn_id,
                 attempted=submission.attempted,
+                stopped=submission.stopped,
                 implementation_notes=submission.implementation_notes,
                 child_response_json=submission.child_response.model_dump(),
                 parent_observations_json=submission.parent_observations,
@@ -431,3 +434,136 @@ class Repository:
             ).scalars().first()
             return existing, False
         return await self.session.get(Feedback, new_id), True
+
+    async def get_feedback(self, *, trial_id: str, turn_id: str) -> Feedback | None:
+        """按幂等键取反馈。给"重试直接返回缓存"和刷新页面用。"""
+        row = (
+            await self.session.execute(
+                select(Feedback).where(
+                    Feedback.trial_id == uuid.UUID(str(trial_id)),
+                    Feedback.turn_id == turn_id,
+                )
+            )
+        ).scalars().first()
+        return row
+
+    async def update_feedback_result(
+        self,
+        *,
+        feedback_id: str,
+        analysis_json: dict[str, Any] | None = None,
+        next_step_json: dict[str, Any] | None = None,
+        followup_answers_json: list[dict[str, Any]] | None = None,
+        followup_rounds: int | None = None,
+        result_json: dict[str, Any] | None = None,
+        analyzed: bool = False,
+        completed: bool = False,
+    ) -> Feedback | None:
+        """把分析/下一步/追问答案写回反馈行。
+
+        **为什么落库而不是只放 state**：反馈入口没有选方案中断，
+        重试同一个 ``turn_id`` 时 Checkpointer 里可能已经是终态；
+        从库里读缓存比再跑一次 LLM 便宜，也保证结果稳定。
+        """
+        row = await self.session.get(Feedback, uuid.UUID(str(feedback_id)))
+        if row is None:
+            return None
+        now = datetime.now(timezone.utc)
+        if analysis_json is not None:
+            row.analysis_json = analysis_json
+        if next_step_json is not None:
+            row.next_step_json = next_step_json
+        if followup_answers_json is not None:
+            row.followup_answers_json = followup_answers_json
+        if followup_rounds is not None:
+            row.followup_rounds = followup_rounds
+        if result_json is not None:
+            row.result_json = result_json
+        if analyzed and row.analyzed_at is None:
+            row.analyzed_at = now
+        if completed:
+            row.completed_at = now
+        await self.session.flush()
+        return row
+
+    async def update_trial_execution(
+        self,
+        *,
+        trial_id: str,
+        status: str,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+    ) -> Trial | None:
+        """记录这次尝试的实际执行状态。
+
+        **只在反馈首次写入时调用**：旧反馈重试不能把已经更新的状态改回去。
+        """
+        trial = await self.session.get(Trial, uuid.UUID(str(trial_id)))
+        if trial is None:
+            return None
+        trial.status = status
+        if started_at is not None and trial.started_at is None:
+            trial.started_at = started_at
+        if ended_at is not None:
+            trial.ended_at = ended_at
+        await self.session.flush()
+        return trial
+
+    async def load_attempt_history(
+        self,
+        *,
+        child_id: str,
+        exclude_trial_id: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """这个孩子过去的尝试 + 对应方案 + 最近一条反馈。
+
+        **给"历史对比"用**：``analyze_feedback`` 只拿到当前反馈时，
+        说得出"这次做了什么"，说不出"和上次比有什么不同"。
+        条数刻意很少（默认 5），prompt 不会因为历史膨胀。
+        """
+        stmt = select(Trial).where(Trial.child_id == uuid.UUID(str(child_id)))
+        if exclude_trial_id:
+            stmt = stmt.where(Trial.id != uuid.UUID(str(exclude_trial_id)))
+        trials = (
+            await self.session.execute(
+                stmt.order_by(Trial.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
+
+        history: list[dict[str, Any]] = []
+        for trial in trials:
+            plan = await self.session.get(Plan, trial.plan_id)
+            feedback = (
+                await self.session.execute(
+                    select(Feedback)
+                    .where(Feedback.trial_id == trial.id)
+                    .order_by(Feedback.submitted_at.desc())
+                    .limit(1)
+                )
+            ).scalars().first()
+            card = dict(plan.plan_json or {}) if plan is not None else {}
+            history.append(
+                {
+                    "trial_id": str(trial.id),
+                    "plan_title": card.get("title") or trial.target,
+                    "plan_version": trial.plan_version,
+                    "trial_status": trial.status,
+                    "attempted": feedback.attempted if feedback else None,
+                    "stopped": feedback.stopped if feedback else False,
+                    "implementation_notes": (
+                        feedback.implementation_notes if feedback else ""
+                    ),
+                    "parent_observations": (
+                        feedback.parent_observations_json if feedback else []
+                    ),
+                    "difficulties": feedback.difficulties_json if feedback else [],
+                    "analysis": feedback.analysis_json if feedback else {},
+                    "submitted_at": (
+                        feedback.submitted_at.isoformat()
+                        if feedback and feedback.submitted_at
+                        else None
+                    ),
+                }
+            )
+        return history

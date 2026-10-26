@@ -28,7 +28,14 @@ class TestHealth:
         assert resp.status_code in (200, 503)
         body = resp.json()
         # 逐项结构固定
-        for key in ("status", "database", "pgvector", "fulltext", "llm"):
+        for key in (
+            "status",
+            "database",
+            "pgvector",
+            "fulltext",
+            "checkpointer",
+            "llm",
+        ):
             assert key in body
         assert body["keyword_backend"] == "postgres_fts"
         assert body["embedding_model"] == "BAAI/bge-m3"

@@ -185,16 +185,54 @@ class RecommendationSet(BaseModel):
 
 
 class NextStep(BaseModel):
-    """反馈之后给家长的下一步。刻意不含"方案是否有效"的结论。"""
+    """反馈之后给家长的下一步。刻意不含"方案是否有效"的结论。
+
+    ``decision`` 是**流程**字段，不是给家长看的建议：
+    它决定这一轮反馈要不要追问、要不要重新查指南、还是就此结束。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    decision: Literal["continue", "adjust", "followup", "stop"]
+    decision_reason: str = ""
     acknowledgment: str = ""
     next_steps: list[str] = Field(default_factory=list)
     observe_this_week: list[str] = Field(default_factory=list)
-    # 只描述"观察到的关系"，不下因果结论
+    # 只描述观察到的关系，不下因果结论
     relation_to_plan: str = ""
+    # 老字段，给已经落库的旧数据/旧前端兜底。
+    # 新代码以 decision == "adjust" 为准。
     suggest_revisit_plan: bool = False
+
+
+class AdjustmentEvidenceNote(BaseModel):
+    """调整建议里的一段话 + 它依据的指南证据。"""
+
+    text: str
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class FeedbackAdjustment(BaseModel):
+    """反馈之后的"证据支撑的调整建议"。
+
+    **刻意不出建议卡**：反馈迭代只调整正在执行的那一件事，
+    再生成 2–3 张新卡会让家长不知道该继续哪一条。这里只给文字，
+    也不创建新的 trial。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    headline: str
+    what_changed: str = ""
+    keep_doing: list[str] = Field(default_factory=list)
+    adjust_actions: list[str] = Field(default_factory=list)
+    observe: list[str] = Field(default_factory=list)
+    stop_if: list[str] = Field(default_factory=list)
+    when_to_seek_professional_help: list[str] = Field(default_factory=list)
+    evidence_notes: list[AdjustmentEvidenceNote] = Field(default_factory=list)
+    evidence_gap_note: str = ""
+    uncertainty_notes: list[str] = Field(default_factory=list)
+
 
 class SafetyReview(BaseModel):
     """安全审查结论（计划 §9.3）。

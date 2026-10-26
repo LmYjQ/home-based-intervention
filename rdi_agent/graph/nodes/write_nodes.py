@@ -14,6 +14,7 @@ from typing import Any
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.graph.state import CoachState
+from rdi_agent.graph.write_guard import skip_write, writes_allowed
 from rdi_agent.schemas.recommendation import RecommendationCard
 
 
@@ -34,9 +35,15 @@ async def persist_evidence_bundle(state: CoachState) -> dict[str, Any]:
     幂等：靠 UNIQUE(conversation_id, turn_id)。追问循环会让这个节点
     跑不止一次，覆盖成最后一次 —— 那份才是最终回答的依据。
     """
+    if not writes_allowed(state):
+        return skip_write(state, "persist_evidence_bundle")
     bundle = state.get("evidence_bundle")
     if not bundle:
         return {}
+    # 反馈入口早期没有 conversation_id；没有它就没法做 (conversation, turn)
+    # 幂等，写进去也追溯不了。宁可跳过并留痕。
+    if not state.get("conversation_id"):
+        return skip_write(state, "persist_evidence_bundle")
     async with session_scope() as session:
         bundle_id = await Repository(session).save_evidence_bundle(
             conversation_id=state["conversation_id"],
@@ -58,6 +65,8 @@ async def persist_candidate_plans(state: CoachState) -> dict[str, Any]:
     靠 ``plans.evidence_bundle_id`` 指向证据包。证据包由
     ``persist_evidence_bundle`` 节点落库，这里只把它的 id 挂到卡上。
     """
+    if not writes_allowed(state):
+        return {**skip_write(state, "persist_candidate_plans"), "plan_db_ids": {}}
     cards = _as_cards(state)
     if not cards:
         return {"plan_db_ids": {}}
@@ -90,6 +99,8 @@ async def commit_plan_selection(state: CoachState) -> dict[str, Any]:
     幂等：同一个 (conversation_id, plan_id) 已经有 accepted 的 trial 就直接返回，
     重发 select-plan 请求不会产生第二条尝试。
     """
+    if not writes_allowed(state):
+        return skip_write(state, "commit_plan_selection")
     plan_id = state.get("selected_plan_id")
     if not plan_id:
         return {"error_code": "no_plan_selected"}

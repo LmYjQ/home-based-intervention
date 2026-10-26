@@ -299,6 +299,9 @@ class Trial(Base):
     conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     target: Mapped[str] = mapped_column(Text, nullable=False)
     planned_context_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # 这次尝试执行的是**哪个版本**的方案卡。方案可能被调整过，
+    # 反馈必须能说清"当时执行的是第几版"，否则历史对比会把两版混在一起。
+    plan_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="accepted")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -324,10 +327,23 @@ class Feedback(Base):
     )
     turn_id: Mapped[str] = mapped_column(String(64), nullable=False)
     attempted: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # 做了但中途停：和"没做"分开记，见 FeedbackSubmission.execution_status
+    stopped: Mapped[bool] = mapped_column(default=False, nullable=False)
     implementation_notes: Mapped[str] = mapped_column(Text, default="")
     child_response_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     parent_observations_json: Mapped[list] = mapped_column(JSONB, default=list)
     difficulties_json: Mapped[list] = mapped_column(JSONB, default=list)
+    # 分析/下一步/追问答案都落库：
+    # 1. 重试同一个 turn_id 不必再跑一遍 LLM；
+    # 2. 刷新页面能拿回上次的分析结果；
+    # 3. completed_at 非空 = 这次反馈已经处理完。
+    analysis_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    next_step_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    followup_answers_json: Mapped[list] = mapped_column(JSONB, default=list)
+    result_json: Mapped[dict] = mapped_column(JSONB, default=dict)
+    followup_rounds: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

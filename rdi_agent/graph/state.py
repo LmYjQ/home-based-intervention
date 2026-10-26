@@ -45,6 +45,21 @@ class CoachState(TypedDict, total=False):
     #
     # 把问过的问题原文交给 prompt，模型才能避开它们。
     asked_questions: list[str]
+    # 已经问过的问题**和家长的回答**，成对存着。
+    # [{"question": "...", "answer": "..."}, ...]
+    #
+    # **为什么光有 asked_questions 不够**（2026-10-26 补）：
+    # 只有问题没有答案，模型不知道"这件事已经问过了"还是"问过了但没答上来"，
+    # 两种情况它都会再问一遍 —— 实测"孩子在幼儿园的表现和在家相比有没有不同"
+    # 被问了两遍，第二次换个说法。
+    #
+    # 有了答案，模型才能做两件不同的事：
+    #   1. 答案有内容 → 这件事**已经问完了**，基于新信息往下走，
+    #      不再问同一件事（家长说"换过老师"，该问的是
+    #      "换老师之后表现有没有变化"，不是把原问题重问一遍）。
+    #   2. 答案是空的/答不上来 → 换个**角度**问，问得更具体，
+    #      但不要换个说法重问原问题。
+    asked_qa_pairs: list[dict[str, Any]]
     # 已经追问几轮。到 MAX_FOLLOWUP_ROUNDS 就强制收手，否则会无限追问下去
     followup_rounds: int
     # generate_followup 发现没东西可问时，直接跳去出方案，省掉一次空中断
@@ -84,9 +99,30 @@ class CoachState(TypedDict, total=False):
     next_step: dict[str, Any]
     trial_id: str
     plan_title: str
+    # 这次尝试执行的方案正文和版本 —— analyze/next_step/adjust 都要看
+    plan_context: dict[str, Any]
+    plan_version: int
+    # 反馈提交后 trial 的执行状态（attempted / not_attempted / stopped）
+    trial_status: str
     selected_plan_db_id: str
     plan_db_ids: dict[str, str]
     feedback_created: bool
+    # 同一 child 过去的尝试 + 对应反馈，给历史对比用
+    feedback_history: list[dict[str, Any]]
+    # 重试时命中库里缓存的分析/下一步，避免再跑 LLM
+    feedback_cached_analysis: dict[str, Any]
+    feedback_cached_next_step: dict[str, Any]
+    feedback_analysis_from_cache: bool
+    # 反馈不足时的追问中断
+    feedback_followup_questions: list[dict[str, Any]]
+    feedback_followup_answers: list[dict[str, Any]]
+    feedback_followup_rounds: int
+    # 反馈追问的"问过什么 + 家长答了什么"，成对累积。
+    # 理由同 asked_qa_pairs：模型只有看到答案，才分得清
+    # "问过了"和"问过了没答上来"。
+    feedback_asked_qa: list[dict[str, Any]]
+    # 证据支撑的调整建议（不出卡）
+    feedback_adjustment: dict[str, Any]
     memory_candidates: list[dict[str, Any]]
     memory_update_result: dict[str, Any]
     # 这一轮给前端"记忆区"看的内容（事实/观察/假设/尝试）
@@ -104,3 +140,5 @@ class CoachState(TypedDict, total=False):
     # 运维
     error_code: str | None
     trace_metadata: dict[str, Any]
+    # 调试分支跳过了哪些业务写入（计划 §12.4）
+    writes_skipped: list[str]

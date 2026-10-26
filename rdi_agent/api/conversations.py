@@ -29,7 +29,7 @@ from rdi_agent.age import parse_birth_date
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.db.repositories.memory import list_memories as list_memories_repo
-from rdi_agent.graph.runtime import config_for, get_graph
+from rdi_agent.graph.runtime import config_for, feedback_thread_id, get_graph
 from rdi_agent.schemas.feedback import FeedbackSubmission
 
 router = APIRouter(prefix="/api", tags=["conversations"])
@@ -82,6 +82,18 @@ class SendMessageRequest(BaseModel):
 class SelectPlanRequest(BaseModel):
     plan_id: str
     turn_id: str | None = None
+
+
+class FeedbackFollowupRequest(BaseModel):
+    """反馈追问的恢复请求。
+
+    ``turn_id`` 必须和最初提交反馈时的一致 —— 它同时是幂等键和
+    checkpoint 线程的一部分（追问中断就停在那条线程上）。
+    """
+
+    turn_id: str
+    message: str = ""
+    answers: list[FollowupAnswer] = []
 
 
 # ------------------------------------------------------------------ 工具
@@ -211,11 +223,15 @@ def _status_of(
         return {
             "followup": "awaiting_followup",
             "plan_selection": "awaiting_plan_selection",
+            "feedback_followup": "awaiting_feedback_followup",
         }.get(kind, "interrupted")
     values = result or {}
     decision = values.get("evidence_decision") or {}
     if decision.get("high_risk"):
         return "needs_professional_support"
+    # 反馈迭代的"证据支撑的调整建议"：不是方案卡，也不是拒答，单独一种状态。
+    if values.get("answer_mode") == "adjustment":
+        return "adjustment"
     # 图走到了有限回答这一路 —— 不管是因为证据不够，还是因为生成建议卡失败了。
     if values.get("answer_mode") in ("limited", "risk"):
         return "needs_professional_support" if values.get("answer_mode") == "risk" else "limited_answer"
@@ -353,15 +369,18 @@ async def _run_turn(conversation_id: str, req: SendMessageRequest) -> dict[str, 
 
     async with session_scope() as session:
         repo = Repository(session)
-        await repo.record_interaction(
-            conversation_id=conversation_id,
-            thread_id=conversation_id,
-            turn_id=turn_id,
-            role="user",
-            content=user_text,
-            family_id=family_id,
-            child_id=child_id,
-        )
+        # 调试分支不写业务表（计划 §12.4）：调试跑出来的对话不能混进
+        # 家长真实看到的历史里。
+        if not req.debug:
+            await repo.record_interaction(
+                conversation_id=conversation_id,
+                thread_id=conversation_id,
+                turn_id=turn_id,
+                role="user",
+                content=user_text,
+                family_id=family_id,
+                child_id=child_id,
+            )
         context = await repo.child_context(child_id)
 
     graph = get_graph()
@@ -402,7 +421,7 @@ async def _run_turn(conversation_id: str, req: SendMessageRequest) -> dict[str, 
 
     # 助手侧也记一条，方便 GET 查回完整对话。
     assistant_text = _assistant_text(result)
-    if assistant_text:
+    if assistant_text and not req.debug:
         async with session_scope() as session:
             await Repository(session).record_interaction(
                 conversation_id=conversation_id,
@@ -704,37 +723,186 @@ async def get_plan(plan_id: str) -> dict[str, Any]:
     }
 
 
+def _feedback_payload(
+    *,
+    trial: Any,
+    turn_id: str,
+    row: Any = None,
+    bundle: dict[str, Any] | None = None,
+    pending: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """反馈入口的统一响应。
+
+    图刚跑完（``result``）、命中断言（``pending``）、命中缓存（``row``）
+    三种来源走同一个形状，前端不用分支。
+    """
+    interrupt_payload = _interrupt_payload(result) if result is not None else None
+    effective_pending = pending or interrupt_payload
+    result_json = dict(getattr(row, "result_json", None) or {})
+
+    if result is not None:
+        status = _status_of(interrupt_payload, result)
+    elif effective_pending is not None:
+        status = _status_of(effective_pending)
+    elif getattr(row, "completed_at", None) is not None:
+        status = result_json.get("status") or "completed"
+    elif row is not None:
+        # 有反馈行但没跑完（上次请求中途挂了）—— 前端可以提示重试。
+        status = "processing"
+    else:
+        status = "completed"
+
+    analysis = (
+        (result or {}).get("feedback_analysis")
+        or dict(getattr(row, "analysis_json", None) or {})
+        or {}
+    )
+    next_step = (
+        (result or {}).get("next_step")
+        or dict(getattr(row, "next_step_json", None) or {})
+        or {}
+    )
+    answer_bundle = (result or {}).get("evidence_bundle") or bundle or {}
+    decision = (
+        (result or {}).get("evidence_decision")
+        or result_json.get("evidence_decision")
+        or {}
+    )
+
+    return {
+        "trial_id": str(getattr(trial, "id", "")),
+        "turn_id": turn_id,
+        "status": status,
+        "feedback_created": bool((result or {}).get("feedback_created", False)),
+        "trial_status": (result or {}).get("trial_status")
+        or getattr(trial, "status", ""),
+        "plan_version": (result or {}).get("plan_version")
+        or getattr(trial, "plan_version", 1),
+        "analysis": analysis,
+        "next_step": next_step,
+        "questions": list((effective_pending or {}).get("questions") or []),
+        "message": (result or {}).get("final_answer")
+        or result_json.get("message")
+        or "",
+        "feedback_adjustment": (result or {}).get("feedback_adjustment") or None,
+        "evidence": _evidence_panel(answer_bundle),
+        "evidence_decision": decision,
+        "evidence_gaps": answer_bundle.get("evidence_gaps") or [],
+        "writes_skipped": (result or {}).get("writes_skipped") or [],
+    }
+
+
+async def _load_feedback_row(trial_id: str, turn_id: str) -> Any:
+    async with session_scope() as session:
+        return await Repository(session).get_feedback(
+            trial_id=trial_id, turn_id=turn_id
+        )
+
+
+async def _load_feedback_bundle(trial: Any, turn_id: str) -> dict[str, Any] | None:
+    async with session_scope() as session:
+        row = await Repository(session).get_evidence_bundle(
+            str(trial.conversation_id), turn_id
+        )
+    return dict(row.bundle_json) if row is not None else None
+
+
 @router.post("/trials/{trial_id}/feedback")
 async def submit_feedback(trial_id: str, req: FeedbackSubmission) -> dict[str, Any]:
-    """反馈入口。重试同一个 turn_id 不会重复写，也不会重复跑 LLM 分析。"""
-    family_id, child_id = await _ensure_identity_for_trial(trial_id)
+    """反馈入口。
+
+    四件事按顺序判断：
+    1. 已经停在反馈追问上 → 直接把问题还给前端，不再跑图；
+    2. 这次反馈已经处理完（``completed_at``）→ 返回缓存，不再跑 LLM；
+    3. 否则跑图；
+    4. 同一个 ``(trial_id, turn_id)`` 重试由 UNIQUE 约束和缓存共同兜住。
+    """
+    trial, family_id, child_id = await _ensure_identity_for_trial(trial_id)
+    if req.trial_id != trial_id:
+        raise HTTPException(400, "请求体里的 trial_id 和路径不一致")
+
+    turn_id = req.turn_id
+    config = config_for(feedback_thread_id(trial_id, turn_id))
+    row = await _load_feedback_row(trial_id, turn_id)
+
+    pending = await _pending_interrupt(config)
+    if pending is not None:
+        if pending.get("kind") != "feedback_followup":
+            raise HTTPException(409, "这条反馈没有待回答的追问")
+        return _feedback_payload(
+            trial=trial, turn_id=turn_id, row=row, pending=pending
+        )
+
+    if row is not None and getattr(row, "completed_at", None) is not None:
+        bundle = await _load_feedback_bundle(trial, turn_id)
+        return _feedback_payload(
+            trial=trial, turn_id=turn_id, row=row, bundle=bundle
+        )
 
     graph = get_graph()
     result = await graph.ainvoke(
         {
             "entrypoint": "feedback",
-            "conversation_id": "",
-            "thread_id": _new_id("fb"),
+            "conversation_id": str(trial.conversation_id),
+            "thread_id": feedback_thread_id(trial_id, turn_id),
             "family_id": family_id,
             "child_id": child_id,
-            "turn_id": req.turn_id,
+            "turn_id": turn_id,
             "feedback": req.model_dump(mode="json"),
         },
-        # 反馈入口不带 Checkpointer 也不会退化：它不中断，跑完就结束。
-        # 单独一条 thread 免得和聊天的 thread 状态互相覆盖。
-        config=config_for(f"feedback-{trial_id}-{req.turn_id}"),
+        config=config,
     )
-    return {
-        "trial_id": trial_id,
-        "status": "completed",
-        "feedback_created": result.get("feedback_created"),
-        "analysis": result.get("feedback_analysis"),
-        "next_step": result.get("next_step"),
-        "message": result.get("final_answer", ""),
-    }
+    row = await _load_feedback_row(trial_id, turn_id)
+    return _feedback_payload(trial=trial, turn_id=turn_id, row=row, result=result)
 
 
-async def _ensure_identity_for_trial(trial_id: str) -> tuple[str, str]:
+@router.post("/trials/{trial_id}/feedback/resume")
+async def resume_feedback(
+    trial_id: str, req: FeedbackFollowupRequest
+) -> dict[str, Any]:
+    """回答反馈追问，从 interrupt 处恢复。"""
+    trial, _, _ = await _ensure_identity_for_trial(trial_id)
+    config = config_for(feedback_thread_id(trial_id, req.turn_id))
+    pending = await _pending_interrupt(config)
+    if pending is None or pending.get("kind") != "feedback_followup":
+        raise HTTPException(409, "当前没有待回答的反馈追问")
+
+    user_text = _compose_answer_text(req.answers, req.message)
+    structured_answers = _structured_answers(req.answers)
+    graph = get_graph()
+    result = await graph.ainvoke(
+        Command(
+            resume={"text": user_text, "answers": structured_answers},
+            update={"turn_id": req.turn_id},
+        ),
+        config=config,
+    )
+    row = await _load_feedback_row(trial_id, req.turn_id)
+    return _feedback_payload(
+        trial=trial, turn_id=req.turn_id, row=row, result=result
+    )
+
+
+@router.get("/trials/{trial_id}/feedback/{turn_id}")
+async def get_feedback_state(trial_id: str, turn_id: str) -> dict[str, Any]:
+    """刷新页面时恢复反馈状态：追问问题，或已落库的结果。"""
+    trial, _, _ = await _ensure_identity_for_trial(trial_id)
+    config = config_for(feedback_thread_id(trial_id, turn_id))
+    pending = await _pending_interrupt(config)
+    row = await _load_feedback_row(trial_id, turn_id)
+    if pending is not None:
+        return _feedback_payload(
+            trial=trial, turn_id=turn_id, row=row, pending=pending
+        )
+    if row is None:
+        raise HTTPException(404, "还没有这条反馈")
+    bundle = await _load_feedback_bundle(trial, turn_id)
+    return _feedback_payload(trial=trial, turn_id=turn_id, row=row, bundle=bundle)
+
+
+async def _ensure_identity_for_trial(trial_id: str) -> tuple[Any, str, str]:
+    """取 trial + 所属 family / child。反馈入口的身份都从 trial 推出来。"""
     from rdi_agent.db.models import Child
 
     async with session_scope() as session:
@@ -744,4 +912,4 @@ async def _ensure_identity_for_trial(trial_id: str) -> tuple[str, str]:
         child = await session.get(Child, trial.child_id)
     if child is None:
         raise HTTPException(404, "孩子档案不存在")
-    return str(child.family_id), str(child.id)
+    return trial, str(child.family_id), str(child.id)

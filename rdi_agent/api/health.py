@@ -105,6 +105,45 @@ async def _check_memory_schema(conn: AsyncConnection) -> dict[str, Any]:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+async def _check_checkpointer(conn: AsyncConnection) -> dict[str, Any]:
+    """Checkpointer 的表在不在。
+
+    **为什么单独查**：这些表由 ``AsyncPostgresSaver.setup()`` 在启动时创建，
+    不归 Alembic 管。有人为了"清干净"把 ``langgraph`` schema 删掉之后，
+    服务能启动、业务表也能用，但**所有会话恢复都会失败** ——
+    症状是"重启后接着聊，系统却从零开始了"。这种静默失败必须在 /health 上暴露。
+    """
+    try:
+        rows = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'langgraph'
+                    """
+                )
+            )
+        ).scalars().all()
+        found = set(rows)
+        required = {
+            "checkpoints",
+            "checkpoint_blobs",
+            "checkpoint_writes",
+            "checkpoint_migrations",
+        }
+        missing = sorted(required - found)
+        if missing:
+            return {
+                "ok": False,
+                "error": f"langgraph schema 缺少 {', '.join(missing)}；"
+                "重启服务跑一次 saver.setup()",
+            }
+        return {"ok": True, "tables": sorted(found)}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 async def check_all() -> dict[str, Any]:
     settings = get_settings()
     result: dict[str, Any] = {
@@ -113,6 +152,7 @@ async def check_all() -> dict[str, Any]:
         "pgvector": {"ok": False, "error": "not checked"},
         "fulltext": {"ok": False, "error": "not checked"},
         "memory_schema": {"ok": False, "error": "not checked"},
+        "checkpointer": {"ok": False, "error": "not checked"},
         # 报**实际生效**的后端，不只是配置里写的那个。
         # 配置写错了（名字拼错、后端没注册）时，实际跑的是默认后端 ——
         # 这个差别必须看得见，否则线上出问题时查的是错的方向。
@@ -134,19 +174,27 @@ async def check_all() -> dict[str, Any]:
             result["pgvector"] = await _check_pgvector(conn)
             result["fulltext"] = await _check_fulltext(conn)
             result["memory_schema"] = await _check_memory_schema(conn)
+            result["checkpointer"] = await _check_checkpointer(conn)
     except Exception as e:
         msg = f"{type(e).__name__}: {e}"
         result["database"] = {"ok": False, "error": msg}
         result["pgvector"] = {"ok": False, "error": msg}
         result["fulltext"] = {"ok": False, "error": msg}
         result["memory_schema"] = {"ok": False, "error": msg}
+        result["checkpointer"] = {"ok": False, "error": msg}
 
     # LLM 自检要发网络请求，replay 模式下跳过
     result["llm"] = await llm.health()
 
     if not all(
         result[k].get("ok")
-        for k in ("database", "pgvector", "fulltext", "memory_schema")
+        for k in (
+            "database",
+            "pgvector",
+            "fulltext",
+            "memory_schema",
+            "checkpointer",
+        )
     ):
         result["status"] = "degraded"
     return result

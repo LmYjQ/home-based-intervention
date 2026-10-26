@@ -89,8 +89,14 @@ def build_graph(checkpointer: Any | None = None) -> Any:
 
     # ---- 反馈入口 ----
     g.add_node("capture_feedback", fb.capture_feedback)
+    g.add_node("load_feedback_context", fb.load_feedback_context)
     g.add_node("analyze_feedback", fb.analyze_feedback)
     g.add_node("next_step", fb.next_step)
+    g.add_node("generate_feedback_followup", fb.generate_feedback_followup)
+    g.add_node("await_feedback_answer", fb.await_feedback_answer)
+    g.add_node("prepare_feedback_retrieval", fb.prepare_feedback_retrieval)
+    g.add_node("build_feedback_adjustment", fb.build_feedback_adjustment)
+    g.add_node("finalize_feedback", fb.finalize_feedback)
 
     # ---- 分流 ----
     g.add_conditional_edges(
@@ -105,7 +111,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_conditional_edges(
         "commit_memory",
         mem.route_after_memory,
-        {"chat": "parse_parent_input", "feedback": "next_step"},
+        {"chat": "parse_parent_input", "feedback": "finalize_feedback"},
     )
     g.add_edge("parse_parent_input", "check_sufficiency")
     g.add_conditional_edges(
@@ -143,6 +149,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
             "limited_answer": "build_limited_answer",
             "professional_support": "build_limited_answer",
             "followup": "generate_evidence_followup",
+            "feedback_adjustment": "build_feedback_adjustment",
         },
     )
     # 证据不足导致的追问：答完回到 parse_parent_input，事实重新并一遍
@@ -155,6 +162,7 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         {"plans": "safety_review", "limited_answer": "build_limited_answer"},
     )
     g.add_edge("build_limited_answer", "safety_review")
+    g.add_edge("build_feedback_adjustment", "safety_review")
     g.add_conditional_edges(
         "safety_review",
         ret.route_after_safety_review,
@@ -163,18 +171,43 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_conditional_edges(
         "render_answer",
         ret.route_after_render,
-        {"plans": "persist_candidate_plans", "end": END},
+        {
+            "plans": "persist_candidate_plans",
+            "end": END,
+            "feedback_end": "extract_memories",
+        },
     )
 
     g.add_edge("persist_candidate_plans", "present_plans")
     g.add_edge("present_plans", "commit_plan_selection")
     g.add_edge("commit_plan_selection", END)
 
-    g.add_edge("capture_feedback", "analyze_feedback")
+    g.add_edge("capture_feedback", "load_feedback_context")
+    g.add_edge("load_feedback_context", "analyze_feedback")
+    g.add_edge("analyze_feedback", "next_step")
+    # 四选一：继续/停止/追问用尽 → 记忆 → 收尾；
+    # 追问 → interrupt；调整 → 重新查指南（只出文字建议）。
+    g.add_conditional_edges(
+        "next_step",
+        fb.route_after_next_step,
+        {
+            "followup": "generate_feedback_followup",
+            "retrieve": "prepare_feedback_retrieval",
+            "finish": "extract_memories",
+        },
+    )
+    g.add_conditional_edges(
+        "generate_feedback_followup",
+        fb.route_after_feedback_followup,
+        {"await": "await_feedback_answer", "finish": "extract_memories"},
+    )
+    g.add_edge("await_feedback_answer", "analyze_feedback")
+    # 调整分支：复用聊天入口的检索链，但门控之后只出文字调整建议。
+    g.add_edge("prepare_feedback_retrieval", "rewrite_query")
+
     # 反馈里"孩子反应 / 执行困难"正是观察的来源（计划 §10.3）。
-    # 放在分析之后、给下一步之前：分析结果一并喂给抽取做背景。
-    g.add_edge("analyze_feedback", "extract_memories")
-    g.add_edge("next_step", END)
+    # 放在反馈循环结束之后：追问答案也一并进抽取。
+    g.add_edge("finalize_feedback", END)
 
     return g.compile(checkpointer=checkpointer)
 

@@ -81,11 +81,56 @@ _MEMORY_RULES = """
 """
 
 
+# 已经问过的问题和家长给的答案。
+#
+# **为什么光给"问过的问题"不管用**（2026-10-26 改）：
+# 只给问题列表时，模型分不清两种情况 ——
+#   "这件事问过了" 和 "这件事问过了但家长没答上来"。
+# 两种它都会再问一遍，于是换个说法把原问题重问（实测"在幼儿园的表现
+# 和在家相比有没有不同"被问了两遍）。
+#
+# 给了答案之后，模型能分辨：
+#   - 答案有内容 → 这件事**问完了**，信息已经拿到，往下走；
+#   - 答案为空   → 家长答不上来，该换个**角度**问，问得更具体，
+#                  但不要换个说法重问原问题。
+#
+# **关键：不要在代码里按字面判重**。同一件事换个说法就问出来的东西
+# 字面不一样，靠分词/相似度去重会误杀真正的追问，也会漏掉变体。
+# 判断"这件事是不是问过了"是语义问题，交给模型。
+_ASKED_QA_RULES = """
+**已经问过的问题和家长的回答（asked_qa）**：
+每一项是 {{"question": "问过什么", "answer": "家长怎么答的"}}。
+这是**已经发生过的事**，家长答过的内容直接当事实用，不要再问一遍。
+
+按回答分三种情况处理：
+
+1. **answer 有实质内容** —— 这件事**已经问完了**。
+   基于这个答案往下走：把答案用进后面的判断和建议里，
+   **不要**再问这件事，哪怕换个说法。
+   答案不完整时，缺的那部分要**另起一个新角度**问
+   （例：家长答"换过老师"，但问的是"在园和在家表现差异"，
+   该问的是"换老师之后在园表现有没有变化"，
+   **不是**把"在园和在家表现有什么不同"换个说法重问）。
+
+2. **answer 是空的 / 家长说不知道** —— 问过了但没答上来。
+   这时候可以再问，但要**换角度**、问得更具体、能给出选项，
+   **不要**换个说法重问同一个问题。
+   问不出来就别问了，进入下一步并把不确定性标出来。
+
+3. **answer 和问题对不上**（家长答的不是这件事）——
+   当成"没答上来"处理，但要在下一轮里把问题问得更清楚。
+
+无论哪种情况，**问过的原文都不许原样或换个说法再问一遍**。
+"""
+
+
 def check_sufficiency(
     *,
     case_summary: dict[str, Any],
     followup_rounds: int,
+    max_followup_rounds: int = 1,
     asked_questions: list[str] | None = None,
+    asked_qa: list[dict[str, Any]] | None = None,
     child_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """判断信息够不够生成一份有用的建议。返回 (system, user)。"""
@@ -103,22 +148,29 @@ def check_sufficiency(
 缺什么就列进 priority_questions，用"还需要知道什么"的角度写，
 不要写成问卷式的封闭问题。最多列 5 个候选，真正的问法由下一步收敛。
 
-**已经问过的问题（asked_questions）不许再列进 priority_questions** ——
-问过的事要么家长已经答了（答案在 case_summary 里），要么家长答不上来
-（那再问一遍也问不出来）。换个说法问同一件事，家长会觉得在被反复盘问。
+**先看 asked_qa**：家长已经答过的内容直接算已知信息，
+**不要**因为它没出现在 case_summary 里就当成"还没问过"。
+只有确实**新**缺的东西才列进 priority_questions。
 
-已经追问过 {rounds} 轮。**只允许追问一轮** ——
-家长回答完这一轮之后就出方案，不再问第二遍。
-在信息不完美的情况下给出一份标注了不确定性的建议，好过继续追问下去。
+已经追问过 {rounds} 轮，最多再问 {remaining} 轮。
+每一轮都要问出**新的**东西 —— 把家长刚给的答案用起来，
+问它的下一步，而不是把它原来那个问题再问一遍。
+信息不完美也照样出方案：建议里会标出哪里不确定，
+这比再问一轮有用。
 """
+        + _ASKED_QA_RULES
         + _MEMORY_RULES
-    ).format(rounds=followup_rounds)
+    ).format(
+        rounds=followup_rounds,
+        remaining=max(0, max_followup_rounds - followup_rounds),
+    )
     context = child_context or {}
     user = json.dumps(
         {
             "case_summary": case_summary,
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
+            "asked_qa": asked_qa or [],
             "known_facts": context.get("confirmed_facts") or [],
             "known_preferences": context.get("preferences") or [],
             "known_contexts": context.get("known_contexts") or [],
@@ -138,6 +190,7 @@ def generate_followup(
     priority_questions: list[str],
     followup_rounds: int,
     asked_questions: list[str] | None = None,
+    asked_qa: list[dict[str, Any]] | None = None,
     child_context: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """把候选问题收敛成最多 3 个给家长看的问法，每个带点选选项。返回 (system, user)。"""
@@ -151,11 +204,10 @@ def generate_followup(
 - 用具体场景问，不要问"您觉得孩子有什么问题"这种没法回答的问题。
 - 每句话都能一句话答完，不要连环追问。
 - 如果候选问题其实不重要，就丢掉。
-- **只问这一轮**。家长回答完就出方案，不会再有第二轮。
-- **已经问过的问题（asked_questions）绝对不许再问一遍** ——
-  哪怕换个说法、哪怕看起来更具体。家长答过的事答案就在 case_summary 里；
-  家长答不上来的事，再问一次还是答不上来，只会让家长觉得在被反复盘问。
-  要问就问**新的角度**（不是同一件事的另一种问法）。
+- **这一轮要问出新的东西**。家长上一轮给的回答（asked_qa）直接用起来，
+  从答案往下问下一步，**不要**把原来那个问题换个说法再问一遍。
+  例：家长答了"换过老师" → 该问"换老师之后在园表现有没有变化"，
+  而不是"在园和在家表现有什么不同"。
 
 选项（options）怎么写 —— **这是给家长一键点的按钮**：
 - 每个问题配 2 到 4 个，宁缺毋滥。
@@ -176,8 +228,9 @@ def generate_followup(
   这一题会退化成自由输入。这比硬凑几个废话选项好。
 - 全部用中文，措辞和 question 里的口吻保持一致。
 """
+        + _ASKED_QA_RULES
         + _MEMORY_RULES
-    ).format(rounds=followup_rounds)
+    ).format()
     context = child_context or {}
     user = json.dumps(
         {
@@ -185,6 +238,7 @@ def generate_followup(
             "priority_questions": priority_questions,
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
+            "asked_qa": asked_qa or [],
             "known_facts": context.get("confirmed_facts") or [],
             "known_preferences": context.get("preferences") or [],
             "known_contexts": context.get("known_contexts") or [],
@@ -251,6 +305,7 @@ def build_recommendation(
     evidence: list[dict[str, Any]] | None = None,
     evidence_catalogue: str | None = None,
     validation_errors: dict[str, list[str]] | None = None,
+    asked_qa: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str]:
     """生成建议卡。返回 (system, user)。
 
@@ -358,6 +413,7 @@ plan_id 用 plan_1 / plan_2 / plan_3 这种短 id，不要用随机数。
             "case_summary": case_summary,
             "child_context": child_context or {},
             "可引用的证据": catalogue,
+            "已问过的问题和家长的回答": asked_qa or [],
         },
         ensure_ascii=False,
         indent=2,
@@ -497,8 +553,17 @@ def analyze_feedback(
     *,
     plan_title: str,
     feedback: dict[str, Any],
+    plan_context: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    child_context: dict[str, Any] | None = None,
+    followup_answers: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
-    """把家长反馈里的"做了什么"和"看到了什么"分开。返回 (system, user)。"""
+    """把家长反馈里的"做了什么"和"看到了什么"分开，并和过去对比。
+
+    **为什么要带历史**：只看当前一次反馈，只能说"这次发生了什么"，
+    说不出"是不是每次都卡在同一处"。历史对比是阶段 4 的核心
+    （计划 §11.4 第 4 项），不是背景装饰。
+    """
     system = (
         _COMMON_RULES
         + """
@@ -509,34 +574,176 @@ def analyze_feedback(
   不要脑补成"按计划执行了"。
 - observed_changes：实际看到的变化，只写观察到的。
 - execution_difficulties：执行中卡住的地方。
+- execution_barriers：执行不下去的原因，按时间 / 环境 / 孩子拒绝 /
+  家长负担 / 指令不清楚分类。没有就留空数组。
 - open_questions：现在还悬着的问题。
 - relation_to_plan：这次观察和原建议之间是什么关系。
   用"这一次……和上次……放在一起看……"这种描述，
   **不要**写"说明方案有效"这种因果结论。一次观察说明不了因果。
+- history_comparison：和"历史尝试"逐条对比。每一条写清
+  previous_trial_id / previous_plan_title / previous_trial_status /
+  similarity（这次和那次像在哪）/ difference（差在哪）。
+  没有可比的历史就给空数组。
+- missing_information：要判断这次变化意味着什么，还缺哪些关键信息。
+- risk_signals：家长原话里明确提到的严重风险（自伤、伤人、意识异常、
+  拒绝进食进水）。普通的哭闹、害怕不算风险信号。
 - confidence_note：这次判断有多可信。
+- **时间、环境、孩子拒绝、家长负担**这些执行障碍要被识别出来，
+  不要归因成"家长没坚持"或"孩子不配合"。
+- 历史里的 analysis 是上几次的判断，只能当参考，不能当事实。
 """
     )
     user = json.dumps(
-        {"plan_title": plan_title, "feedback": feedback}, ensure_ascii=False, indent=2
+        {
+            "plan_title": plan_title,
+            "plan_context": plan_context or {},
+            "feedback": feedback,
+            "history": history or [],
+            "child_context": child_context or {},
+            "家长对上一轮追问的回答": followup_answers or [],
+        },
+        ensure_ascii=False,
+        indent=2,
     )
     return system, user
 
 
-def next_step(*, analysis: dict[str, Any]) -> tuple[str, str]:
-    """给下一步。返回 (system, user)。"""
+def next_step(
+    *,
+    analysis: dict[str, Any],
+    plan_context: dict[str, Any] | None = None,
+    history: list[dict[str, Any]] | None = None,
+    child_context: dict[str, Any] | None = None,
+    followup_rounds: int = 0,
+) -> tuple[str, str]:
+    """给下一步。返回 (system, user)。
+
+    ``decision`` 是流程字段，四选一：
+    - continue：方案还能执行，继续做，只微调观察点；
+    - adjust：方案本身需要换一种做法，要重新查指南给证据支撑的调整；
+    - followup：这次反馈太模糊，先问清 1–3 个会改变建议的问题；
+    - stop：出现风险信号、持续执行不下去、或负担已经超过收益。
+    """
     system = (
         _COMMON_RULES
-        + """
-基于刚才的分析，给家长一个下一步。
+        + f"""
+基于刚才的分析，给家长一个下一步。先选 decision，再写文字。
 
-要求：
+decision 只能是下面四个之一：
+- continue：方案还能执行，继续做，只微调观察点。
+- adjust：方案本身需要换一种做法（比如对送园的人不友好、
+  孩子拒绝的是某一步），需要重新查指南并给证据支撑的调整。
+- followup：这次反馈太模糊，先问清 1–3 个会改变建议的问题。
+  **已经追问过 {followup_rounds} 轮，达到 1 轮就不能再选 followup。**
+- stop：出现风险信号、持续执行不下去、或家长负担已经超过收益。
+  这时要明确说"先停下来"，并给出什么时候找专业人士。
+
+其余字段：
+- decision_reason：为什么选这个 decision，写给家长看的一句话。
 - acknowledgment：一句话回应，先接住家长的努力，不要评价做得好不好。
 - next_steps：1–3 个具体动作，一周内能做完。
 - observe_this_week：这周留意哪些变化。
-- suggest_revisit_plan：只有当信息明显变了、或者原建议根本没法执行时才为 true。
-  只是"没感觉出效果"不足以改方案，那可能是需要更多时间。
-- 不要在信息不足时建议换方案。说清楚还需要什么。
+- relation_to_plan：只描述观察到的关系，不下因果结论。
+- **一次观察说明不了方案有效**，不要写"说明这个办法有用"。
+- 未执行（attempted=false）和中途停止（stopped=true）同样是有价值的信息：
+  说明门槛在第一步或执行不下去，不要当成"方案失败"。
 """
     )
-    user = json.dumps({"analysis": analysis}, ensure_ascii=False, indent=2)
+    user = json.dumps(
+        {
+            "analysis": analysis,
+            "plan_context": plan_context or {},
+            "history": history or [],
+            "child_context": child_context or {},
+            "followup_rounds": followup_rounds,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return system, user
+
+
+def build_feedback_adjustment(
+    *,
+    plan_context: dict[str, Any],
+    feedback: dict[str, Any],
+    analysis: dict[str, Any],
+    history: list[dict[str, Any]],
+    child_context: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    evidence_status: str,
+    evidence_gaps: list[str],
+    evidence_catalogue: str,
+    followup_answers: list[dict[str, str]] | None = None,
+) -> tuple[str, str]:
+    """反馈之后的"证据支撑的调整建议"。
+
+    **不出新建议卡**：只调整正在执行的那一件事。家长已经选过一条路，
+    再给两三张新卡会让他不知道该继续哪条。这里只给文字，也不建新 trial。
+    """
+    has_usable = evidence_status in ("direct", "indirect")
+    evidence_rules = (
+        """
+这次检索到了可参考的指南内容。要求：
+- 只调整**当前这条方案**，不要另起炉灶，也不要生成新的方案卡。
+- 每条专业主张都要在 evidence_notes 里挂证据编号（E1、E2…）。
+  没有证据支撑的话不要写，或写进 uncertainty_notes。
+- 指南依据和我们建议的做法要分开：evidence_notes 里的是"指南里说的"，
+  keep_doing / adjust_actions 是"根据指南结合你家情况的做法"。
+"""
+        if has_usable
+        else """
+这次**没有**足够可引用的指南证据。要求：
+- evidence_notes 必须是空数组。
+- evidence_gap_note 必须写清楚"当前知识库没有找到足够依据"。
+- 不许写"指南说""指南提到"；只能给低风险、可观察的调整，
+  并明确说明这是应用转化，不是指南结论。
+"""
+    )
+
+    system = (
+        _COMMON_RULES
+        + """
+家长已经执行过上一条建议，现在根据反馈给一个调整方案。
+
+要求：
+- headline：一句话说清这次调整的核心。
+- what_changed：这次和上次相比，家长描述的实际情况变了什么。
+- keep_doing：原方案里仍然有效的部分，别全盘推翻。
+- adjust_actions：1–3 个具体调整，一周内能做完。
+- observe：这周留意哪些变化。
+- stop_if：出现什么就减量或停。
+- when_to_seek_professional_help：什么情况下找专业人士。
+- uncertainty_notes：这次判断还不确定的地方。
+- **一次观察说明不了方案有效**，不要写"说明这个办法有用"。
+- 未执行（attempted=false）和中途停止（stopped=true）同样有价值：
+  说明门槛在第一步或执行不下去，不要归因成"家长没坚持"。
+- 历史尝试只当参考，不能当事实。
+"""
+        + evidence_rules
+        + """
+evidence_notes 的写法（**必须严格照做**）：
+- 每条 note 是一句话 + 它的 evidence_ids。
+- evidence_ids 只能填上面"可引用的证据"清单里的**编号**（E1、E2…），
+  不能填指南名、章节名，也不能自己编编号。
+- 提到指南术语（"正强化""消退"这类）的 note，必须挂上真的包含
+  这个术语的那一条证据。挂错证据和编造一样，整条 note 会被丢掉。
+- 纯执行细节（"提前十分钟出门"）可以不挂证据，evidence_ids 留空数组。
+"""
+    )
+    user = json.dumps(
+        {
+            "plan_context": plan_context,
+            "feedback": feedback,
+            "analysis": analysis,
+            "history": history,
+            "child_context": child_context,
+            "家长对追问的回答": followup_answers or [],
+            "evidence_status": evidence_status,
+            "证据缺口": evidence_gaps,
+            "可引用的证据": evidence_catalogue,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
     return system, user

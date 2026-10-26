@@ -190,10 +190,19 @@ def enforce_rules(
 
 
 def route_after_evidence_gate(state: dict[str, Any]) -> str:
-    """证据门控之后的路由（计划 §9.3，原样照抄）。"""
+    """证据门控之后的路由（计划 §9.3）。
+
+    反馈入口只有两种出口：
+    - 风险/专业支持 → ``professional_support``（兜底话术）；
+    - 其余 → ``feedback_adjustment``（证据支撑的文字调整，不出卡）。
+
+    聊天入口保持原来的四条路由不变。
+    """
     d = state.get("evidence_decision") or {}
-    if d.get("high_risk"):
+    if d.get("high_risk") or d.get("decision") == "professional_support":
         return "professional_support"
+    if state.get("entrypoint") == "feedback":
+        return "feedback_adjustment"
     if d.get("needs_followup"):
         return "followup"
     if d.get("decision") == "recommend":

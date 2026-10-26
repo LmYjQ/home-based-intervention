@@ -4,7 +4,7 @@
 // 契约刻意把"执行了什么"和"结果如何"分开（schemas/feedback.py）：
 // attempted 只表示家长做了没有，孩子"今天没哭"要填进 child_response
 // 或 parent_observations —— 它是一条观察，不等于"上一轮方案有效"。
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { api } from '../api.js'
 
 const props = defineProps({
@@ -12,7 +12,10 @@ const props = defineProps({
 })
 const emit = defineEmits(['done'])
 
-const attempted = ref(true)
+// attempted / stopped 是**两个字段**，但对家长是一个三选一：
+// 做了 / 没做 / 做了但中途停了。
+// 中途停止比"没做"更有信息量：说明门槛不在第一步，而是执行不下去。
+const execution = ref('attempted')
 const implementationNotes = ref('')
 const behavior = ref('')
 const affect = ref('')
@@ -21,6 +24,17 @@ const parentObservations = ref('')
 const difficulties = ref('')
 const busy = ref(false)
 const error = ref('')
+
+// **turn_id 必须稳定**：它是后端的幂等键，也决定反馈追问停在
+// 哪条 checkpoint 线程上。如果每次点提交都重新生成，网络抖一下重试
+// 就会变成"两次不同的反馈"，追问也接不回来。
+const turnId = ref(`turn_fb_${props.trialId}_${Date.now()}`)
+watch(
+  () => props.trialId,
+  (next) => {
+    turnId.value = `turn_fb_${next}_${Date.now()}`
+  },
+)
 
 function toList(text) {
   return text.split('\n').map((s) => s.trim()).filter(Boolean)
@@ -33,8 +47,9 @@ async function submit() {
     const result = await api.submitFeedback(props.trialId, {
       // 后端 FeedbackSubmission 要求 trial_id 也在 body 里
       trial_id: props.trialId,
-      turn_id: `turn_fb_${Date.now()}`,
-      attempted: attempted.value,
+      turn_id: turnId.value,
+      attempted: execution.value !== 'not_attempted',
+      stopped: execution.value === 'stopped',
       implementation_notes: implementationNotes.value,
       child_response: {
         behavior: behavior.value,
@@ -60,13 +75,16 @@ async function submit() {
     <div class="err-box" v-if="error">{{ error }}</div>
 
     <div class="field">
-      <label>这轮真的做了吗</label>
+      <label>这轮执行到哪一步</label>
       <div class="row">
         <label class="row" style="margin:0">
-          <input type="radio" style="width:auto" :value="true" v-model="attempted" /> 做了
+          <input type="radio" style="width:auto" value="attempted" v-model="execution" /> 做了
         </label>
         <label class="row" style="margin:0">
-          <input type="radio" style="width:auto" :value="false" v-model="attempted" /> 没做
+          <input type="radio" style="width:auto" value="stopped" v-model="execution" /> 做了但中途停了
+        </label>
+        <label class="row" style="margin:0">
+          <input type="radio" style="width:auto" value="not_attempted" v-model="execution" /> 没做
         </label>
       </div>
     </div>

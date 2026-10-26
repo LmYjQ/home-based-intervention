@@ -77,6 +77,36 @@ export const api = {
   submitFeedback: (trialId, payload) =>
     request(`/api/trials/${trialId}/feedback`, { method: 'POST', body: payload }),
 
+  // 反馈不足时，回答追问（turn_id 必须和第一次提交时一致）
+  resumeFeedback: (trialId, payload) =>
+    request(`/api/trials/${trialId}/feedback/resume`, {
+      method: 'POST',
+      body: payload,
+    }),
+
+  getFeedback: (trialId, turnId) =>
+    request(`/api/trials/${trialId}/feedback/${encodeURIComponent(turnId)}`),
+
+  // ---- 调试（阶段 5）----
+  debugState: (conversationId, threadId) => {
+    const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ''
+    return request(`/api/debug/conversations/${conversationId}/state${query}`)
+  },
+
+  debugCheckpoints: (conversationId, { threadId, limit = 50 } = {}) => {
+    const query = new URLSearchParams({ limit })
+    if (threadId) query.set('thread_id', threadId)
+    return request(
+      `/api/debug/conversations/${conversationId}/checkpoints?${query}`,
+    )
+  },
+
+  debugFork: (conversationId, payload) =>
+    request(`/api/debug/conversations/${conversationId}/fork`, {
+      method: 'POST',
+      body: payload,
+    }),
+
   // ---- 长期记忆（阶段 3）----
   listMemories: (childId, familyId, params = {}) => {
     const query = new URLSearchParams({ family_id: familyId, ...params })

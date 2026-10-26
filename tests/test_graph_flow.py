@@ -547,6 +547,173 @@ def _count_followups(fake: FakeLLM) -> int:
     return fake.calls.count("followup")
 
 
+# ------------------------------------------------------- 重复提问（回归）
+@pytest.mark.asyncio
+async def test_asked_qa_pairs_are_passed_to_prompt(
+    patched_llm, no_writes, no_retrieval
+):
+    """问过的问题**和家长的答案**都要进 prompt。
+
+    **为什么两个都要**（2026-10-26 的 bug）：
+    只给问题列表时，模型分不清"这件事问过了"和"问过了但没答上来"，
+    两种情况它都会再问一遍 —— 实测"孩子在幼儿园的表现和在家相比
+    有没有什么不同"被问了两遍，第二次只是换了说法。
+
+    给了答案，模型才能知道"换过老师"这个答案对不对题，
+    进而基于更新过的信息问下一步（"换老师之后表现有没有变化"），
+    而不是把原问题重问一遍。
+    """
+    seen: list[str] = []
+
+    async def fake_chat_json(**kwargs):
+        if kwargs["model_cls"] is SufficiencyDecision:
+            seen.append(kwargs["user"])
+        payload = FakeLLM.DEFAULTS.get(kwargs["model_cls"])
+        if payload is None:
+            payload = fake.script.get(kwargs["model_cls"])
+        if payload is None:
+            raise AssertionError(f"{kwargs['stage']} 没有预置答案")
+        if isinstance(payload, list):
+            i = getattr(fake_chat_json, "_i", 0)
+            fake_chat_json._i = i + 1
+            payload = payload[min(i, len(payload) - 1)]
+        return payload, llm.LLMTrace(stage=kwargs["stage"], model="fake", source="fake")
+
+    fake = patched_llm(
+        {
+            CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
+            SufficiencyDecision: SufficiencyDecision(
+                requires_followup=True, reasons=["缺细节"]
+            ),
+            FollowupQuestions: FollowupQuestions(
+                questions=[FollowupQuestion(question="在园和在家表现有什么不同？")]
+            ),
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
+            RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
+        }
+    )
+
+    import rdi_agent.graph.nodes.chat_nodes as chat_nodes
+
+    real = chat_nodes.llm.chat_json
+    chat_nodes.llm.chat_json = fake_chat_json
+    try:
+        graph = build_graph(checkpointer=InMemorySaver())
+        cfg = _cfg()
+        await graph.ainvoke(_state("上幼儿园前会哭"), config=cfg)
+        await graph.ainvoke(
+            Command(resume={"text": "换过老师", "answers": [
+                {"question": "在园和在家表现有什么不同？", "answer": "换过老师"},
+            ]}),
+            config=cfg,
+        )
+    finally:
+        chat_nodes.llm.chat_json = real
+
+    assert seen, "check_sufficiency 没被调到"
+    last = seen[-1]
+    assert "在园和在家表现有什么不同？" in last, (
+        f"问过的问题没进 prompt：{last[:400]}"
+    )
+    assert "换过老师" in last, (
+        f"家长的答案没进 prompt —— 模型不知道这件事已经问完了，"
+        f"会换个说法再问一遍：{last[:400]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_asked_qa_pairs_accumulate_across_rounds(
+    patched_llm, no_writes, no_retrieval
+):
+    """两轮追问的问答对要**累积**，不能被后一轮覆盖。
+
+    **为什么**：第二轮生成问题时，模型要知道第一轮问了什么、
+    家长答了什么。只留最新一轮的话，第一轮的问题就"忘"了，
+    又会被换个说法问一遍。
+    """
+    fake = patched_llm(
+        {
+            CaseSummary: CaseSummary(observed_facts=["4 岁，上幼儿园前会哭"]),
+            SufficiencyDecision: SufficiencyDecision(
+                requires_followup=True, reasons=["还缺"]
+            ),
+            FollowupQuestions: FollowupQuestions(
+                questions=[
+                    FollowupQuestion(question="第一轮的问题？"),
+                    FollowupQuestion(question="第二轮的问题？"),
+                ]
+            ),
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
+            RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
+        }
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    cfg = _cfg()
+
+    await graph.ainvoke(_state("上幼儿园前会哭"), config=cfg)
+    result = await graph.ainvoke(
+        Command(resume={"text": "答案一", "answers": [
+            {"question": "第一轮的问题？", "answer": "答案一"},
+        ]}),
+        config=cfg,
+    )
+
+    pairs = result.get("asked_qa_pairs") or []
+    assert pairs, "asked_qa_pairs 是空的 —— 问答对没进 state"
+    assert pairs[0]["question"] == "第一轮的问题？", f"问答对不对：{pairs}"
+    assert pairs[0]["answer"] == "答案一", f"答案没配上：{pairs}"
+
+
+@pytest.mark.asyncio
+async def test_unanswered_question_is_recorded_with_empty_answer(
+    patched_llm, no_writes, no_retrieval
+):
+    """问了但家长没答上来的问题，也要进 asked_qa（answer 留空）。
+
+    **为什么**：模型只有看到"问过但没答"这一条，才知道该
+    **换角度**问，而不是当成"还没问过"重问一遍。
+
+    ``unpack_resume`` 会把空回答丢掉，所以"没答"这个事实
+    只能靠问题列表本身还原。
+    """
+    fake = patched_llm(
+        {
+            CaseSummary: CaseSummary(observed_facts=["4 岁"]),
+            SufficiencyDecision: SufficiencyDecision(
+                requires_followup=True, reasons=["还缺"]
+            ),
+            FollowupQuestions: FollowupQuestions(
+                questions=[
+                    FollowupQuestion(question="问过但没答的问题？"),
+                    FollowupQuestion(question="答了的问题？"),
+                ]
+            ),
+            EvidenceDecision: _DIRECT,
+            SafetyReviewCheck: _SAFETY_OK,
+            RecommendationSet: RecommendationSet(plans=[_card("plan_1", True)]),
+        }
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    cfg = _cfg()
+
+    await graph.ainvoke(_state("上幼儿园前会哭"), config=cfg)
+    result = await graph.ainvoke(
+        Command(resume={"text": "只有这题答了", "answers": [
+            {"question": "答了的问题？", "answer": "有内容"},
+        ]}),
+        config=cfg,
+    )
+
+    pairs = {p["question"]: p["answer"] for p in (result.get("asked_qa_pairs") or [])}
+    assert "问过但没答的问题？" in pairs, f"没答的问题没记进去：{pairs}"
+    assert pairs["问过但没答的问题？"] == "", (
+        f"没答的问题应该留空答案：{pairs}"
+    )
+    assert pairs.get("答了的问题？") == "有内容", f"答案没配上：{pairs}"
+
+
 # ------------------------------------------------------------------ 选方案
 @pytest.mark.asyncio
 async def test_select_plan_commits(patched_llm, no_writes, no_retrieval):

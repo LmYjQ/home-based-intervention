@@ -234,3 +234,112 @@ async def test_duplicate_feedback_is_ignored(repo):
             )
         ).scalar_one()
     assert n == 1
+
+
+@pytest.mark.asyncio
+async def test_feedback_result_is_persisted(repo):
+    """分析/下一步/completed_at 要能写回反馈行 —— 重试靠它短路。"""
+    tags = repo
+    cid = tags["conversation_id"]
+    family = str(uuid.uuid4())
+
+    async with session_scope() as s:
+        repo2 = Repository(s)
+        child = await repo2.ensure_child(family_id=family, display_label="反馈孩子")
+        child_id = str(child.id)
+        await repo2.save_candidate_plans(
+            conversation_id=cid, family_id=family, child_id=child_id, cards=[_card()]
+        )
+        _plan, trial = await repo2.select_plan(
+            conversation_id=cid, plan_id="plan_1", turn_id="t1",
+            child_id=child_id, target="方案 1",
+        )
+        trial_id = str(trial.id)
+        row, _ = await repo2.save_feedback(
+            trial_id=trial_id,
+            submission=FeedbackSubmission(
+                trial_id=trial_id, turn_id="fb1", attempted=True, stopped=True
+            ),
+        )
+        assert row is not None
+        await repo2.update_feedback_result(
+            feedback_id=str(row.id),
+            analysis_json={"actual_execution": "做了但停了"},
+            next_step_json={"decision": "adjust"},
+            followup_rounds=1,
+            result_json={"status": "adjustment"},
+            analyzed=True,
+            completed=True,
+        )
+
+    async with session_scope() as s:
+        row = (
+            await s.execute(
+                select(Feedback).where(
+                    Feedback.trial_id == trial_id, Feedback.turn_id == "fb1"
+                )
+            )
+        ).scalars().one()
+        assert row.stopped is True
+        assert row.analysis_json["actual_execution"] == "做了但停了"
+        assert row.next_step_json["decision"] == "adjust"
+        assert row.followup_rounds == 1
+        assert row.result_json["status"] == "adjustment"
+        assert row.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_trial_status_and_attempt_history(repo):
+    """反馈后的执行状态 + 历史尝试查询（阶段 4 历史对比的数据源）。"""
+    tags = repo
+    cid = tags["conversation_id"]
+    family = str(uuid.uuid4())
+
+    async with session_scope() as s:
+        repo2 = Repository(s)
+        child = await repo2.ensure_child(family_id=family, display_label="反馈孩子")
+        child_id = str(child.id)
+        await repo2.save_candidate_plans(
+            conversation_id=cid, family_id=family, child_id=child_id, cards=[_card()]
+        )
+        _plan, trial = await repo2.select_plan(
+            conversation_id=cid, plan_id="plan_1", turn_id="t1",
+            child_id=child_id, target="方案 1",
+        )
+        trial_id = str(trial.id)
+        assert trial.plan_version == 1
+
+        await repo2.save_feedback(
+            trial_id=trial_id,
+            submission=FeedbackSubmission(
+                trial_id=trial_id, turn_id="fb1", attempted=True, stopped=True,
+                implementation_notes="出门前就不肯穿鞋",
+            ),
+        )
+        updated = await repo2.update_trial_execution(
+            trial_id=trial_id, status="stopped"
+        )
+        assert updated is not None and updated.status == "stopped"
+
+        # 再选一张方案会建第二条 trial；历史查询要排除当前这条
+        await repo2.save_candidate_plans(
+            conversation_id=cid,
+            family_id=family,
+            child_id=child_id,
+            cards=[_card("plan_2", recommended=False)],
+        )
+        _plan2, trial2 = await repo2.select_plan(
+            conversation_id=cid, plan_id="plan_2", turn_id="t2",
+            child_id=child_id, target="方案 2",
+        )
+        history = await repo2.load_attempt_history(
+            child_id=child_id, exclude_trial_id=str(trial2.id)
+        )
+
+    assert len(history) == 1
+    item = history[0]
+    assert item["trial_id"] == trial_id
+    assert item["trial_status"] == "stopped"
+    assert item["stopped"] is True
+    assert item["implementation_notes"] == "出门前就不肯穿鞋"
+    assert item["plan_title"] == "方案 plan_1"

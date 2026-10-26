@@ -1131,6 +1131,44 @@ def await_plan_selection(state: CoachState) -> dict:
 
 RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演示。
 
+#### 8.6.1 重复提问：问答对透传（2026-10-26 修）
+
+**现象**：第二轮追问和第一轮问的是同一件事，第二次只是换了说法。
+
+实测：孩子 4 岁不愿去幼儿园。第一轮问了
+「孩子在幼儿园的表现和在家相比，有没有什么不同？」和
+「孩子在早上出门时有没有其他不愉快的经历？」，
+家长答了「换过老师」和「早上出门找借口不愿意起床」，
+第二轮又问「孩子在幼儿园和在家的表现具体有哪些不同？」。
+
+**根因**（三个叠加）：
+
+1. **去重只靠提示词，代码不拦。** `check_sufficiency` / `generate_followup`
+   的 prompt 里写了"问过的不许再问"，但模型面对"这个信息我还没拿到"
+   的诱惑时会重新生成一个措辞不同的问题。提示词约束是**软约束**。
+2. **模型只看到"问过的问题"，看不到"家长答了什么"。** `asked_questions`
+   只有问题列表。模型分不清两件本质不同的事：
+   *「这件事问过了」和「问过了但家长没答上来」——
+   两种它都会再问一遍。家长答了"换过老师"，模型不知道这个答案对不对题，
+   就继续追着原问题问。
+3. **`MAX_FOLLOWUP_ROUNDS` 从 1 调回 2，把第二轮重新打开了。**
+   之前压到 1 轮只是盖住症状，根因没动。
+
+**改法**：新增 `asked_qa_pairs`（`[{"question": ..., "answer": ...}]`），
+把**问过的问题和家长的答案成对**透传给 prompt，
+让模型基于**更新过的信息**生成后面的内容。
+
+- `await_user_answer` 累积问答对；`check_sufficiency` /
+  `generate_followup` / `build_recommendation` 都拿到它。
+- **问过但没答的也要记**（`answer` 留空）—— 模型只有看到"问过但没答"，
+  才知道该**换角度**问，而不是当成"还没问过"重问。
+  （`unpack_resume` 会把空回答丢掉，所以"没答"只能靠问题列表还原。）
+- `MAX_FOLLOWUP_ROUNDS = 2` 保留。
+
+**为什么不在代码里按字面判重**：同一件事换个说法就问出来的东西字面不一样。
+靠分词/相似度去重会误杀真正的追问，也会漏掉变体。
+判断"这件事是不是问过了"是语义问题，交给模型。
+
 ### 8.7 交付物
 
 一个可实际运行的端到端 Demo，以及后续阶段复用的 State、契约和中断模式。
@@ -1161,9 +1199,12 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
    而是 import 边界本身就做不到。
 2. **追问那圈回到 `parse_parent_input`**，不是接一个新节点。家长的回答要重新并进
    `CaseSummary` —— 事实是累积的，问一轮丢一轮就退化成单轮问答了。
-   收敛靠 `followup_rounds`，**只允许追问一轮**（`MAX_FOLLOWUP_ROUNDS = 1`），
+   收敛靠 `followup_rounds`，**最多追问两轮**（`MAX_FOLLOWUP_ROUNDS = 2`），
    答完强制出方案，
    且 `check_sufficiency` 会**覆盖模型"还要问"的判断**并记下理由。
+   > **2026-10-26 修正**：这里原来写的是"只允许追问一轮"，是错的 ——
+   > 压到 1 轮只是把"重复提问"这个症状盖住了，根因是模型看不到
+   > **问过的问题和家长的答案**（详见 §8.6 的 `asked_qa_pairs`）。
 3. **候选卡在中断之前落库**（`status='proposed'`）。家长可能看到卡就关掉浏览器，
    这一轮的分析不该丢掉。真正的 `selected` 由 `commit_plan_selection` 改。
 4. **`conversation_id` 直接编码 `family_id.child_id.uuid`**。省一张会话表。
@@ -1851,14 +1892,35 @@ next_step
 
 ### 11.4 任务
 
-- [ ] 实现 `capture_feedback`：写 `feedbacks`，更新 `trials.status`。
-- [ ] 定义 `Feedback` 和 `FeedbackAnalysis` 契约。
-- [ ] 实现 `analyze_feedback`：区分执行情况、观察结果、困难和未确认问题。
-- [ ] 实现历史对比：读取同一 child 过去的 trials 和 observations，生成对比摘要。
-- [ ] 实现 `next_step`：continue / adjust / followup / stop 四选一。
-- [ ] 需要新证据时重新进入检索，不重复使用上一轮证据包。
-- [ ] 反馈提交按 `(trial_id, turn_id)` 幂等。
-- [ ] 写测试：单次改善不归因、执行失败可记录、反例削弱假设。
+- [x] 实现 `capture_feedback`：写 `feedbacks`，更新 `trials.status`。
+- [x] 定义 `Feedback` 和 `FeedbackAnalysis` 契约。
+- [x] 实现 `analyze_feedback`：区分执行情况、观察结果、困难和未确认问题。
+- [x] 实现历史对比：读取同一 child 过去的 trials 和 observations，生成对比摘要。
+- [x] 实现 `next_step`：continue / adjust / followup / stop 四选一。
+- [x] 需要新证据时重新进入检索，不重复使用上一轮证据包。
+- [x] 反馈提交按 `(trial_id, turn_id)` 幂等。
+- [x] 写测试：单次改善不归因、执行失败可记录、反例削弱假设。
+
+#### 交付记录（2026-10-26）
+
+| 项 | 落在哪 |
+|---|---|
+| 契约 | `schemas/feedback.py`（`stopped` / `execution_status` / 历史对比字段）、`schemas/conversation.py`（`NextStep.decision` / `FeedbackAdjustment`） |
+| 迁移 | `008_feedback_iteration.py`（分析/下一步/追问/完成时间）、`009_trial_plan_version.py` |
+| 节点 | `graph/nodes/feedback_nodes.py`：`capture_feedback → load_feedback_context → analyze_feedback → next_step`，追问与调整分支 |
+| 图 | `builder.py`：四选一路由、反馈追问环、`adjust` 复用检索链、`commit_memory → finalize_feedback` |
+| 历史 | `Repository.load_attempt_history`（trial + plan + 最近反馈） |
+| API | `POST /api/trials/{id}/feedback`（缓存短路）、`POST .../feedback/resume`、`GET .../feedback/{turn_id}` |
+| 前端 | `FeedbackForm.vue` 三态、反馈追问复用 `FollowupStepper`、结果卡展示决策/历史对比/调整建议/依据 |
+| 测试 | `tests/test_feedback_flow.py`、`tests/test_feedback_api.py`、仓储测试新增 2 条 |
+
+**两个设计决定**：
+
+1. **adjust 只出文字，不出新卡**。反馈迭代调整的是正在执行的这一条，
+   再生成 2–3 张新卡会让家长不知道该继续哪条；也不新建 trial。
+2. **执行状态和"已分析"分开**：`trials.status` 记 `attempted /
+   not_attempted / stopped`，`feedbacks.completed_at` 表示这次反馈处理完了。
+   不拿 `reviewed` 覆盖执行状态，否则"没做"这个信息会丢。
 
 ### 11.5 验收
 
@@ -1910,13 +1972,32 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 
 ### 12.5 任务
 
-- [ ] 配置 `AsyncPostgresSaver`，`thread_id = conversation_id`，Checkpoint schema 与业务表隔离。
-- [ ] 启动时恢复未完成会话的测试。
-- [ ] 实现调试 API：查看当前 State、历史 checkpoint、从指定 checkpoint 派生分支。
-- [ ] 在调试响应中返回节点名、时间、关键 state 摘要（不返回敏感原文）。
-- [ ] 实现幂等写入并测试：同一反馈提交两次只产生一条记录。
-- [ ] 演示一次 Time Travel：从“生成方案前”的 checkpoint 分支，改变一个情境变量，重新生成并对比。
-- [ ] 确认调试分支不写业务表。
+- [x] 配置 `AsyncPostgresSaver`，`thread_id = conversation_id`，Checkpoint schema 与业务表隔离。
+- [x] 启动时恢复未完成会话的测试。
+- [x] 实现调试 API：查看当前 State、历史 checkpoint、从指定 checkpoint 派生分支。
+- [x] 在调试响应中返回节点名、时间、关键 state 摘要（不返回敏感原文）。
+- [x] 实现幂等写入并测试：同一反馈提交两次只产生一条记录。
+- [x] 演示一次 Time Travel：从“生成方案前”的 checkpoint 分支，改变一个情境变量，重新生成并对比。
+- [x] 确认调试分支不写业务表。
+
+#### 交付记录（2026-10-26）
+
+| 项 | 落在哪 |
+|---|---|
+| 运行时 | `graph/runtime.py`：`feedback_thread_id`；修掉 `shutdown_graph` 先清空再判断、saver 永远关不掉的 bug |
+| 调试 API | `api/debug.py`：`GET .../state`、`GET .../checkpoints`、`POST .../fork` |
+| 分叉 | 新 thread + `aupdate_state(as_node=生产者节点)` + `ainvoke(None)`；源 thread 的 head/历史不变 |
+| 写保护 | `graph/write_guard.py`；`write_nodes` / `feedback_nodes` / API 记交互都检查 `debug` |
+| 健康检查 | `api/health.py::_check_checkpointer`，缺 `langgraph` 表时 `status=degraded` |
+| 前端 | `components/DebugPanel.vue`：当前 state、checkpoint 列表、`values_patch` 分叉 |
+| 测试 | `tests/test_debug_api.py`、`tests/test_runtime_restart.py`、`tests/test_api_health.py` |
+
+**分叉配方的边界**（本机 langgraph 1.2.16 实测）：
+
+- `AsyncPostgresSaver.acopy_thread()` **未实现**，不能用；
+- 现在是"源 state 作种子 + `as_node` 定位下一节点"的**合成** checkpoint，
+  不是逐字节复制整条历史链；用于"改一个变量再看输出"足够；
+- 分叉落在 `debug-fork-*` 独立线程，并强制 `debug=True`，写节点会跳过业务表。
 
 ### 12.6 验收
 

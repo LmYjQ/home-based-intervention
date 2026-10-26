@@ -81,10 +81,28 @@ def config_for(conversation_id: str, **extra: Any) -> dict[str, Any]:
     return {"configurable": {"thread_id": conversation_id}, **extra}
 
 
+def feedback_thread_id(trial_id: str, turn_id: str) -> str:
+    """反馈入口的 checkpoint 线程。
+
+    **为什么带 turn_id**：同一个 trial 可能每周提交一次反馈，
+    每次是**新的一轮**，不能复用上一条线程的终态。
+    同一个 ``(trial_id, turn_id)`` 重试则必须落回同一条线程 ——
+    追问中断的恢复就靠这个确定性。
+    """
+    return f"feedback-{trial_id}-{turn_id}"
+
+
 async def shutdown_graph() -> None:
-    """关掉 Checkpointer 连接。lifespan 退出时调。"""
+    """关掉 Checkpointer 连接。lifespan 退出时调。
+
+    **踩过的坑**：之前先 `_saver_ctx = None` 再判断 `if _saver_ctx`，
+    条件永远为假，saver 从来没被关过。重启测试会因此挂在连接泄漏上。
+    """
     global _graph, _saver, _saver_ctx
-    _graph, _saver, _saver_ctx = None, None, None
-    if _saver_ctx is not None:
+    ctx = _saver_ctx
+    _graph = None
+    _saver = None
+    _saver_ctx = None
+    if ctx is not None:
         with contextlib.suppress(Exception):
-            await _saver_ctx.__aexit__(None, None, None)
+            await ctx.__aexit__(None, None, None)

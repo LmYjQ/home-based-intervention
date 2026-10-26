@@ -15,6 +15,7 @@ import FeedbackForm from './components/FeedbackForm.vue'
 import FollowupStepper from './components/FollowupStepper.vue'
 import MemoryPanel from './components/MemoryPanel.vue'
 import MonthPicker from './components/MonthPicker.vue'
+import DebugPanel from './components/DebugPanel.vue'
 
 // 快捷填入的演示回答。只问一轮（后端 MAX_FOLLOWUP_ROUNDS = 1），
 // 所以一条回答就把场景、行为、试过什么、目标都补齐了。
@@ -35,6 +36,8 @@ const CHILD_KEY = 'rdi.child_id'
 // 每个孩子记住自己上次用的会话 id —— 切账号回来能接着上次的上下文，
 // 而不是从一张白纸重新开始。
 const CHILD_CONV_PREFIX = 'rdi.conversation_id.child.'
+// 每个 trial 最后一次反馈的 turn_id —— 刷新页面后靠它把反馈结果接回来
+const FEEDBACK_TURN_PREFIX = 'rdi.feedback_turn.'
 const conversationId = ref(localStorage.getItem(CONV_KEY) || '')
 const familyId = ref(localStorage.getItem(FAMILY_KEY) || '')
 const childId = ref(localStorage.getItem(CHILD_KEY) || '')
@@ -83,11 +86,29 @@ const progressSteps = ref([])
 const awaitingFollowup = computed(() => status.value === 'awaiting_followup')
 const awaitingPlanSelection = computed(() => status.value === 'awaiting_plan_selection')
 const canSend = computed(() => conversationId.value && !busy.value && !awaitingPlanSelection.value)
-const needsFeedback = computed(() => Boolean(trialId.value) && !feedbackResult.value)
+// 反馈不足时图会停在 feedback_followup 中断上 —— 这时要把表单
+// 换成追问，而不是继续显示"记录反馈"。
+const feedbackFollowup = computed(
+  () => feedbackResult.value?.status === 'awaiting_feedback_followup',
+)
+const feedbackQuestions = computed(() =>
+  feedbackFollowup.value ? feedbackResult.value?.questions || [] : [],
+)
+const needsFeedback = computed(
+  () => Boolean(trialId.value) && !feedbackResult.value,
+)
 // 新建账号：姓名和出生年月都必须填
 const canCreateAccount = computed(
   () => Boolean(newName.value.trim()) && Boolean(newBirth.value) && !busy.value,
 )
+// 按钮为什么是灰的 —— 直接写出来，别让家长猜。
+const missingAccountFields = computed(() => {
+  const missing = []
+  if (!newName.value.trim()) missing.push('姓名 / 孩子的描述')
+  if (!newBirth.value) missing.push('出生年月（点「选择年月」）')
+  if (busy.value) missing.push('上一个请求还在处理')
+  return missing
+})
 
 // 下拉选项。当前孩子如果不在列表里（老会话、换过库），也要能显示出来 ——
 // 否则 select 会变成"没有任何选项被选中"，看起来像坏了。
@@ -128,10 +149,20 @@ const today = computed(() => {
 const STATUS_TEXT = {
   awaiting_followup: ['追问中', 'warn'],
   awaiting_plan_selection: ['待选方案', 'accent'],
+  awaiting_feedback_followup: ['反馈追问中', 'warn'],
+  adjustment: ['证据调整建议', 'accent'],
   limited_answer: ['有限回答', 'warn'],
   needs_professional_support: ['建议转专业支持', 'err'],
   completed: ['已完成', 'ok'],
   interrupted: ['中断', 'warn'],
+}
+
+// 反馈后四选一的说法。给家长看的话，不是枚举名。
+const FEEDBACK_DECISION_TEXT = {
+  continue: ['继续当前方案', 'ok'],
+  adjust: ['根据指南调整这一步', 'accent'],
+  followup: ['还需要补充信息', 'warn'],
+  stop: ['先停一停', 'err'],
 }
 
 const STATUS_HINT = {
@@ -332,6 +363,7 @@ async function hydrateConversation(targetId) {
   if (pending?.kind === 'followup') {
     questions.value = pending.questions || []
   }
+  await restoreFeedback()
   return true
 }
 
@@ -502,10 +534,53 @@ async function selectPlan(planId) {
   await refresh()
 }
 
-async function submitFeedback(result) {
+function applyFeedbackResult(result) {
   feedbackResult.value = result
+  // 记住 turn_id：刷新页面后 GET /feedback/{turn_id} 能拿回结果，
+  // 也不会让家长以为"上次的反馈没提交"。
+  if (trialId.value && result.turn_id) {
+    localStorage.setItem(FEEDBACK_TURN_PREFIX + trialId.value, result.turn_id)
+  }
   finalMessage.value = result.message || finalMessage.value
-  push('bot', result.message || '反馈已记录。')
+  if (result.status === 'awaiting_feedback_followup') {
+    // 题目由 FollowupStepper 渲染，消息区只留一句引子。
+    push('bot', `（反馈还缺 ${result.questions?.length || 0} 个信息）`)
+  } else if (result.message) {
+    push('bot', result.message)
+  }
+  refreshMemories()
+}
+
+async function submitFeedback(result) {
+  applyFeedbackResult(result)
+}
+
+// 刷新/切回会话时，把已经提交过的反馈结果接回来。
+// 接不回来（清过库、turn_id 不认）就当没提交过，表单照常出现。
+async function restoreFeedback() {
+  if (!trialId.value || feedbackResult.value) return
+  const turn = localStorage.getItem(FEEDBACK_TURN_PREFIX + trialId.value)
+  if (!turn) return
+  try {
+    feedbackResult.value = await api.getFeedback(trialId.value, turn)
+  } catch {
+    localStorage.removeItem(FEEDBACK_TURN_PREFIX + trialId.value)
+  }
+}
+
+// 回答反馈追问。turn_id 沿用第一次提交时的 —— 后端用它找到
+// 停在 interrupt 上的那条 checkpoint 线程。
+async function submitFeedbackAnswers(answers) {
+  if (!answers?.length || !feedbackResult.value?.turn_id) return
+  const summary = answers.map((a) => `${a.question}\n${a.answer}`).join('\n\n')
+  push('user', summary)
+  const data = await run(() =>
+    api.resumeFeedback(trialId.value, {
+      turn_id: feedbackResult.value.turn_id,
+      answers,
+    }),
+  )
+  if (data) applyFeedbackResult(data)
 }
 
 async function refresh() {
@@ -521,6 +596,7 @@ async function refresh() {
   if (data.plans?.length && !plans.value.length) plans.value = data.plans
   memories.value = data.memories || []
   memoryPending.value = data.memory_pending || 0
+  await restoreFeedback()
 }
 
 // 刷新页面后把上次那个会话接回来。
@@ -650,7 +726,7 @@ onMounted(async () => {
             </button>
           </div>
           <div v-if="!canCreateAccount" class="small muted" style="margin:-4px 0 10px">
-            姓名和出生年月都要填才能新建账号。
+            还差：{{ missingAccountFields.join('、') }}。
           </div>
 
           <div class="msgs">
@@ -750,8 +826,31 @@ onMounted(async () => {
 
         <FeedbackForm v-if="needsFeedback" :trial-id="trialId" @done="submitFeedback" />
 
-        <div class="card" v-if="feedbackResult">
-          <header><h3>反馈结果</h3></header>
+        <!-- 反馈不足：图停在 feedback_followup 中断上 -->
+        <FollowupStepper
+          v-if="feedbackFollowup"
+          :questions="feedbackQuestions"
+          :busy="busy"
+          @submit="submitFeedbackAnswers"
+        />
+
+        <div class="card" v-if="feedbackResult && !feedbackFollowup">
+          <header>
+            <h3>反馈结果</h3>
+            <span
+              v-if="feedbackResult.next_step?.decision"
+              class="badge"
+              :class="FEEDBACK_DECISION_TEXT[feedbackResult.next_step.decision]?.[1] || ''"
+            >
+              {{ FEEDBACK_DECISION_TEXT[feedbackResult.next_step.decision]?.[0] || feedbackResult.next_step.decision }}
+            </span>
+            <span class="badge" :class="STATUS_TEXT[feedbackResult.status]?.[1] || ''">
+              {{ STATUS_TEXT[feedbackResult.status]?.[0] || feedbackResult.status }}
+            </span>
+          </header>
+          <div class="small muted" v-if="feedbackResult.next_step?.decision_reason">
+            {{ feedbackResult.next_step.decision_reason }}
+          </div>
           <dl class="kv">
             <dt>实际执行</dt><dd>{{ feedbackResult.analysis?.actual_execution || '—' }}</dd>
             <dt>观察到的变化</dt>
@@ -759,14 +858,65 @@ onMounted(async () => {
               <div v-for="(c, i) in feedbackResult.analysis?.observed_changes || []" :key="i">{{ c }}</div>
               <span v-if="!feedbackResult.analysis?.observed_changes?.length">—</span>
             </dd>
+            <dt>执行障碍</dt>
+            <dd>
+              <div v-for="(c, i) in feedbackResult.analysis?.execution_barriers || []" :key="i">{{ c }}</div>
+              <span v-if="!feedbackResult.analysis?.execution_barriers?.length">—</span>
+            </dd>
             <dt>与方案的关系</dt><dd>{{ feedbackResult.analysis?.relation_to_plan || '—' }}</dd>
             <dt>置信说明</dt><dd>{{ feedbackResult.analysis?.confidence_note || '—' }}</dd>
-            <dt>下一步</dt>
+            <dt>下一次</dt>
             <dd>
               <div v-for="(s, i) in feedbackResult.next_step?.next_steps || []" :key="i">{{ s }}</div>
               <span v-if="!feedbackResult.next_step?.next_steps?.length">—</span>
             </dd>
           </dl>
+
+          <!-- 历史对比：这次和过去几次像在哪、差在哪 -->
+          <div v-if="feedbackResult.analysis?.history_comparison?.length" class="field">
+            <label>和过去的尝试比</label>
+            <div
+              v-for="(c, i) in feedbackResult.analysis.history_comparison"
+              :key="i"
+              class="small"
+              style="margin-bottom:6px"
+            >
+              <strong>{{ c.previous_plan_title || c.previous_trial_id }}</strong>
+              <span class="muted">（{{ c.previous_trial_status }}）</span>
+              <div v-if="c.similarity">相同：{{ c.similarity }}</div>
+              <div v-if="c.difference">不同：{{ c.difference }}</div>
+            </div>
+          </div>
+
+          <!-- 证据支撑的调整建议（adjust 分支） -->
+          <div v-if="feedbackResult.feedback_adjustment" class="field">
+            <label>根据指南的调整</label>
+            <div style="white-space:pre-wrap">{{ feedbackResult.feedback_adjustment.headline }}</div>
+            <div class="small" v-if="feedbackResult.feedback_adjustment.what_changed">
+              {{ feedbackResult.feedback_adjustment.what_changed }}
+            </div>
+            <div class="small" v-for="(a, i) in feedbackResult.feedback_adjustment.adjust_actions || []" :key="'a'+i">
+              · {{ a }}
+            </div>
+            <div class="small" v-for="(a, i) in feedbackResult.feedback_adjustment.observe || []" :key="'o'+i">
+              留意：{{ a }}
+            </div>
+            <div class="small" v-for="(a, i) in feedbackResult.feedback_adjustment.stop_if || []" :key="'s'+i">
+              停止：{{ a }}
+            </div>
+            <div class="small muted" v-if="feedbackResult.feedback_adjustment.evidence_gap_note">
+              {{ feedbackResult.feedback_adjustment.evidence_gap_note }}
+            </div>
+          </div>
+
+          <div v-if="feedbackResult.evidence?.length" class="field">
+            <label>这次的依据（{{ feedbackResult.evidence.length }} 条）</label>
+            <div v-for="(e, i) in feedbackResult.evidence" :key="i" class="small">
+              [{{ i + 1 }}] 《{{ e.section_title || e.title }}》
+              <span v-if="e.pdf_page_start">PDF 第 {{ e.pdf_page_start }}-{{ e.pdf_page_end }} 页</span>
+              ：{{ e.summary }}
+            </div>
+          </div>
         </div>
       </div>
 
@@ -780,6 +930,8 @@ onMounted(async () => {
           @correct="onMemoryCorrect"
           @delete="onMemoryDelete"
         />
+
+        <DebugPanel :conversation-id="conversationId" />
 
         <div class="card" v-if="lastRaw">
           <header>

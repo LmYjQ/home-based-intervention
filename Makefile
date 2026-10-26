@@ -128,3 +128,8 @@ health:
 clean:
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf .pytest_cache
+
+# 清空开发期产生的测试数据（业务表 + Checkpointer），知识库不动。
+# 加 DRY=1 只看不删。
+clean-db:
+	$(PY) -m tools.clean_test_data $(if $(DRY),--dry-run,) --yes
