@@ -129,10 +129,8 @@ def forced_decision(
             supported_claims=[],
             unsupported_claims=[],
             missing_information=list(signals),
-            can_support_personalized_advice=False,
             high_risk=True,
             needs_followup=False,
-            decision="professional_support",
         )
     if not bundle.evidence:
         return EvidenceDecision(
@@ -140,12 +138,41 @@ def forced_decision(
             supported_claims=[],
             unsupported_claims=[],
             missing_information=list(bundle.evidence_gaps) or ["知识库中没有找到相关片段"],
-            can_support_personalized_advice=False,
             high_risk=False,
             needs_followup=False,
-            decision="limited_answer",
         )
     return None
+
+
+def decide_flow(
+    decision: EvidenceDecision,
+    bundle: EvidenceBundle,
+    case_summary: dict[str, Any] | None = None,
+) -> str:
+    """**代码**决定走哪条路 —— 模型不参与（2026-10-26 改）。
+
+    返回 ``"recommend"`` / ``"limited_answer"`` / ``"professional_support"``。
+
+    **为什么不让模型填这个**（§8.6.5、§8.6.7）：它曾经是模型自由填的字段，
+    而它决定着"给不给方案卡"。实测同一份证据（8/8 可用、章节页码对得上）
+    两次门控给出相反的结论 —— 一次出卡、一次只给家长一段话，
+    前端还显示"证据不够"。家长拿到什么成了掷骰子。
+
+    规则只有三条：
+
+    1. **有高风险 → professional_support**（找专业人士，不出卡）
+    2. **一条可用证据都没有 → limited_answer**（没东西可引，给有限回答）
+    3. **其余一律 → recommend**（出建议卡）
+
+    证据够不够支撑一条具体建议，由引用校验（``graph/citations.py``）把关 ——
+    那才是硬闸：引用的 evidence_id 必须在证据包里、页码要对得上、
+    主张里的术语必须真出现在那条证据里。编造引用照样会被丢掉。
+    """
+    if decision.high_risk or serious_signals(case_summary):
+        return "professional_support"
+    if not usable_evidence(bundle):
+        return "limited_answer"
+    return "recommend"
 
 
 def enforce_rules(
@@ -169,18 +196,12 @@ def enforce_rules(
         data.update(
             evidence_status="risk",
             high_risk=True,
-            can_support_personalized_advice=False,
-            decision="professional_support",
         )
         return EvidenceDecision.model_validate(data)
 
     # 规则 2：没有可用证据就不能是 direct
-    if not usable:
-        if data.get("evidence_status") == "direct":
-            data["evidence_status"] = "indirect"
-        data["can_support_personalized_advice"] = False
-        if data.get("decision") == "recommend":
-            data["decision"] = "limited_answer"
+    if not usable and data.get("evidence_status") == "direct":
+        data["evidence_status"] = "indirect"
 
     # 规则 3：追问轮数用完了就不许再追问
     if evidence_followup_rounds >= MAX_EVIDENCE_FOLLOWUP_ROUNDS:
@@ -192,19 +213,31 @@ def enforce_rules(
 def route_after_evidence_gate(state: dict[str, Any]) -> str:
     """证据门控之后的路由（计划 §9.3）。
 
-    反馈入口只有两种出口：
-    - 风险/专业支持 → ``professional_support``（兜底话术）；
-    - 其余 → ``feedback_adjustment``（证据支撑的文字调整，不出卡）。
+    **走哪条路由由代码算，不由模型说**（``decide_flow``）。
 
-    聊天入口保持原来的四条路由不变。
+    以前这里有四道判断（high_risk / needs_followup / decision /
+    can_support_personalized_advice），而 ``decision`` 和
+    ``can_support`` 都是**模型自由填的字段** —— 实测同一份证据
+    （8/8 可用、章节页码对得上）两次门控给出不同结论：
+    一次 ``decision="recommend"`` 出了卡，一次
+    ``decision="limited_answer"`` 只给了家长一段话。
+    家长拿到什么东西成了掷骰子。
+
+    现在模型只描述证据（够不够直接、能支撑哪些主张、缺什么、
+    有没有高风险），**路由由 ``decide_flow`` 按硬规则算**：
+    有高风险 → professional_support；一条可用证据都没有 →
+    limited_answer；其余一律出卡。
+
+    证据够不够支撑一条具体建议，由引用校验（``citations.py``）
+    才是硬闸：引用的 evidence_id 必须在证据包里、页码要对得上、
+    主张里的术语必须真出现在那条证据里。编造引用照样会被丢掉。
     """
     d = state.get("evidence_decision") or {}
-    if d.get("high_risk") or d.get("decision") == "professional_support":
+    flow = d.get("decision")
+    if flow == "professional_support":
         return "professional_support"
     if state.get("entrypoint") == "feedback":
         return "feedback_adjustment"
-    if d.get("needs_followup"):
-        return "followup"
-    if d.get("decision") == "recommend":
-        return "recommend"
-    return "limited_answer"
+    if flow == "limited_answer":
+        return "limited_answer"
+    return "recommend"

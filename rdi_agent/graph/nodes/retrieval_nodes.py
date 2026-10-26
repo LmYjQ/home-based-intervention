@@ -277,10 +277,18 @@ async def evidence_gate(state: CoachState) -> dict[str, Any]:
     if decision.needs_followup and rounds < gate.MAX_EVIDENCE_FOLLOWUP_ROUNDS:
         next_rounds = rounds + 1
 
+    # **走哪条路由由代码算**（``decide_flow``），不由模型说。
+    #
+    # 以前 ``decision`` 是模型自由填的字段，而它决定着"给不给方案卡"——
+    # 同一份证据两次门控给出相反结论，家长拿到什么成了掷骰子。
+    # 现在模型只描述证据，路由在这里按硬规则算出来。
+    flow = gate.decide_flow(decision, bundle, case_summary)
+
     return {
-        "evidence_decision": decision.model_dump(mode="json"),
+        # decision 这个 key 是**代码算出来的**，不是模型填的。
+        "evidence_decision": {**decision.model_dump(mode="json"), "decision": flow},
         "evidence_followup_rounds": next_rounds,
-        "trace_metadata": {"evidence_gate": trace},
+        "trace_metadata": {"evidence_gate": f"{trace}；走 {flow}"},
     }
 
 
@@ -352,12 +360,41 @@ async def build_limited_answer(state: CoachState) -> dict[str, Any]:
 
 
 async def safety_review(state: CoachState) -> dict[str, Any]:
-    """安全审查。规则层是硬闸，LLM 复核只能加严不能放宽。"""
+    """安全审查。规则层是硬闸，LLM 复核只能加严不能放宽。
+
+    **逐卡丢弃**（2026-10-26 改）。
+
+    命中规则的是**某一张卡**，不是整组图。
+    实测踩过的坑：三张卡里一张标题写成
+    「尝试忽略孩子的哭闹，让孩子逐渐适应出门过程」，
+    命中"忽视明显不适"（ignore_distress）——
+    之前是**整组卡连坐丢掉**，家长一张都拿不到，
+    只剩一段有限回答，前端还显示"证据不够"（更误导）。
+
+    现在把命中的那张单独丢掉，剩下几张照常走完后面的流程；
+    全被命中才退到有限回答。
+    """
     cards = _cards_of(state)
     bundle = _bundle_of(state)
     answer_text = state.get("final_answer") or ""
 
     review = review_safety(cards, bundle, answer_text)
+
+    # ---- 逐卡丢弃 ----
+    dropped_ids: list[str] = []
+    kept_cards: list[RecommendationCard] = []
+    if review.result in ("blocked", "needs_human_review") and cards:
+        flagged = _flagged_plan_ids(review)
+        if flagged:
+            dropped_ids = sorted(flagged)
+            kept_cards = [c for c in cards if c.plan_id not in flagged]
+            if kept_cards:
+                cards = kept_cards
+                # 剩下的重新审一遍 —— 确认它们干净
+                review = review_safety(cards, bundle, answer_text)
+                # 被丢掉的可能正好是推荐卡，补一个推荐位
+                if review.result == "pass" and not any(c.recommended for c in cards):
+                    cards[0] = cards[0].model_copy(update={"recommended": True})
 
     # 规则层直接判"blocked"/"needs_human_review"时**不调 LLM** ——
     # 那一支得自己打点，否则家长看不到"安全检查"这一步。
@@ -365,6 +402,8 @@ async def safety_review(state: CoachState) -> dict[str, Any]:
     # **注意别打两次**：走 pass 分支时 chat_json 自己会打。
     if review.result != "pass":
         progress.emit("safety_review")
+
+    updates: dict[str, Any] = {}
 
     if review.result == "pass":
         content = _review_content(state, cards, answer_text)
@@ -382,30 +421,61 @@ async def safety_review(state: CoachState) -> dict[str, Any]:
             )
         except llm.LLMError as exc:
             # 复核失败不阻断流程：规则层已经放行了。
-            return {
-                "safety_review": review.model_copy(
-                    update={"llm_checked": False}
-                ).model_dump(mode="json"),
-                "trace_metadata": {"safety_review": f"规则通过；复核失败：{exc}"},
-            }
-        if not check.passed:
-            result = "blocked" if check.severity == "major" else "needs_human_review"
-            review = SafetyReview(
-                result=result,
-                findings=review.findings + list(check.concerns),
-                rules_hit=review.rules_hit + ["llm_review"],
-                llm_checked=True,
-                llm_concerns=list(check.concerns),
-            )
+            review = review.model_copy(update={"llm_checked": False})
+            note = f"规则通过；复核失败：{exc}"
         else:
-            review = review.model_copy(
-                update={"llm_checked": True, "llm_concerns": list(check.concerns)}
-            )
+            if not check.passed:
+                result = "blocked" if check.severity == "major" else "needs_human_review"
+                review = SafetyReview(
+                    result=result,
+                    findings=review.findings + list(check.concerns),
+                    rules_hit=review.rules_hit + ["llm_review"],
+                    llm_checked=True,
+                    llm_concerns=list(check.concerns),
+                )
+            else:
+                review = review.model_copy(
+                    update={"llm_checked": True, "llm_concerns": list(check.concerns)}
+                )
+            note = f"结果 {review.result}；命中规则 {review.rules_hit}"
+    else:
+        note = f"结果 {review.result}；命中规则 {review.rules_hit}"
 
-    return {
-        "safety_review": review.model_dump(mode="json"),
-        "trace_metadata": {"safety_review": f"结果 {review.result}；命中规则 {review.rules_hit}"},
-    }
+    updates["safety_review"] = review.model_dump(mode="json")
+
+    if dropped_ids:
+        updates["safety_dropped_plans"] = dropped_ids
+        if kept_cards:
+            # 剩下的卡才是要交给家长的那几张
+            updates["candidate_plans"] = [c.model_dump(mode="json") for c in cards]
+        note += (
+            f"；安全审查拦下 {len(dropped_ids)} 张卡（{', '.join(dropped_ids)}）"
+            + (f"，剩下 {len(cards)} 张照常给出" if kept_cards else "，全部拦下，退回有限回答")
+        )
+
+    updates["trace_metadata"] = {"safety_review": note}
+    return updates
+
+
+# findings 的格式是 "[plan_1] 出现了…" —— 被点名的卡 id 在方括号里。
+_FLAGGED_PLAN_RE = re.compile(r"^\[(plan_[A-Za-z0-9_-]+)\]")
+
+
+def _flagged_plan_ids(review: Any) -> set[str]:
+    """从 findings 里取出被安全规则点名的卡。
+
+    **为什么从文本里抠 id**：``review_safety`` 是纯函数，
+    findings 是给人和前端看的字符串（"[plan_1] 出现了…"）。
+    为这一处改成结构化输出要动安全层的契约，
+    而规则命中的卡本来就是逐张的，抠出来足够用。
+    """
+    ids: set[str] = set()
+    for finding in review.findings or []:
+        match = _FLAGGED_PLAN_RE.match(str(finding).strip())
+        if match:
+            ids.add(match.group(1))
+    return ids
+
 
 
 def _review_content(

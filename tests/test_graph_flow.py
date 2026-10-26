@@ -111,10 +111,8 @@ _DIRECT = EvidenceDecision(
     supported_claims=["书里讲的是引导式参与"],
     unsupported_claims=[],
     missing_information=[],
-    can_support_personalized_advice=True,
     high_risk=False,
     needs_followup=False,
-    decision="recommend",
 )
 
 _NO_EVIDENCE = EvidenceDecision(
@@ -122,10 +120,8 @@ _NO_EVIDENCE = EvidenceDecision(
     supported_claims=[],
     unsupported_claims=[],
     missing_information=["知识库里没有对应内容"],
-    can_support_personalized_advice=False,
     high_risk=False,
     needs_followup=False,
-    decision="limited_answer",
 )
 
 _SAFETY_OK = SafetyReviewCheck(passed=True, severity="none", concerns=[])

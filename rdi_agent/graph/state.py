@@ -89,6 +89,12 @@ class CoachState(TypedDict, total=False):
     comparison_note: str
     # 安全审查已经降级过一次没有（防 safety_review 的死循环）
     safety_fallback_used: bool
+    # 被安全审查逐卡丢弃的 plan_id。
+    #
+    # **为什么记**：家长看到"少了一张卡"要知道少在哪、为什么少 ——
+    # 之前整组卡被连坐丢掉，前端一律显示"证据不够"，
+    # 真实原因（某张卡命中了"忽视明显不适"）谁也看不到。
+    safety_dropped_plans: list[str]
     # 节点之间的路由提示
     route_after_recommendation: str | None
     route_after_render: str | None

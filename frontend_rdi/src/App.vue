@@ -59,6 +59,8 @@ const plans = ref([])
 const selectedPlanId = ref('')
 const evidence = ref([])
 const evidenceDecision = ref({})
+// 安全审查的结论（含被逐卡丢弃的卡）—— 前端要能说清"为什么少了一张"
+const safetyReview = ref({})
 const evidenceGaps = ref([])
 const trialId = ref('')
 const finalMessage = ref('')
@@ -152,6 +154,8 @@ const STATUS_TEXT = {
   awaiting_feedback_followup: ['反馈追问中', 'warn'],
   adjustment: ['证据调整建议', 'accent'],
   limited_answer: ['有限回答', 'warn'],
+  // 建议卡生成了，但全被安全审查拦下 —— 和"证据不够"是两回事
+  safety_blocked: ['安全复核未通过', 'err'],
   needs_professional_support: ['建议转专业支持', 'err'],
   completed: ['已完成', 'ok'],
   interrupted: ['中断', 'warn'],
@@ -169,9 +173,27 @@ const STATUS_HINT = {
   awaiting_followup: '图停在 await_user_answer 中断上。家长答完这一轮才会继续往下走。',
   awaiting_plan_selection: '图停在 present_plans 中断上 —— 必须调 select-plan 才会执行 commit_plan_selection，trial 才落库。',
   limited_answer: '证据不够，给了有限回答，没有方案卡。',
+  safety_blocked: '安全审查把所有建议卡拦下了，给了有限回答。',
   needs_professional_support: '门控判成高风险，建议转专业支持。',
   completed: '本轮跑完了。',
 }
+
+// 安全审查的说明**要带数量和原因** —— 静态文案说不清
+// "少了几张、为什么少"。少一张卡，家长得知道少在哪。
+const statusHint = computed(() => {
+  const dropped = safetyReview.value?.dropped_plans || []
+  if (dropped.length) {
+    const reasons = (safetyReview.value.findings || [])
+      .filter((f) => dropped.some((id) => String(f).startsWith(`[${id}]`)))
+      .map((f) => String(f).replace(/^\[[^\]]+\]\s*/, ''))
+    const reason = reasons.length ? ` 原因：${reasons.join('；')}` : ''
+    if (status.value === 'safety_blocked') {
+      return `安全审查把全部 ${dropped.length} 张建议卡拦下了，给了有限回答。${reason}`
+    }
+    return `安全审查拦下了 ${dropped.length} 张建议卡，剩下 ${plans.value.length} 张照常给出。${reason}`
+  }
+  return STATUS_HINT[status.value] || ''
+})
 
 // 证据门控的结论。右侧的证据清单取消之后，这个状态挪到方案卡头上 ——
 // 家长还是要知道"这次是有依据的，还是没找到依据"。
@@ -380,6 +402,7 @@ function resetTurnState() {
   evidence.value = []
   evidenceDecision.value = {}
   evidenceGaps.value = []
+  safetyReview.value = {}
   feedbackResult.value = null
   memories.value = []
   memoryPending.value = 0
@@ -470,6 +493,7 @@ function applyTurn(data) {
   evidence.value = data.evidence || []
   evidenceDecision.value = data.evidence_decision || {}
   evidenceGaps.value = data.evidence_gaps || []
+  safetyReview.value = data.safety_review || {}
   finalMessage.value = data.message || ''
 
   // 方案卡在两个地方出现：select-plan 之后从 GET 查，或本轮 plans 里带回来
@@ -656,7 +680,7 @@ onMounted(async () => {
       后端自检没过：{{ JSON.stringify(health, null, 2) }}
     </div>
     <div v-if="error" class="err-box">{{ error }}</div>
-    <div v-if="status && STATUS_HINT[status]" class="notice">{{ STATUS_HINT[status] }}</div>
+    <div v-if="status && statusHint" class="notice">{{ statusHint }}</div>
 
     <div class="cols">
       <!-- 左：对话与方案 -->

@@ -123,8 +123,8 @@ def _forbidden_terms(state: CoachState) -> list[str]:
     ]
 
 
-def _is_forbidden(fact: str, forbidden: list[str]) -> bool:
-    """这条事实是不是已经被作废了。
+def _forbidden_hit(fact: str, forbidden: list[str]) -> str:
+    """这条事实命中了哪条已作废的内容。没命中返回空串。
 
     只看"旧内容是这条事实的全部或一部分" —— 反过来（新事实是旧事实的
     子串）会误杀，比如删掉"孩子 4 岁，喜欢恐龙"之后，
@@ -132,8 +132,57 @@ def _is_forbidden(fact: str, forbidden: list[str]) -> bool:
     """
     normalized = normalize_content(fact)
     if not normalized:
-        return False
-    return any(normalized == old or old in normalized for old in forbidden)
+        return ""
+    for old in forbidden:
+        if old and (normalized == old or old in normalized):
+            return old
+    return ""
+
+
+def _restated_terms(message: str, forbidden: list[str]) -> set[str]:
+    """这一轮家长的原话里，又提到了哪些已作废的内容。
+
+    **为什么要有这个**（2026-10-26 修）：
+    作废内容进 ``forbidden_facts`` 是为了**别再拿旧事实喂模型**，
+    不是为了把家长刚说的话也一起扔掉。
+
+    实测踩过的坑：一条事实被错判成 superseded（被一条完全无关的
+    "孩子最近换过老师"顶掉了），于是家长下一轮**一字不差地又说了
+    同一句**时，那句话被当成"过期信息"丢掉 ——
+    ``observed_facts`` 直接变成空数组，整轮一条事实都没有。
+
+    家长最新的话说了算：他这轮又说了，就是当前事实。
+    """
+    normalized = normalize_content(message)
+    if not normalized:
+        return set()
+    return {old for old in forbidden if old and old in normalized}
+
+
+def _filter_forbidden_texts(
+    values: list[Any],
+    forbidden: list[str],
+    restated: set[str],
+) -> tuple[list[str], int]:
+    """把作废内容从一批文本里剔掉。返回 (留下的, 剔掉几条)。
+
+    ``restated`` 里的是"家长这轮又说了的" —— 这些保留。
+    """
+    kept: list[str] = []
+    dropped = 0
+    for value in values:
+        text = str(value).strip()
+        if not text:
+            continue
+        hit = _forbidden_hit(text, forbidden)
+        if hit and hit not in restated:
+            # 家长刚纠正过 / 刚删掉的事实，不能再并进事实清单 ——
+            # 除非家长这一轮又亲口说了它。
+            dropped += 1
+            continue
+        if text not in kept:
+            kept.append(text)
+    return kept, dropped
 
 
 async def parse_parent_input(state: CoachState) -> dict[str, Any]:
@@ -167,21 +216,27 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
     #   3. 家长明确答了的问答对 —— 结构化传进来的，**一定**要算进事实。
     previous = state.get("case_summary") or {}
     forbidden = _forbidden_terms(state)
+    # 家长这一轮**原话**里又提到的作废内容 —— 这些不作废。
+    #
+    # 见 :func:`_restated_terms`：家长刚说的话不可能是"过期信息"。
+    restated = _restated_terms(state.get("user_message") or "", forbidden)
     dropped = 0
 
-    facts: list[str] = []
-    for source in (
-        previous.get("observed_facts") or [],
-        data.get("observed_facts") or [],
-    ):
-        for value in source:
-            text = str(value).strip()
-            if _is_forbidden(text, forbidden):
-                # 家长刚纠正过 / 刚删掉的事实，不能再并进本轮的事实清单。
-                dropped += 1
-                continue
-            if text and text not in facts:
-                facts.append(text)
+    # 累积的旧事实 + 本轮新抽的事实，一起过滤、一起去重。
+    #
+    # **为什么本轮新抽的也要过滤**：模型会复述家长早就纠正过的内容，
+    # 那还是不能要。
+    # **为什么本轮新抽的可以留下**：家长这一轮**亲口又说了**同一句，
+    # 那是当前事实（见上面的 restated）。
+    facts, dropped_facts = _filter_forbidden_texts(
+        [
+            *(previous.get("observed_facts") or []),
+            *(data.get("observed_facts") or []),
+        ],
+        forbidden,
+        restated,
+    )
+    dropped += dropped_facts
 
     for item in state.get("followup_answers") or []:
         question = str(item.get("question") or "").strip()
@@ -196,7 +251,31 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
             facts.append(line)
     data["observed_facts"] = facts
 
-    # 风险信号**绝不能丢** —— 丢一次就可能漏掉"该找专业人士"的信号。
+    # **作废内容不能从别的字段漏出去**（2026-10-26 修）。
+    #
+    # 实测漏过一条：``retrieval_concepts`` 没过滤，
+    # 一条被 superseded 的"孩子最近换过老师"直接进了检索 query ——
+    # 家长已经不要这条了，它还在左右检索结果。
+    for field in ("already_tried", "missing_information", "retrieval_concepts"):
+        values, dropped_n = _filter_forbidden_texts(
+            data.get(field) or [], forbidden, restated
+        )
+        data[field] = values
+        dropped += dropped_n
+
+    # context 是 dict，值也要过一遍。
+    filtered_context: dict[str, str] = {}
+    for key, value in (data.get("context") or {}).items():
+        hit = _forbidden_hit(str(value), forbidden)
+        if hit and hit not in restated:
+            dropped += 1
+            continue
+        filtered_context[str(key)] = value
+    data["context"] = filtered_context
+
+    # **risk_signals 不过滤** —— 风险信号**绝不能丢**，
+    # 丢一次就可能漏掉"该找专业人士"的信号。
+    # 家长作废的是一条事实，不是这条事实里可能藏着的风险。
     signals = list(data.get("risk_signals") or [])
     for value in previous.get("risk_signals") or []:
         text = str(value).strip()
@@ -206,7 +285,9 @@ async def parse_parent_input(state: CoachState) -> dict[str, Any]:
 
     note = trace.brief()
     if dropped:
-        note += f"；过滤掉 {dropped} 条已作废事实"
+        note += f"；过滤掉 {dropped} 条已作废内容"
+    if restated:
+        note += f"；家长本轮重述了 {len(restated)} 条已作废内容，按最新说法保留"
     return {
         "case_summary": data,
         # 答案已经并进事实了，清掉 —— 免得下一轮又并一遍。
@@ -448,9 +529,9 @@ async def _generate_cards(
         name="recommendation_set",
         stage="build_recommendation",
         temperature=0.7,
-        # 3 张卡 + 中文说明，一次 2000 token 不够。截断会被 llm.py 检出并重试，
+        # 3 张卡 + 中文说明，输出量大。截断会被 llm.py 检出并重试，
         # 但这里直接给够，省一次往返。
-        max_tokens=6000,
+        max_tokens=12000,
         # 这一步的 prompt 里塞了整包证据，输出也要写满 3 张卡，
         # 是全流程里最慢的一次调用。默认的 20 秒超时（settings.llm_timeout_s）
         # 实测会连续三次超时 —— 宁可多等，不要把家长的问题判成"模型连不上"。

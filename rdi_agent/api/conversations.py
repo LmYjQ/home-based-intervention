@@ -30,7 +30,10 @@ from rdi_agent.db.engine import session_scope
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.db.repositories.memory import list_memories as list_memories_repo
 from rdi_agent.graph.runtime import config_for, feedback_thread_id, get_graph
+from rdi_agent.logging_setup import get_logger
 from rdi_agent.schemas.feedback import FeedbackSubmission
+
+logger = get_logger("api.conversations")
 
 router = APIRouter(prefix="/api", tags=["conversations"])
 
@@ -233,9 +236,22 @@ def _status_of(
     if values.get("answer_mode") == "adjustment":
         return "adjustment"
     # 图走到了有限回答这一路 —— 不管是因为证据不够，还是因为生成建议卡失败了。
+    #
+    # **判断依据是 ``answer_mode``，不是 ``decision``**：
+    # ``decision`` 是模型填的自由字段，门控的路由早就不看它了
+    # （2026-10-26 起只有 high_risk 能挡住建议卡）。
+    # 模型填了 ``decision="limited_answer"`` 但图其实出了卡的时候，
+    # 拿它当依据会报出"证据不够" —— 家长看到的和实际拿到的不一样。
     if values.get("answer_mode") in ("limited", "risk"):
-        return "needs_professional_support" if values.get("answer_mode") == "risk" else "limited_answer"
-    if decision.get("decision") == "limited_answer":
+        if values.get("answer_mode") == "risk":
+            return "needs_professional_support"
+        # **有限回答 ≠ 证据不够**（2026-10-26 改）。
+        #
+        # 还有一种走这条路的原因：建议卡生成了，但**全被安全审查拦下**
+        # （逐卡丢弃之后一张不剩）。这两种要分开报 ——
+        # 报成"证据不够"会把家长引到完全错误的方向去。
+        if values.get("safety_dropped_plans"):
+            return "safety_blocked"
         return "limited_answer"
     return "completed"
 
@@ -471,14 +487,20 @@ def _turn_payload(conversation_id: str, result: dict[str, Any]) -> dict[str, Any
         "evidence": evidence,
         "evidence_decision": {
             "evidence_status": decision.get("evidence_status"),
-            "can_support_personalized_advice": decision.get(
-                "can_support_personalized_advice"
-            ),
+            "high_risk": decision.get("high_risk"),
             "missing_information": decision.get("missing_information") or [],
         },
         "evidence_gaps": (result.get("evidence_bundle") or {}).get(
             "evidence_gaps"
         ) or [],
+        # 安全审查的结论 + 被逐卡丢弃的卡。
+        # **前端要能说真话**：少了一张卡，得说清少在哪、为什么少。
+        "safety_review": {
+            "result": (result.get("safety_review") or {}).get("result"),
+            "rules_hit": (result.get("safety_review") or {}).get("rules_hit") or [],
+            "findings": (result.get("safety_review") or {}).get("findings") or [],
+            "dropped_plans": result.get("safety_dropped_plans") or [],
+        },
         # 这一轮之后这个孩子记住了什么（前端"记忆区"直接用）
         "memory": result.get("memory_context") or {},
         "memory_notes": result.get("memory_notes") or [],
@@ -536,6 +558,12 @@ async def send_message_stream(
                     pump_task.cancel()
                 put("result", _turn_payload(conversation_id, result))
             except Exception as exc:  # noqa: BLE001 - 错误要发给前端，不是吞掉
+                # 同时落一份日志 —— 前端只显示一句话，
+                # 想知道"是哪一步、什么原因"得看 logs/rdi.log。
+                logger.error(
+                    "会话出错 | conversation_id=%s | %s: %s",
+                    conversation_id, type(exc).__name__, exc, exc_info=True,
+                )
                 put("error", {"message": f"{type(exc).__name__}: {exc}"})
             finally:
                 outbox.put_nowait(None)  # 哨兵：告诉消费方"完了"

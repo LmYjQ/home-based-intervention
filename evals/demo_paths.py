@@ -174,9 +174,7 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "why": case["why"],
         "turns": turns,
         "evidence_status": decision.get("evidence_status"),
-        "can_support_personalized_advice": decision.get(
-            "can_support_personalized_advice"
-        ),
+        "high_risk": decision.get("high_risk"),
         "missing_information": decision.get("missing_information") or [],
         "evidence_gaps": result.get("evidence_gaps") or [],
         "evidence": [
@@ -239,7 +237,7 @@ def print_case(r: dict[str, Any]) -> None:
     if r["evidence_status"]:
         print(
             f"\n   门控：evidence_status={r['evidence_status']}　"
-            f"可支撑个性化建议={r['can_support_personalized_advice']}"
+            f"高风险={r['high_risk']}"
         )
     if r["missing_information"]:
         print(f"   缺的信息：{'; '.join(r['missing_information'])}")

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,21 @@ from rdi_agent.rag import search as search_mod
 from rdi_agent.rag.query_rewrite import RetrievalQueries
 
 CASES_PATH = Path(__file__).resolve().parent.parent / "evals" / "retrieval_cases.jsonl"
+
+
+def _title_of(section_code: str) -> str:
+    """从 ``007_针对挑战性行为的干预`` 里取出标题部分。"""
+    return section_code.split("_", 1)[1] if "_" in section_code else section_code
+
+
+def _norm_title(title: str) -> str:
+    """标题归一：只比字面，分隔符全去掉。
+
+    章节编号里的分隔符和 ``title_zh`` 不总一致 ——
+    ``006_针对非适应性_非功能性的…`` 对应的 ``title_zh`` 是
+    ``针对非适应性、非功能性的…``（一个下划线一个顿号）。
+    """
+    return re.sub(r"[\s_、，,。·\-—－/（）()]+", "", title or "")
 
 
 def _candidate(chunk_id, vector_rank=None, fts_rank=None):
@@ -200,7 +216,60 @@ class TestEvalSet:
         assert len(irrelevant) >= 2
 
     def test_section_codes_exist_in_book(self):
-        """标注的章节必须真实存在 —— 编出来的章节会让指标失真。"""
+        """标注的章节必须真实存在 —— 编出来的章节会让指标失真。
+
+        **按标题认，不按编号**（2026-10-26 改）。
+
+        编号只是入库时排的序号，重新入库就可能整体挪位 ——
+        实测新版入库多了一个封面章节，后面全部 +1，
+        标注里的编号就全成了"不存在的章节"。
+
+        章节的身份是**标题**（``title_zh``），编号只是索引。
+        拿标题当判据，"这个章节还在不在"就不会被重新编号误伤。
+        编号本身对不对，交给下面那条用例盯。
+        """
+        import asyncio
+
+        from sqlalchemy import text
+
+        from rdi_agent.db.engine import session_scope
+
+        codes = {
+            c
+            for case in self._cases()
+            for c in case.get("expected_sections", [])
+        }
+
+        async def check():
+            async with session_scope() as session:
+                rows = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT DISTINCT b.section_code, b.title_zh
+                            FROM book_sections b
+                            JOIN knowledge_sources k ON k.id = b.source_id
+                            WHERE k.source_id = 'guideline2026'
+                            """
+                        )
+                    )
+                ).all()
+            return rows
+
+        known_titles = {_norm_title(title) for _, title in asyncio.run(check())}
+        unknown = [c for c in codes if _norm_title(_title_of(c)) not in known_titles]
+        assert not unknown, f"标注里有不存在的章节：{unknown}"
+
+    def test_section_codes_are_in_sync_with_book(self):
+        """编号必须和库里对得上 —— 否则检索评测的 recall 会静默变成 0。
+
+        ``evals/run_retrieval.py`` 是**按 section_code 精确匹配**的
+        （``if item["section_code"] in expected``）。
+        编号一漂移，所有用例的 recall 全归零，**而且不报错** ——
+        指标看着"很差"，真因是标注过期了。
+
+        重新入库改了编号，这条会挡住，并指出该改哪。
+        """
         import asyncio
 
         from sqlalchemy import text
@@ -231,7 +300,11 @@ class TestEvalSet:
 
         known = asyncio.run(check())
         unknown = codes - known
-        assert not unknown, f"标注里有不存在的章节：{unknown}"
+        assert not unknown, (
+            f"标注里的章节编号和库里对不上：{unknown}。"
+            f"重新入库改了编号，要同步更新 {CASES_PATH.name}（按标题对应，"
+            "不是简单 +1）"
+        )
 
 
 class TestEvaluationMetrics:

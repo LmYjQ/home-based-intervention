@@ -127,10 +127,35 @@ class TestEvidence:
         assert bundle.evidence_gaps == []
 
     def test_decision_vocabulary(self):
-        d = EvidenceDecision(evidence_status="direct", decision="recommend")
-        assert d.can_support_personalized_advice is False
+        d = EvidenceDecision(evidence_status="direct", high_risk=False)
+        assert d.high_risk is False
         with pytest.raises(ValidationError):
-            EvidenceDecision(evidence_status="maybe", decision="recommend")
+            EvidenceDecision(evidence_status="maybe", high_risk=False)
+
+    def test_can_support_field_is_gone(self):
+        """``can_support_personalized_advice`` 已删除（2026-10-26）。
+
+        它由模型自由填，和 ``decision`` 经常自相矛盾 ——
+        同一份证据两次门控给出不同结论，家长拿到的东西成了掷骰子。
+        """
+        with pytest.raises(ValidationError):
+            EvidenceDecision(
+                evidence_status="direct",
+                high_risk=False,
+                can_support_personalized_advice=True,
+            )
+
+    def test_decision_field_is_gone(self):
+        """``decision`` 也不再由模型填 —— 改由 ``decide_flow`` 算出来。
+
+        模型填它就等于让模型决定"给不给方案卡"，那正是随机性的来源。
+        """
+        with pytest.raises(ValidationError):
+            EvidenceDecision(
+                evidence_status="direct",
+                high_risk=False,
+                decision="limited_answer",
+            )
 
 
 class TestCitation:

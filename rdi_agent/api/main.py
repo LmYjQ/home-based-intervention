@@ -18,6 +18,11 @@ from rdi_agent.api.debug import router as debug_router
 from rdi_agent.api.health import check_all
 from rdi_agent.api.memory import router as memory_router
 from rdi_agent.config import get_settings
+from rdi_agent.logging_setup import setup_logging
+
+# 尽早配置日志 —— 导入期出的问题（配置读不到、模型连不上）
+# 也要能落到 logs/rdi.log，不能只出现在启动那一屏。
+setup_logging()
 
 
 @asynccontextmanager

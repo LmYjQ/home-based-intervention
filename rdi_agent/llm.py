@@ -27,6 +27,9 @@ from openai import APITimeoutError
 from pydantic import BaseModel, ValidationError
 
 from rdi_agent.config import get_settings
+from rdi_agent.logging_setup import get_logger
+
+logger = get_logger("llm")
 
 __all__ = [
     "LLMError",
@@ -74,6 +77,29 @@ class LLMError(RuntimeError):
 
 class LLMUnavailable(LLMError):
     """根本没连上（没配 key、网络不通）。上层据此切换到 fallback。"""
+
+
+# ------------------------------------------------------------------ token 上限
+#
+# **为什么从 2000 抬到 8000**（2026-10-26）
+#
+# 实测 `sufficiency` 这一步被截断过：模型一口气写了 4500+ tokens 还没写完，
+# `finish_reason == "length"` → 重试把上限提到 1.5 倍 → 再截断 → 整轮 500。
+#
+# 明明只需要一个四字段的 JSON。原因是**受限解码的 schema 不限制数组长度**：
+# `priority_questions: list[str]` 之类没有 `maxItems`，
+# 模型一旦开始铺陈就能一路写下去，2000 的上限一刀切断。
+#
+# `max_tokens` 是**上限不是预留** —— 正常输出该多短还是多短，
+# 只是不再因为模型话多而把整轮打断。
+_DEFAULT_MAX_TOKENS = 8000
+
+# 截断重试时的天花板。
+#
+# 1.5 倍连乘没有上限的话，改一次 `max_attempts` 就能把请求推到几万 token，
+# 慢到像挂了。Qwen2.5-7B 的上下文是 32k，
+# 留出 prompt 的位置，输出封顶 24k。
+_MAX_TOKENS_CEILING = 24000
 
 
 # ------------------------------------------------------------------ client
@@ -199,7 +225,7 @@ async def chat_json(
     name: str,
     stage: str = "",
     model: str | None = None,
-    max_tokens: int = 2000,
+    max_tokens: int = _DEFAULT_MAX_TOKENS,
     temperature: float = 0.0,
     max_attempts: int | None = None,
     timeout_s: float | None = None,
@@ -286,13 +312,29 @@ async def chat_json(
             is_timeout = isinstance(e, (APITimeoutError, asyncio.TimeoutError)) or "timeout" in msg.lower()
             if attempt >= max_attempts:
                 if is_timeout:
+                    _log_call_failure(
+                        trace,
+                        model=model,
+                        max_tokens=max_tokens,
+                        reason=f"连续 {attempt} 次超时",
+                    )
                     raise LLMError(
                         f"{stage} 连续 {attempt} 次超时（每次 {timeout_s or get_settings().llm_timeout_s:.0f}s）："
                         "模型侧排队，不是 key 或网络问题"
                     ) from e
+                _log_call_failure(
+                    trace, model=model, max_tokens=max_tokens, reason=f"连不上模型：{msg}"
+                )
                 raise LLMUnavailable(f"{stage} 连不上模型：{msg}") from e
             if "api_key" in msg.lower() or "connection" in msg.lower():
+                _log_call_failure(
+                    trace, model=model, max_tokens=max_tokens, reason=f"连不上模型：{msg}"
+                )
                 raise LLMUnavailable(f"{stage} 连不上模型：{msg}") from e
+            logger.warning(
+                "LLM 第 %d/%d 次尝试失败，准备重试 | stage=%s | %s",
+                attempt, max_attempts, stage, msg[:200],
+            )
             await asyncio.sleep(min(2**attempt, 8))
             continue
 
@@ -308,15 +350,33 @@ async def chat_json(
         if not content:
             trace.retries.append("空响应")
             if attempt >= max_attempts:
+                _log_call_failure(
+                    trace, model=model, max_tokens=max_tokens, reason="连续空响应"
+                )
                 raise LLMError(f"{stage} 连续 {attempt} 次空响应")
+            logger.warning(
+                "LLM 第 %d/%d 次尝试返回空响应 | stage=%s",
+                attempt, max_attempts, stage,
+            )
             continue
 
         # ---- 截断：立刻加 token 重试 ----
         if trace.finish_reason == "length":
             trace.retries.append("输出被截断(max_tokens 不够)")
-            max_tokens = int(max_tokens * 1.5)
+            max_tokens = min(int(max_tokens * 1.5), _MAX_TOKENS_CEILING)
             if attempt < max_attempts:
+                logger.warning(
+                    "LLM 第 %d/%d 次尝试输出被截断，max_tokens 提到 %d | stage=%s "
+                    "completion_tokens=%d",
+                    attempt, max_attempts, max_tokens, stage, trace.completion_tokens,
+                )
                 continue
+            _log_call_failure(
+                trace,
+                model=model,
+                max_tokens=max_tokens,
+                reason=f"加到 {max_tokens} tokens 仍被截断",
+            )
             raise LLMError(f"{stage} 加到 {max_tokens} tokens 仍被截断")
 
         # ---- 校验 ----
@@ -325,6 +385,10 @@ async def chat_json(
         except ValidationError as e:
             trace.retries.append("schema 不合规: " + _brief_errors(e))
             if attempt < max_attempts:
+                logger.warning(
+                    "LLM 第 %d/%d 次尝试 schema 不合规 | stage=%s | %s",
+                    attempt, max_attempts, stage, _brief_errors(e),
+                )
                 messages.append({"role": "assistant", "content": content})
                 messages.append(
                     {
@@ -337,13 +401,55 @@ async def chat_json(
                     }
                 )
                 continue
+            _log_call_failure(
+                trace,
+                model=model,
+                max_tokens=max_tokens,
+                reason=f"连续 {attempt} 次 schema 不合规：{_brief_errors(e)}",
+            )
             raise LLMError(f"{stage} 连续 {attempt} 次 schema 不合规：{_brief_errors(e)}") from e
 
         if _CAPTURE:
             _replay_save(stage, key, content)
         return parsed, trace
 
+    _log_call_failure(
+        trace, model=model, max_tokens=max_tokens, reason=f"重试 {max_attempts} 次仍失败"
+    )
     raise LLMError(f"{stage} 重试 {max_attempts} 次仍失败")
+
+
+def _log_call_failure(
+    trace: LLMTrace,
+    *,
+    model: str,
+    max_tokens: int,
+    reason: str,
+) -> None:
+    """把一次失败的 LLM 调用整个记下来。
+
+    **为什么要有这个**：以前失败只有一句 ``LLMError`` 冒到前端，
+    "第几次尝试、finish_reason 是什么、模型到底吐了什么"全丢了 ——
+    线上只能看到 ``sufficiency 加到 6750 tokens 仍被截断``，
+    连"是截断还是 schema 不合规"都分不出来。
+
+    原始输出整段写进来（截到 2000 字）：
+    schema 不合规时，模型多半是在某个字段上跑偏，
+    看一眼它到底写了什么，比猜快得多。
+    """
+    logger.error(
+        "LLM 调用失败 | stage=%s | model=%s | 第%d次 | finish_reason=%s | "
+        "prompt_tokens=%d | completion_tokens=%d | max_tokens=%d | 原因=%s",
+        trace.stage, model, trace.attempt, trace.finish_reason or "-",
+        trace.prompt_tokens, trace.completion_tokens, max_tokens, reason,
+    )
+    if trace.retries:
+        logger.error("  重试经过 | %s", " | ".join(trace.retries))
+    raw = trace.raw_content or ""
+    if raw:
+        logger.error("  原始输出(前 2000 字):\n%s", raw[:2000])
+        if len(raw) > 2000:
+            logger.error("  原始输出(后 800 字):\n%s", raw[-800:])
 
 
 def _parse(model_cls: type[BaseModel], content: str) -> BaseModel:

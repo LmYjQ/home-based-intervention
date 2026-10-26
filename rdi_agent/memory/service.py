@@ -270,7 +270,7 @@ async def extract_candidates(
         name="memory_extraction",
         stage="memory_extract",
         temperature=0.0,
-        max_tokens=2000,
+        max_tokens=6000,
         timeout_s=settings.memory_extract_timeout_s,
         max_attempts=settings.memory_extract_max_attempts,
     )

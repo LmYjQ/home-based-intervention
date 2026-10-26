@@ -132,7 +132,7 @@ async def _generate(items: list[dict[str, Any]]) -> dict[str, str]:
             name="summary_zh_batch",
             stage="summary_zh",
             temperature=0.2,
-            max_tokens=2000,
+            max_tokens=6000,
         )
     except llm.LLMError:
         return {}

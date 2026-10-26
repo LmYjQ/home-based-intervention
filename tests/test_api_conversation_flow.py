@@ -197,10 +197,8 @@ def always_wants_more(monkeypatch):
                 supported_claims=["书里讲的是引导式参与"],
                 unsupported_claims=[],
                 missing_information=[],
-                can_support_personalized_advice=True,
                 high_risk=False,
                 needs_followup=False,
-                decision="recommend",
             )
         elif model_cls is SafetyReviewCheck:
             payload = SafetyReviewCheck(passed=True, severity="none", concerns=[])

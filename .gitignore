@@ -73,3 +73,6 @@ bd_api.py
 legacy/asd_agent/fixtures/
 legacy/frontend/dist/
 legacy/frontend/node_modules/
+
+# 运行期日志（LLM 失败时的原始输出也在里面，别进版本库）
+logs/

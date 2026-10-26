@@ -532,16 +532,16 @@ class EvidenceBundle(BaseModel):
 
 
 class EvidenceDecision(BaseModel):
+    # 2026-10-26 改：can_support_personalized_advice 和 decision 都删了。
+    # 它们是模型自由填的字段，却决定着"给不给方案卡" ——
+    # 同一份证据两次门控给出相反结论（见 §8.6.7）。
+    # 现在模型只描述证据；走哪条路由由 decide_flow() 按硬规则算。
     evidence_status: Literal["direct", "indirect", "conflicting", "none", "risk"]
     supported_claims: list[str] = Field(default_factory=list)
     unsupported_claims: list[str] = Field(default_factory=list)
     missing_information: list[str] = Field(default_factory=list)
-    can_support_personalized_advice: bool = False
-    high_risk: bool = False
+    high_risk: bool = False          # 唯一能挡住建议卡的信号，强制进 required
     needs_followup: bool = False
-    decision: Literal[
-        "recommend", "limited_answer", "followup", "professional_support"
-    ]
 
 
 class SourceCitation(BaseModel):
@@ -782,7 +782,7 @@ CREATE UNIQUE INDEX uq_feedback_turn ON feedbacks(trial_id, turn_id);
 - **表格行各自成块**（`atomic_items=True`）。指南附件 1–4 全是宽表格，
   **一行就是一条完整的干预要点**（"正强化：xxx" / "0~18 月龄：xxx"）。
   按字数攒子块的话，7 条策略会挤进同一个 543 字的块 ——
-  问"孩子做对了要怎么奖励"时正确���案挤不进前 5 名。
+  问"孩子做对了要怎么奖励"时正确答案挤不进前 5 名。
   开了之后每行一个块，召回粒度直接对上"针对某一条策略的干预"。
 - **分词只发生在 `content_normalized`**，`content_original` 保留原文。
   分词是给 `to_tsvector('simple', ...)` 用的（它按空格切词），
@@ -1168,6 +1168,262 @@ RAG、长期记忆、多 Agent、复杂评分、漂亮前端、Time Travel 演�
 **为什么不在代码里按字面判重**：同一件事换个说法就问出来的东西字面不一样。
 靠分词/相似度去重会误杀真正的追问，也会漏掉变体。
 判断"这件事是不是问过了"是语义问题，交给模型。
+
+#### 8.6.2 点选选项：模型抄 prompt 的示例（2026-10-26 修）
+
+**现象**：追问的问题本身是对的，但配的选项答非所问。
+
+实测：问题「孩子在换老师后，幼儿园的表现有没有变化？」，
+选项给的是「换过老师」「没有这种情况」——
+前者是家长上一轮已经答过的，后者是**另一个问题**的答案。
+这两句都**一字不差地来自 prompt 里的示例清单**。
+
+**根因**：`prompts/chat.py` 的选项段落里写着一份固定的正反例：
+
+```
+好："在园更自在"、"换过老师"、"有人接送"、"没有这种情况"
+```
+
+模型把这张清单当成了**候选词表**照抄，而不是当"文风示范"。
+示例里的词全是名词短语，压根答不了"有没有变化"这种是非题。
+
+**改法**：删掉所有具体示例，只留说明（数量、字数、覆盖几种常见情况、
+不写判断/解释、不夹带建议、想不出就给空数组），另加一条
+「**选项必须能回答 question 本身**」。
+
+**为什么不在代码里兜底**（想过，没做）：
+"选项能不能回答这道题"是语义判断，同分词判重一个道理；
+而"选项不得等于家长已给出的答案"虽然字面可比，但用户明确要求
+先只改 prompt 试效果。
+
+#### 8.6.3 LLM 调用：max_tokens 上限与日志（2026-10-26）
+
+**现象**：`sufficiency` 这一步报
+`LLMError: sufficiency 加到 6750 tokens 仍被截断`，整轮 500。
+明明只需要一个四字段的 JSON。
+
+**两个根因**：
+
+1. `max_tokens` 默认 2000 太小。`json_schema` 约束解码**不限制数组长度**
+   （`priority_questions: list[str]` 没有 `maxItems`），
+   模型一旦开始铺陈就能一路写下去，2000 一刀切断。
+   截断后重试把上限提到 1.5 倍（2000→3000→4500），还是不够。
+   **改法**：默认 2000 → **8000**（`llm.py`），
+   `build_recommendation` 6000 → **12000**，
+   `memory_extract` / `summary_zh` 2000 → **6000**；
+   截断重试的 1.5 倍连乘加**天花板 24000**。
+   `max_tokens` 是上限不是预留，正常输出长度不受影响。
+2. **项目里一条 logger 都没有**（`grep logging rdi_agent/` 零命中），
+   失败只有一句 `LLMError` 冒到前端，
+   "第几次尝试、finish_reason 是什么、模型到底吐了什么"全丢了。
+   **改法**：新增 `rdi_agent/logging_setup.py`（`logs/rdi.log` + stderr），
+   `llm.py` 每次重试写 warning、最终失败写 error
+   （含 finish_reason / token 数 / 重试经过 / 原始输出前 2000 字），
+   API 的 SSE 错误分支写 error（带 conversation_id + traceback）。
+
+**还没做的**：给 `json_schema` 里的数组加 `maxItems`，
+让模型在解码层就写不下去 —— 这才是治本，
+但会改 schema 指纹（回放 fixture 要重录）。
+
+#### 8.6.4 安全审查：逐卡丢弃 + 前端说真话（2026-10-26 修）
+
+**现象**：家长看到"证据不够，给了有限回答，没有方案卡。"——
+但真实原因**不是证据不够**。
+
+实测会话 `7d939e42…`：证据门控判的是
+`decision="recommend"`、`evidence_status="indirect"`、
+`can_support_personalized_advice=true`、`high_risk=false`，
+三张建议卡也生成成功了（`route_after_recommendation="plans"`）。
+真正拦下来的是安全审查的规则层：
+
+```json
+{"result": "blocked", "rules_hit": ["ignore_distress"],
+ "findings": ["[plan_1] 出现了忽视明显不适的建议。"]}
+```
+
+plan_1 的标题是「尝试忽略孩子的哭闹，让孩子逐渐适应出门过程」——
+命中 `IGNORE_DISTRESS_RULE`（"忽略"+"哭闹"同时出现，severity=hard）。
+
+**两个问题**：
+
+1. **一张卡连坐整组。** 命中的是 plan_1，plan_2、plan_3 一起被丢 ——
+   家长一张卡都拿不到，只剩一段有限回答。
+2. **状态报错了原因。** 前端一律显示"证据不够"，
+   把家长和调试的人引到完全错误的方向。
+
+**改法**：
+
+- `retrieval_nodes.safety_review` 改成**逐卡丢弃**：
+  从 findings 里取出被点名的 plan_id，只丢那几张，剩下的重新过一遍规则，
+  继续走后面的流程；全被点名才退到有限回答。
+  丢掉的是推荐卡时，剩下的补一个推荐位。
+- state 新增 `safety_dropped_plans`；API 的 `_status_of` 区分
+  `safety_blocked`（卡全被拦）和 `limited_answer`（证据真不够）；
+  payload 带上 `safety_review`（结论 / 命中规则 / findings / 丢掉的卡）。
+- 前端 `STATUS_TEXT` 加 `safety_blocked`，
+  `STATUS_HINT` 改成 computed —— 安全审查的说明要带**数量和原因**，
+  静态文案说不清"少了几张、为什么少"。
+
+**覆盖用例**：`tests/test_safety_drop.py`（6 条）。
+
+**顺带发现、还没修的**（同一个会话里）：
+
+- plan_3 整张跑偏：标题是「尝试建立**如厕程序表**帮助孩子理解如厕过程」，
+  和"不愿意去幼儿园"无关（检索把如厕章节拉进来了）。
+- 建议卡引用了「不同年龄和能力水平的**孤独症**儿童干预要点」——
+  这孩子只是 4 岁不愿去幼儿园。
+- 有限回答的正文里出现了原始字段名
+  （`- observe): …`、`- when_to_seek_professional_help): …`）——
+  模型把这几个字段当字符串塞进了 `low_risk_actions` 数组，
+  JSON 合法所以校验放过了。
+
+#### 8.6.5 证据门控：decision 字段没有约束（2026-10-26 修）
+
+**现象**：又出现"证据不够，给了有限回答，没有方案卡。"——
+但这次的原因和 §8.6.4 完全不同。
+
+实测会话 `c0b07701…` 的门控裁决：
+
+```json
+{"evidence_status": "indirect", "supported_claims": [2 条],
+ "unsupported_claims": [1 条], "missing_information": [],
+ "can_support_personalized_advice": true, "high_risk": false,
+ "needs_followup": false, "decision": "followup"}
+```
+
+四个字段自相矛盾：证据撑得住个体化建议、不缺信息、不用再追问，
+唯独 `decision` 填了 `followup`。
+
+**根因**：
+
+1. `EvidenceDecision.decision` 是必填的 `Literal["recommend","limited_answer",
+   "followup","professional_support"]`，但**门控 prompt 里从头到尾没提过
+   `decision` 这个字段** —— 模型只能随便挑一个。
+2. 路由只认两个信号：`needs_followup` → followup，
+   `decision == "recommend"` → recommend，**其余一律 limited_answer**。
+   于是 `decision="followup"` + `needs_followup=false` 掉进 limited_answer。
+3. 门控**根本不允许追问**（`MAX_EVIDENCE_FOLLOWUP_ROUNDS = 0`），
+   所以 "followup" 在这里从来就不是合法出口 —— 约四分之一的轮次
+   会因为这个标签被误判成"证据不够"。
+
+**改法**（三处一起）：
+
+- **prompt**：讲清 `decision` 四个值分别什么时候选，
+  明确"这一轮不要选 followup"（门控不再追问），
+  并要求 `decision` 与 `can_support_personalized_advice` 对得上。
+- **`enforce_rules` 加规则 4**：把对不上的 `decision` 掰回来 ——
+  `followup` 且撑得住个体化建议 → `recommend`，
+  否则 → `limited_answer`；`professional_support` 不动（风险优先）。
+- **路由兜底**：标签再不对，只要 `can_support_personalized_advice` 为真
+  就出卡 —— 不能因为标签错就少给东西。
+
+**覆盖用例**：`tests/test_evidence_gate_decision.py`（6 条）。
+
+#### 8.6.6 门控看不到父块原文：判据没错，是输入被截断了（2026-10-26 修）
+
+**现象**：又出现"仍然证据不够，给了有限回答，没有方案卡。"
+
+实测会话 `399cee38-…1a8540f25359`：
+
+- 检索**其实很好**：8 条证据、8 条可用、`evidence_gaps` 是空的；
+  其中一条正是「（四）针对挑战性行为的干预」（PDF 7-9 页），
+  父块里明明白白写着"功能分析""前因干预""替代行为训练""后果管理"。
+- 门控裁决却是 `indirect` / `can_support=false` / `decision=limited_answer`。
+- 规则层**没有误伤**：规则 2 只在"一条可用证据都没有"时才降级（这里 8/8 可用），
+  规则 4 只在 `decision=="followup"` 时掰回（这里已经是 `limited_answer`）。
+  也就是说这个结论是**模型自己判的**。
+
+**根因不在判据，在输入**：
+
+1. 检索的召回单元是**子块**，`EvidenceItem.summary` 取的是
+   `search.py::_snippet()` —— 子块 `content_original` 的**前 220 字**
+   （`rag/retrieval.py:317`）。
+2. 门控 prompt 里的证据清单（`prompts/chat.py::_evidence_lines`）
+   **只渲染 `summary`，不渲染 `source_excerpt`**。
+3. 这一节的子块恰好是**评估环节** ——
+   "访谈儿童家长时，可通过以下问题分析挑战性行为的功能：这种行为通常发生在
+   一天中的什么时间？……"，而**干预方法全在父块里**
+   （实测偏移量：功能分析@120、前因干预@707、替代行为训练@916、后果管理@1091）。
+
+所以模型看到的是"一份家长访谈问卷 + 几段孤独症章节"，
+判 `indirect` **完全合理** —— 门控没判错，是**证据没给它看全**。
+
+**这也解释了为什么前两次改 prompt 全都无效**：
+当时改的是*判据*（"哪怕标题带孤独症也算 direct"），
+而 prompt 里那句"如果证据里有讲挑战性行为的功能分析、前因干预、
+替代行为训练、后果管理 —— 这就是 direct"提到的这 4 个词，
+模型**根本没读到**。改判据，改不动看不见的东西。
+
+**改法**（只动渲染层，不动判据）：
+
+- `_evidence_lines` 加 `include_excerpt` 参数，
+  门控这一路传 `include_excerpt=True`，把父块原文节选（上限 1200 字，
+  覆盖 707/916/1091 那几个方法）一起渲染进去。
+- 其他调用方（有限回答等）**保持不带原文** —— 有限回答的 prompt 要求
+  "绝对不要补写指南观点"，给它看原文反而会诱发编造。
+
+**实测效果**：同一份证据包连跑 5 次，裁决从
+`indirect` **稳定翻成 `direct`**，模型写出的 supported_claims
+从"孩子早上出门哭闹可能是因为对幼儿园环境的不适应"（证据里根本没有）
+变成"可以采用前因干预、替代行为训练和后果管理的方法来减少孩子的哭闹行为"
+（原文里真有）。
+
+**覆盖用例**：`tests/test_evidence_rendering.py`（5 条）。
+
+#### 8.6.7 门控只保留 high_risk：走哪条路由由代码算（2026-10-26 修）
+
+**现象**：§8.6.6 修完渲染层后，同一份证据（8/8 可用、章节页码对得上）
+两次门控给出**相反**的结论 —— 一次出卡，一次只给家长一段话，
+前端还显示"证据不够"。
+
+**根因**：`EvidenceDecision` 里有两个**模型自由填**的字段决定着
+"给不给方案卡"：
+
+- `can_support_personalized_advice`：模型自评"证据能不能撑住一条个体化建议"；
+- `decision`：模型自选流程决定。
+
+它们和 `supported_claims` 互相矛盾 —— 主张写得很具体，
+`can_support` 却填 false；`decision` 填 `limited_answer` 而
+`evidence_status` 填 `direct`。**同一份证据两次门控结果不同**，
+家长拿到什么成了掷骰子。
+
+**改法**（把决定权从模型手里拿走）：
+
+1. **删掉 `can_support_personalized_advice`** —— 它是重复的信号
+   （和 `evidence_status`、`supported_claims` 表达同一件事），
+   而且是模型自由填的。
+2. **`decision` 不再由模型填** —— 从 `EvidenceDecision` 里删掉，
+   改由 `evidence_gate.py::decide_flow()` **按硬规则算**：
+
+   ```
+   有高风险                    → professional_support
+   一条可用证据都没有          → limited_answer
+   其余                        → recommend（一律出卡）
+   ```
+
+   结果写进 state 的 `evidence_decision["decision"]`，
+   `route_after_evidence_gate` 只读这个**代码算出来的**值。
+3. **`high_risk` 进 json_schema 的 required** ——
+   它是唯一能挡住建议卡的信号，不能靠模型省略。
+   （用 `json_schema_extra` 强制，和 `RecommendationCard.recommended`
+   同一个套路。）
+
+**为什么"证据够不够"不再由门控判断**：那件事本来就有硬闸 ——
+引用校验（`graph/citations.py`）：引用的 `evidence_id` 必须在证据包里、
+页码要对得上、主张里的术语必须真出现在那条证据里。
+**编造引用照样会被丢掉**。门控再叠一层模型自评，纯属增加随机性。
+
+**实测效果**：§8.6.6 那份证据包连跑 3 次，
+`evidence_status=direct` / `high_risk=false` → `flow=recommend`（3/3 稳定）。
+且 supported_claims 里的"调整环境和任务难度""替代行为训练"
+"后果管理"都是**父块原文里真有的方法**。
+
+**覆盖用例**：`tests/test_evidence_gate_decision.py`（11 条，改为测
+`decide_flow`）、`tests/test_schemas.py`（新增两条：字段已删除）。
+
+**副作用**：`decision` 不再是模型契约的一部分，所以
+`tests/test_graph_flow.py` 等文件里构造 `EvidenceDecision` 的地方
+要去掉 `decision=` —— 那些是**模拟模型返回**，现在模型不再返回它。
 
 ### 8.7 交付物
 
@@ -1786,6 +2042,37 @@ RAG 检索
 - 不把“系统建议过”当成“家长执行过”；执行状态由 `trials` 单独记录。
 - 不把“孩子在某个场景下这样”写成“孩子就是这样”。
 - 重要变更需家长确认；确认动作写入 `memory_events.confirmed_by_parent`。
+
+#### 10.5.1 作废事实的过滤边界（2026-10-26 修）
+
+**事故**：一条事实被错判成 `superseded`（被一条完全无关的
+「孩子最近换过老师」顶掉了），它因此进了 `forbidden_facts`。
+家长下一轮**一字不差地又说了同一句**，
+那句话被当成"过期信息"丢掉 —— `observed_facts` 直接变成空数组，
+整轮一条事实都没有。
+
+**根因**：`parse_parent_input` 的过滤条件是"作废内容是新事实的子串就丢"，
+而它**不区分这条事实是上一轮累积的还是本轮新抽的**。
+本轮家长刚说的话，是最新的事实，不可能过期。
+
+**改法**（`graph/nodes/chat_nodes.py`）：
+
+1. **家长重述的保留**：新增 `_restated_terms()` ——
+   拿家长这一轮的**原话**去比对作废内容，凡是家长这轮又说了的，
+   一律不算作废（家长最新的话说了算）。
+2. **作废内容不外泄**：过滤只作用于 `observed_facts`，
+   `retrieval_concepts` / `already_tried` / `missing_information` / `context`
+   全都漏过 —— 实测被 `superseded` 的「换过老师」就是从
+   `retrieval_concepts` 漏进检索 query 的。
+3. **`risk_signals` 不过滤**：家长作废的是一条事实，
+   不是这条事实里可能藏着的风险。风险信号漏一次就可能漏掉
+   「该找专业人士」。
+
+覆盖用例：`tests/test_forbidden_facts.py`（6 条）。
+
+**还没修的**：`supersede` 的判定本身还是模型说了算 ——
+它把两条无关的事实判成了"后者顶替前者"。
+收紧它要动记忆写入路径，风险更大，单独排期。
 
 ### 10.6 任务
 

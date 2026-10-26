@@ -1,37 +1,37 @@
-{"case_id": "tantrum_challenging", "query": "孩子发脾气，摔东西尖叫", "category": "情绪行为", "expected_sections": ["006_针对挑战性行为的干预", "019_挑战性行为干预要点"], "must_include_terms": ["挑战性行为", "功能分析"], "notes": "发脾气在指南里对应「挑战性行为」。核心章节 + 附件3。"}
-{"case_id": "tantrum_function", "query": "孩子为什么总是发脾气，他想得到什么", "category": "情绪行为", "expected_sections": ["006_针对挑战性行为的干预", "019_挑战性行为干预要点"], "must_include_terms": ["功能分析", "前因", "后果"], "notes": "指南要求先做功能分析，弄清行为的继存功能。"}
-{"case_id": "tantrum_extinction", "query": "孩子一直要抱，不抱就哭怎么办", "category": "情绪行为", "expected_sections": ["018_常用于孤独症儿童的行为干预策略", "006_针对挑战性行为的干预"], "must_include_terms": ["消退", "强化"], "notes": "为了获取关注的行为用消退策略。附件2 讲得最细。"}
-{"case_id": "problem_behavior_function", "query": "孩子为了逃避任务就不动，怎么改", "category": "情绪行为", "expected_sections": ["019_挑战性行为干预要点", "018_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["逃避", "消退", "替代行为"], "notes": "逃避任务的功能行为 —— 附件3 有专门一行。"}
-{"case_id": "stereotype_interest", "query": "孩子只玩一样东西，怎么也不肯换", "category": "局限兴趣", "expected_sections": ["005_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预"], "must_include_terms": ["局限兴趣", "重复刻板行为"], "notes": "局限兴趣和重复刻板行为是独立一章。"}
-{"case_id": "repetitive_behavior", "query": "孩子一直转圈拍手，怎么干预", "category": "局限兴趣", "expected_sections": ["005_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预"], "must_include_terms": ["重复刻板行为", "适应性行为"], "notes": "重复刻板行为的干预原则。"}
-{"case_id": "deficit_social", "query": "孩子不会跟人打招呼，也不会眼神交流", "category": "缺陷行为", "expected_sections": ["004_针对缺陷行为的干预康复"], "must_include_terms": ["社会交往", "共同注意", "模仿"], "notes": "针对缺陷行为的干预康复 —— 发展水平评估和训练目标。"}
-{"case_id": "deficit_language", "query": "孩子两岁半还不会说话，语言发育慢", "category": "缺陷行为", "expected_sections": ["004_针对缺陷行为的干预康复"], "must_include_terms": ["语言", "发育水平评估"], "notes": "语言发育属于缺陷行为干预的范围，要先做发育水平评估。"}
-{"case_id": "individualized_plan", "query": "干预计划应该怎么定，按什么标准", "category": "干预原则", "expected_sections": ["004_针对缺陷行为的干预康复", "001_干预康复基本原则"], "must_include_terms": ["个体化", "发育水平评估", "季度目标"], "notes": "个体化干预原则 + 训练目标的制定。"}
-{"case_id": "early_intervention", "query": "孩子已经三岁了，现在开始干预还来得及吗", "category": "干预原则", "expected_sections": ["001_干预康复基本原则", "000_干预康复目的"], "must_include_terms": ["早期干预", "越早越好"], "notes": "早期干预原则。"}
-{"case_id": "intensity_hours", "query": "每天要陪孩子练多久，一周多少小时", "category": "干预原则", "expected_sections": ["001_干预康复基本原则"], "must_include_terms": ["长程高强度", "20 小时", "干预时间"], "notes": "长程高强度原则 —— 指南给了具体数字：每周 20 小时以上。"}
-{"case_id": "family_role", "query": "家长要做什么，家里怎么配合", "category": "家庭干预", "expected_sections": ["008_家庭干预", "003_健康教育"], "must_include_terms": ["家庭干预", "培训家庭干预基本技能"], "notes": "家庭干预章节 + 健康教育。"}
-{"case_id": "parent_psych_support", "query": "我天天照顾孩子很崩溃，没人帮我", "category": "家长支持", "expected_sections": ["003_健康教育"], "must_include_terms": ["家长心理支持", "情绪调节"], "notes": "健康教育里的「家长心理支持」一条。"}
-{"case_id": "behavior_strategy_positive_reinforcement", "query": "孩子做对了要怎么奖励", "category": "干预策略", "expected_sections": ["018_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["正强化", "强化物"], "notes": "附件2 的正强化策略。"}
-{"case_id": "behavior_strategy_prompting", "query": "孩子做不好，我要怎么帮他，提示到什么程度", "category": "干预策略", "expected_sections": ["018_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["辅助", "高级辅助", "低级辅助"], "notes": "附件2 的辅助策略 —— 从高级辅助逐步减少。"}
-{"case_id": "behavior_strategy_differential", "query": "孩子做别的事的时候该怎么强化", "category": "干预策略", "expected_sections": ["018_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["差别强化"], "notes": "附件2 的差别强化。"}
-{"case_id": "antecedent_intervention", "query": "能不能从环境上想办法，别让他有机会发脾气", "category": "干预策略", "expected_sections": ["006_针对挑战性行为的干预", "018_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["前因干预", "环境结构化"], "notes": "前因干预：环境结构化、任务分解、提供选择。"}
-{"case_id": "alternative_behavior", "query": "孩子想要东西就哭，怎么教他用别的方式要", "category": "干预策略", "expected_sections": ["006_针对挑战性行为的干预"], "must_include_terms": ["替代行为", "功能分析"], "notes": "替代行为训练。"}
-{"case_id": "coexisting_problem", "query": "孩子同时有睡眠问题，夜里总醒", "category": "共存问题", "expected_sections": ["007_共存问题和共患病干预", "020_常见共存问题干预要点"], "must_include_terms": ["共存问题", "睡眠"], "notes": "共存问题章节 + 附件4。"}
-{"case_id": "eating_problem", "query": "孩子不肯吃饭，只吃那几样东西", "category": "共存问题", "expected_sections": ["020_常见共存问题干预要点", "007_共存问题和共患病干预"], "must_include_terms": ["饮食问题", "进食"], "notes": "附件4 的饮食问题干预要点。"}
-{"case_id": "toilet_problem", "query": "孩子四岁了还尿裤子，怎么训练如厕", "category": "共存问题", "expected_sections": ["020_常见共存问题干预要点"], "must_include_terms": ["如厕"], "notes": "附件4 的如厕问题。"}
-{"case_id": "comorbidity_epilepsy", "query": "孩子有癫痫，还能做行为干预吗", "category": "共患病", "expected_sections": ["007_共存问题和共患病干预"], "must_include_terms": ["共患病", "癫痫"], "notes": "共患病干预。"}
-{"case_id": "age_specific", "query": "一岁半的孩子该怎么练", "category": "年龄阶段", "expected_sections": ["017_不同年龄和能力水平的孤独症儿童干预要点"], "must_include_terms": ["月龄", "干预目标"], "notes": "附件1 的分年龄干预要点。"}
-{"case_id": "school_transition", "query": "上小学了怎么准备，让他能跟上", "category": "年龄阶段", "expected_sections": ["017_不同年龄和能力水平的孤独症儿童干预要点", "001_干预康复基本原则"], "must_include_terms": ["学龄期", "融合"], "notes": "附件1 学龄期行 + 社会融合原则。"}
-{"case_id": "psychotherapy", "query": "要不要给孩子做心理治疗", "category": "干预内容", "expected_sections": ["009_心理治疗"], "must_include_terms": [], "notes": "心理治疗是独立小节。"}
-{"case_id": "digital_intervention", "query": "能不能用手机APP或者线上课程来干预", "category": "干预内容", "expected_sections": ["010_数智干预康复"], "must_include_terms": [], "notes": "数智干预康复。"}
-{"case_id": "follow_up", "query": "多久要复诊一次，要评估什么", "category": "随访", "expected_sections": ["011_随访"], "must_include_terms": [], "notes": "随访章节。"}
-{"case_id": "venue_staff", "query": "干预要在哪里做，谁来做", "category": "实施条件", "expected_sections": ["013_干预康复场地", "014_干预康复人员"], "must_include_terms": [], "notes": "干预康复场地和人员。"}
-{"case_id": "grassroots", "query": "老家没有专门机构，去哪里做", "category": "实施条件", "expected_sections": ["001_干预康复基本原则", "013_干预康复场地"], "must_include_terms": ["基层", "就近就便"], "notes": "基层为主原则 + 场地。"}
-{"case_id": "quality_control", "query": "怎么判断干预有没有效，质量怎么控", "category": "质量", "expected_sections": ["015_质量控制"], "must_include_terms": [], "notes": "质量控制章节。"}
-{"case_id": "definitions", "query": "指南里说的挑战性行为到底指什么", "category": "名词解释", "expected_sections": ["016_名词解释"], "must_include_terms": [], "notes": "名词解释章节。"}
-{"case_id": "effect_evaluation", "query": "怎么知道干预有没有效果，看哪些指标", "category": "评估", "expected_sections": ["006_针对挑战性行为的干预", "017_不同年龄和能力水平的孤独症儿童干预要点"], "must_include_terms": ["效果评估"], "notes": "效果评估散在正文章节。"}
-{"case_id": "social_communication_training", "query": "怎么练孩子的社交和沟通", "category": "缺陷行为", "expected_sections": ["004_针对缺陷行为的干预康复"], "must_include_terms": ["社会交往", "沟通", "回合试验教学"], "notes": "训练方法里讲社交沟通技能训练。"}
-{"case_id": "group_intervention", "query": "几个孩子一起上课合适吗", "category": "训练形式", "expected_sections": ["004_针对缺陷行为的干预康复"], "must_include_terms": ["团体干预", "个体干预"], "notes": "训练形式：个体干预和团体干预。"}
+{"case_id": "tantrum_challenging", "query": "孩子发脾气，摔东西尖叫", "category": "情绪行为", "expected_sections": ["007_针对挑战性行为的干预", "020_挑战性行为干预要点"], "must_include_terms": ["挑战性行为", "功能分析"], "notes": "发脾气在指南里对应「挑战性行为」。核心章节 + 附件3。"}
+{"case_id": "tantrum_function", "query": "孩子为什么总是发脾气，他想得到什么", "category": "情绪行为", "expected_sections": ["007_针对挑战性行为的干预", "020_挑战性行为干预要点"], "must_include_terms": ["功能分析", "前因", "后果"], "notes": "指南要求先做功能分析，弄清行为的继存功能。"}
+{"case_id": "tantrum_extinction", "query": "孩子一直要抱，不抱就哭怎么办", "category": "情绪行为", "expected_sections": ["019_常用于孤独症儿童的行为干预策略", "007_针对挑战性行为的干预"], "must_include_terms": ["消退", "强化"], "notes": "为了获取关注的行为用消退策略。附件2 讲得最细。"}
+{"case_id": "problem_behavior_function", "query": "孩子为了逃避任务就不动，怎么改", "category": "情绪行为", "expected_sections": ["020_挑战性行为干预要点", "019_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["逃避", "消退", "替代行为"], "notes": "逃避任务的功能行为 —— 附件3 有专门一行。"}
+{"case_id": "stereotype_interest", "query": "孩子只玩一样东西，怎么也不肯换", "category": "局限兴趣", "expected_sections": ["006_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预"], "must_include_terms": ["局限兴趣", "重复刻板行为"], "notes": "局限兴趣和重复刻板行为是独立一章。"}
+{"case_id": "repetitive_behavior", "query": "孩子一直转圈拍手，怎么干预", "category": "局限兴趣", "expected_sections": ["006_针对非适应性_非功能性的局限兴趣和重复刻板行为的干预"], "must_include_terms": ["重复刻板行为", "适应性行为"], "notes": "重复刻板行为的干预原则。"}
+{"case_id": "deficit_social", "query": "孩子不会跟人打招呼，也不会眼神交流", "category": "缺陷行为", "expected_sections": ["005_针对缺陷行为的干预康复"], "must_include_terms": ["社会交往", "共同注意", "模仿"], "notes": "针对缺陷行为的干预康复 —— 发展水平评估和训练目标。"}
+{"case_id": "deficit_language", "query": "孩子两岁半还不会说话，语言发育慢", "category": "缺陷行为", "expected_sections": ["005_针对缺陷行为的干预康复"], "must_include_terms": ["语言", "发育水平评估"], "notes": "语言发育属于缺陷行为干预的范围，要先做发育水平评估。"}
+{"case_id": "individualized_plan", "query": "干预计划应该怎么定，按什么标准", "category": "干预原则", "expected_sections": ["005_针对缺陷行为的干预康复", "002_干预康复基本原则"], "must_include_terms": ["个体化", "发育水平评估", "季度目标"], "notes": "个体化干预原则 + 训练目标的制定。"}
+{"case_id": "early_intervention", "query": "孩子已经三岁了，现在开始干预还来得及吗", "category": "干预原则", "expected_sections": ["002_干预康复基本原则", "001_干预康复目的"], "must_include_terms": ["早期干预", "越早越好"], "notes": "早期干预原则。"}
+{"case_id": "intensity_hours", "query": "每天要陪孩子练多久，一周多少小时", "category": "干预原则", "expected_sections": ["002_干预康复基本原则"], "must_include_terms": ["长程高强度", "20 小时", "干预时间"], "notes": "长程高强度原则 —— 指南给了具体数字：每周 20 小时以上。"}
+{"case_id": "family_role", "query": "家长要做什么，家里怎么配合", "category": "家庭干预", "expected_sections": ["009_家庭干预", "004_健康教育"], "must_include_terms": ["家庭干预", "培训家庭干预基本技能"], "notes": "家庭干预章节 + 健康教育。"}
+{"case_id": "parent_psych_support", "query": "我天天照顾孩子很崩溃，没人帮我", "category": "家长支持", "expected_sections": ["004_健康教育"], "must_include_terms": ["家长心理支持", "情绪调节"], "notes": "健康教育里的「家长心理支持」一条。"}
+{"case_id": "behavior_strategy_positive_reinforcement", "query": "孩子做对了要怎么奖励", "category": "干预策略", "expected_sections": ["019_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["正强化", "强化物"], "notes": "附件2 的正强化策略。"}
+{"case_id": "behavior_strategy_prompting", "query": "孩子做不好，我要怎么帮他，提示到什么程度", "category": "干预策略", "expected_sections": ["019_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["辅助", "高级辅助", "低级辅助"], "notes": "附件2 的辅助策略 —— 从高级辅助逐步减少。"}
+{"case_id": "behavior_strategy_differential", "query": "孩子做别的事的时候该怎么强化", "category": "干预策略", "expected_sections": ["019_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["差别强化"], "notes": "附件2 的差别强化。"}
+{"case_id": "antecedent_intervention", "query": "能不能从环境上想办法，别让他有机会发脾气", "category": "干预策略", "expected_sections": ["007_针对挑战性行为的干预", "019_常用于孤独症儿童的行为干预策略"], "must_include_terms": ["前因干预", "环境结构化"], "notes": "前因干预：环境结构化、任务分解、提供选择。"}
+{"case_id": "alternative_behavior", "query": "孩子想要东西就哭，怎么教他用别的方式要", "category": "干预策略", "expected_sections": ["007_针对挑战性行为的干预"], "must_include_terms": ["替代行为", "功能分析"], "notes": "替代行为训练。"}
+{"case_id": "coexisting_problem", "query": "孩子同时有睡眠问题，夜里总醒", "category": "共存问题", "expected_sections": ["008_共存问题和共患病干预", "021_常见共存问题干预要点"], "must_include_terms": ["共存问题", "睡眠"], "notes": "共存问题章节 + 附件4。"}
+{"case_id": "eating_problem", "query": "孩子不肯吃饭，只吃那几样东西", "category": "共存问题", "expected_sections": ["021_常见共存问题干预要点", "008_共存问题和共患病干预"], "must_include_terms": ["饮食问题", "进食"], "notes": "附件4 的饮食问题干预要点。"}
+{"case_id": "toilet_problem", "query": "孩子四岁了还尿裤子，怎么训练如厕", "category": "共存问题", "expected_sections": ["021_常见共存问题干预要点"], "must_include_terms": ["如厕"], "notes": "附件4 的如厕问题。"}
+{"case_id": "comorbidity_epilepsy", "query": "孩子有癫痫，还能做行为干预吗", "category": "共患病", "expected_sections": ["008_共存问题和共患病干预"], "must_include_terms": ["共患病", "癫痫"], "notes": "共患病干预。"}
+{"case_id": "age_specific", "query": "一岁半的孩子该怎么练", "category": "年龄阶段", "expected_sections": ["018_不同年龄和能力水平的孤独症儿童干预要点"], "must_include_terms": ["月龄", "干预目标"], "notes": "附件1 的分年龄干预要点。"}
+{"case_id": "school_transition", "query": "上小学了怎么准备，让他能跟上", "category": "年龄阶段", "expected_sections": ["018_不同年龄和能力水平的孤独症儿童干预要点", "002_干预康复基本原则"], "must_include_terms": ["学龄期", "融合"], "notes": "附件1 学龄期行 + 社会融合原则。"}
+{"case_id": "psychotherapy", "query": "要不要给孩子做心理治疗", "category": "干预内容", "expected_sections": ["010_心理治疗"], "must_include_terms": [], "notes": "心理治疗是独立小节。"}
+{"case_id": "digital_intervention", "query": "能不能用手机APP或者线上课程来干预", "category": "干预内容", "expected_sections": ["011_数智干预康复"], "must_include_terms": [], "notes": "数智干预康复。"}
+{"case_id": "follow_up", "query": "多久要复诊一次，要评估什么", "category": "随访", "expected_sections": ["012_随访"], "must_include_terms": [], "notes": "随访章节。"}
+{"case_id": "venue_staff", "query": "干预要在哪里做，谁来做", "category": "实施条件", "expected_sections": ["014_干预康复场地", "015_干预康复人员"], "must_include_terms": [], "notes": "干预康复场地和人员。"}
+{"case_id": "grassroots", "query": "老家没有专门机构，去哪里做", "category": "实施条件", "expected_sections": ["002_干预康复基本原则", "014_干预康复场地"], "must_include_terms": ["基层", "就近就便"], "notes": "基层为主原则 + 场地。"}
+{"case_id": "quality_control", "query": "怎么判断干预有没有效，质量怎么控", "category": "质量", "expected_sections": ["016_质量控制"], "must_include_terms": [], "notes": "质量控制章节。"}
+{"case_id": "definitions", "query": "指南里说的挑战性行为到底指什么", "category": "名词解释", "expected_sections": ["017_名词解释"], "must_include_terms": [], "notes": "名词解释章节。"}
+{"case_id": "effect_evaluation", "query": "怎么知道干预有没有效果，看哪些指标", "category": "评估", "expected_sections": ["007_针对挑战性行为的干预", "018_不同年龄和能力水平的孤独症儿童干预要点"], "must_include_terms": ["效果评估"], "notes": "效果评估散在正文章节。"}
+{"case_id": "social_communication_training", "query": "怎么练孩子的社交和沟通", "category": "缺陷行为", "expected_sections": ["005_针对缺陷行为的干预康复"], "must_include_terms": ["社会交往", "沟通", "回合试验教学"], "notes": "训练方法里讲社交沟通技能训练。"}
+{"case_id": "group_intervention", "query": "几个孩子一起上课合适吗", "category": "训练形式", "expected_sections": ["005_针对缺陷行为的干预康复"], "must_include_terms": ["团体干预", "个体干预"], "notes": "训练形式：个体干预和团体干预。"}
 {"case_id": "irrelevant_cooking", "query": "红烧肉怎么做才好吃", "category": "无关问题", "expected_sections": [], "must_include_terms": [], "notes": "无关问题 —— 必须返回零证据。"}
 {"case_id": "irrelevant_weather", "query": "明天上海天气怎么样", "category": "无关问题", "expected_sections": [], "must_include_terms": [], "notes": "无关问题 —— 必须返回零证据。"}
 {"case_id": "irrelevant_school_math", "query": "三年级数学乘法口诀怎么背", "category": "无关问题", "expected_sections": [], "must_include_terms": [], "notes": "无关问题 —— 必须返回零证据。"}
