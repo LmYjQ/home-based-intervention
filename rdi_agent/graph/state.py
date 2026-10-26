@@ -107,7 +107,17 @@ class CoachState(TypedDict, total=False):
     plan_title: str
     # 这次尝试执行的方案正文和版本 —— analyze/next_step/adjust 都要看
     plan_context: dict[str, Any]
+    # 方案版本：1 = 首版，修订一次 +1。卡号前缀也按它生成。
     plan_version: int
+    # 家长在反馈里补充的新情况。首版为空；修订版会透给生成 prompt。
+    revision_note: str
+    # 修订来源：{"trial_id", "turn_id", "base_plan_version", "fork_checkpoint_id"}
+    revision_source: dict[str, Any]
+    # 生成这一版之前的 checkpoint id，落进 plans.fork_checkpoint_id。
+    # 下次修订从它分叉，事实/证据/门控结论都沿用。
+    fork_checkpoint_id: str
+    # 修订时复用/重跑了哪些环节（给接口响应和调试看）
+    revision_reused: list[str]
     # 反馈提交后 trial 的执行状态（attempted / not_attempted / stopped）
     trial_status: str
     selected_plan_db_id: str

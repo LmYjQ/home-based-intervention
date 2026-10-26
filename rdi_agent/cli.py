@@ -147,7 +147,7 @@ async def _demo() -> None:
 
     if status != "awaiting_plan_selection":
         print(f"\n演示输入没走到方案选择就结束了（status={status}），这和预期不符。")
-        print("如果是 limited_answer，说明证据门控没放行 —— 看上面的证据缺口。")
+        print("如果是 limited_answer，说明建议卡没生成出来 —— 看上面的证据缺口和日志。")
         return
 
     pick = next(p["plan_id"] for p in plans if p.get("recommended"))

@@ -87,6 +87,11 @@ export const api = {
   getFeedback: (trialId, turnId) =>
     request(`/api/trials/${trialId}/feedback/${encodeURIComponent(turnId)}`),
 
+  // 反馈里补充新情况 → 从"生成建议卡"之前分叉，只重出方案。
+  // turn_id 是幂等键，同一次修订重试要沿用同一个值。
+  revisePlan: (trialId, payload) =>
+    request(`/api/trials/${trialId}/revise`, { method: 'POST', body: payload }),
+
   // ---- 调试（阶段 5）----
   debugState: (conversationId, threadId) => {
     const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ''

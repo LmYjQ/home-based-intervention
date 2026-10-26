@@ -17,6 +17,7 @@ from rdi_agent.api.conversations import router as conversations_router
 from rdi_agent.api.debug import router as debug_router
 from rdi_agent.api.health import check_all
 from rdi_agent.api.memory import router as memory_router
+from rdi_agent.api.revision import router as revision_router
 from rdi_agent.config import get_settings
 from rdi_agent.logging_setup import setup_logging
 
@@ -52,6 +53,7 @@ app = FastAPI(
 app.include_router(children_router)
 app.include_router(conversations_router)
 app.include_router(memory_router)
+app.include_router(revision_router)
 app.include_router(debug_router)
 
 

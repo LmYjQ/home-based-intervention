@@ -269,6 +269,12 @@ class Plan(Base):
     )
     conversation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     plan_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    # 产生这一版方案的那一轮（聊天 turn 或修订 turn）。
+    # 修订请求按它判重：同一个 turn_id 不生成第二版。
+    source_turn_id: Mapped[str | None] = mapped_column(String(64))
+    # 分叉起点：生成这一版之前的那个 checkpoint。
+    # 修订时从这里派生新分支，事实/证据/门控结论都沿用。
+    fork_checkpoint_id: Mapped[str | None] = mapped_column(String(255))
     plan_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     evidence_bundle_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("evidence_bundles.id")

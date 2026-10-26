@@ -265,11 +265,18 @@ class Repository:
         child_id: str | None,
         cards: list[RecommendationCard],
         evidence_bundle_id: uuid.UUID | None = None,
+        plan_version: int = 1,
+        source_turn_id: str | None = None,
+        fork_checkpoint_id: str | None = None,
     ) -> dict[str, uuid.UUID]:
         """把候选建议卡落库，返回 {plan_id: db_uuid}。
 
         同一 conversation 已经存过的卡不再重复写 —— 一轮只应该出一组候选，
         重试同一轮请求时保住原来的 UUID，不然 select-plan 会指向一条新记录。
+
+        **修订版靠卡号前缀区分**：第 2 版起卡号是 ``r2_plan_1``，
+        和旧版的 ``plan_1`` 不会撞车 —— 不加前缀的话新卡会被这里
+        当成"已经存过"直接跳过，家长选到的仍是旧卡。
         """
         existing = (
             await self.session.execute(
@@ -288,6 +295,9 @@ class Repository:
                 family_id=uuid.UUID(str(family_id)),
                 child_id=uuid.UUID(str(child_id)) if child_id else None,
                 conversation_id=conversation_id,
+                plan_version=plan_version,
+                source_turn_id=source_turn_id,
+                fork_checkpoint_id=fork_checkpoint_id,
                 plan_json=card.model_dump(mode="json"),
                 evidence_bundle_id=evidence_bundle_id,
                 application_label=card.application_label,
@@ -379,6 +389,9 @@ class Repository:
                 .order_by(Plan.created_at)
             )
         ).scalars().all()
+        # 最新的一版是"当前版本"，更早的版本在界面上标为"已归档"。
+        # 不直接改 status：旧卡可能还在被某次尝试执行，改了会丢执行痕迹。
+        current_version = max((r.plan_version or 1 for r in rows), default=1)
         result: list[dict[str, Any]] = []
         for r in rows:
             card = dict(r.plan_json or {})
@@ -389,12 +402,71 @@ class Repository:
                 "status": r.status,
                 "recommended": r.recommended,
                 "application_label": r.application_label,
+                "plan_version": r.plan_version or 1,
+                "is_current_version": (r.plan_version or 1) == current_version,
+                "source_turn_id": r.source_turn_id,
+                "fork_checkpoint_id": r.fork_checkpoint_id,
                 # 整张卡。前面那几个字段是为了兼容，card 才是完整的。
                 **card,
                 "card": card,
             }
             result.append(item)
         return result
+
+    async def get_latest_plan(self, conversation_id: str) -> Plan | None:
+        """这个会话最新一版方案里的一张卡。
+
+        修订版从**最新一版**的分叉点继续分叉（v1→v2→v3 形成一条链），
+        而不是每次都回到 v1，否则反复修订会互相覆盖。
+        """
+        return (
+            await self.session.execute(
+                select(Plan)
+                .where(Plan.conversation_id == conversation_id)
+                .order_by(Plan.plan_version.desc(), Plan.created_at.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+
+    async def get_plans_by_source_turn(
+        self, *, conversation_id: str, source_turn_id: str
+    ) -> list[Plan]:
+        """取某一轮（通常是一次修订）产生的方案。
+
+        修订请求的幂等靠它：同一个 ``turn_id`` 再来一次时，
+        这一版方案已经存在，直接回读，不再派生第二条分支。
+        """
+        if not source_turn_id:
+            return []
+        rows = (
+            await self.session.execute(
+                select(Plan)
+                .where(
+                    Plan.conversation_id == conversation_id,
+                    Plan.source_turn_id == source_turn_id,
+                )
+                .order_by(Plan.created_at)
+            )
+        ).scalars().all()
+        return list(rows)
+
+    async def get_interaction(
+        self, *, conversation_id: str, turn_id: str, role: str
+    ) -> Interaction | None:
+        """这一轮的这个角色的交互记录。
+
+        修订成功后会写一条 user 交互；它同时充当"这次修订已经跑过"
+        的幂等标记 —— 风险分支不出卡，光靠 plans 判重覆盖不到。
+        """
+        return (
+            await self.session.execute(
+                select(Interaction).where(
+                    Interaction.conversation_id == conversation_id,
+                    Interaction.turn_id == turn_id,
+                    Interaction.role == role,
+                )
+            )
+        ).scalars().first()
 
     async def get_trial(self, trial_id: str) -> Trial | None:
         return await self.session.get(Trial, uuid.UUID(str(trial_id)))

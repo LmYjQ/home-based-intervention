@@ -959,8 +959,8 @@ async def test_short_ids_are_translated_to_real_evidence_ids(patched_llm):
 
 
 @pytest.mark.asyncio
-async def test_fragment_citing_unknown_evidence_is_dropped(patched_llm):
-    """片段引用了不存在的那条 —— 这张卡要被丢掉，不能带病放行。"""
+async def test_fragment_citing_unknown_evidence_is_stripped(patched_llm):
+    """片段引用了不存在的那条 —— 摘掉引用，卡片保留，不能带病放行。"""
     card = RecommendationCard(
         plan_id="plan_1",
         title="方案 1",
@@ -984,7 +984,42 @@ async def test_fragment_citing_unknown_evidence_is_dropped(patched_llm):
         "evidence_bundle": _bundle(),
     }
     out = await chat_nodes.build_recommendation(state)
-    assert out["candidate_plans"] == []
-    # 降级成有限回答，并且 trace 里留了痕
-    assert out["route_after_recommendation"] == "limited_answer"
-    assert "citation_validation_failed" in out["trace_metadata"]["build_recommendation"]
+    # 卡不再整张丢掉：引用被摘掉，卡留下来。
+    assert len(out["candidate_plans"]) == 1
+    card = out["candidate_plans"][0]
+    assert out["route_after_recommendation"] == "plans"
+    assert card["explanation_parts"][0]["evidence_ids"] == []
+    assert card["source_citations"] == []
+    assert card["application_label"] == "ai_adaptation"
+    assert any("引用未通过校验" in note for note in card["uncertainty_notes"])
+    # trace 里能看出摘掉了什么
+    assert "citation_stripped" in out["trace_metadata"]["build_recommendation"]
+
+
+@pytest.mark.asyncio
+async def test_only_failed_card_gets_citations_stripped(patched_llm):
+    """一张卡引用坏了，不能连累另一张干净的卡。"""
+    good = _card("plan_1", True)
+    bad = _card("plan_2", False)
+    bad.source_citations[0].source_id = "E9"  # 不存在的证据 → 校验失败
+    patched_llm(
+        {
+            RecommendationSet: RecommendationSet(
+                plans=[good, bad], comparison_note=""
+            )
+        }
+    )
+    state = {
+        "case_summary": {},
+        "child_context": {},
+        "evidence_bundle": _bundle(),
+    }
+    out = await chat_nodes.build_recommendation(state)
+    plans = {p["plan_id"]: p for p in out["candidate_plans"]}
+    assert set(plans) == {"plan_1", "plan_2"}
+    # 干净的卡原样保留
+    assert plans["plan_1"]["application_label"] == "source_summary"
+    assert plans["plan_1"]["source_citations"]
+    # 有问题的卡只摘引用，卡片本身还在
+    assert plans["plan_2"]["application_label"] == "ai_adaptation"
+    assert plans["plan_2"]["source_citations"] == []

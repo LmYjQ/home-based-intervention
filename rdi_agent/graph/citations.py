@@ -7,8 +7,11 @@
 计划 §4.3 的硬规则原文：
 
 > ``RecommendationCard`` 的每一条 ``source_citations`` 必须能在当前
-> ``EvidenceBundle`` 中找到对应 ``evidence_id``；找不到就判定为编造引用，
-> 整张卡重试或降级为 ``limited_answer``。
+> ``EvidenceBundle`` 中找到对应 ``evidence_id``；找不到就判定为编造引用。
+
+现在的处理（2026-10-26 改）：带错误重试一次；仍有问题的引用会被
+摘掉，卡片保留并降级为 ``ai_adaptation``。只有模型一张卡都生成不出来
+时才降级为 ``limited_answer``。
 
 **字段语义的坑**（交接说明 §2.3）：``SourceCitation.source_id`` 里放的是
 **``evidence_id``（chunk 的 UUID）**，不是 ``knowledge_sources.source_id``
@@ -377,6 +380,111 @@ def validate_cards(
         if errors:
             problems[card.plan_id] = errors
     return problems
+
+
+def sanitize_card_citations(
+    card: RecommendationCard,
+    bundle: EvidenceBundle,
+) -> tuple[RecommendationCard, list[str]]:
+    """摘掉通不过校验的引用，保留卡片。
+
+    **为什么不再整张丢**：家长要的是能执行的动作，一条出处对不上
+    不代表整张卡没用。直接丢掉会让家长在三轮追问后只拿到一段文字。
+    这里只摘掉对不上的引用，并把卡片降级为 ``ai_adaptation``，
+    在 ``uncertainty_notes`` 里说明 —— 不把编造的出处给家长看。
+
+    返回 ``(卡片, 摘掉的内容)``；没有问题时原样返回。
+    """
+    source_errors = validate_card_citations(card, bundle)
+    fragment_errors = validate_card_fragments(card, bundle)
+    if not source_errors and not fragment_errors:
+        return card, []
+
+    removed: list[str] = []
+    index = {e.evidence_id: e for e in bundle.evidence}
+
+    kept_citations: list[SourceCitation] = []
+    for citation in card.source_citations:
+        check = check_citation(citation, bundle)
+        if check.errors:
+            removed.append(
+                f"引用 {str(citation.source_id)[:8]}：{check.errors[0]}"
+            )
+        else:
+            kept_citations.append(citation)
+    card.source_citations = kept_citations
+
+    for i, part in enumerate(card.explanation_parts, start=1):
+        kept_ids: list[str] = []
+        for evidence_id in part.evidence_ids:
+            if evidence_id not in index:
+                removed.append(f"说明第 {i} 段：证据 {evidence_id} 不在证据包里")
+                continue
+            errors = _check_fragment(
+                part.text,
+                [evidence_id],
+                index,
+                where=f"说明第 {i} 段",
+                require_binding=False,
+            )
+            if errors:
+                removed.append(f"说明第 {i} 段：{errors[0]}")
+            else:
+                kept_ids.append(evidence_id)
+        part.evidence_ids = kept_ids
+
+    for i, action in enumerate(card.parent_actions, start=1):
+        text = " ".join(
+            [
+                action.action,
+                action.context,
+                *action.steps,
+                *action.observe,
+                *action.reduce_or_stop_if,
+            ]
+        )
+        kept_ids = []
+        for evidence_id in action.evidence_ids:
+            if evidence_id not in index:
+                removed.append(f"动作 {i}：证据 {evidence_id} 不在证据包里")
+                continue
+            errors = _check_fragment(
+                text,
+                [evidence_id],
+                index,
+                where=f"动作 {i}（{action.action}）",
+                require_binding=False,
+            )
+            if errors:
+                removed.append(f"动作 {i}：{errors[0]}")
+            else:
+                kept_ids.append(evidence_id)
+        action.evidence_ids = kept_ids
+
+    if card.application_label != "ai_adaptation":
+        card.application_label = "ai_adaptation"
+    note = (
+        "本卡的引用未通过校验，已去掉出处；"
+        "以下只是结合您描述的情况做的应用建议，不是指南原文。"
+    )
+    if note not in card.uncertainty_notes:
+        card.uncertainty_notes.append(note)
+
+    # 兜底：逐条过滤后仍有问题（例如证据包为空却还有引用），
+    # 就把所有出处清掉。卡片本身仍然保留。
+    if validate_card_citations(card, bundle) or validate_card_fragments(card, bundle):
+        card.source_citations = []
+        for part in card.explanation_parts:
+            part.evidence_ids = []
+        for action in card.parent_actions:
+            action.evidence_ids = []
+        if card.application_label != "ai_adaptation":
+            card.application_label = "ai_adaptation"
+
+    if not removed:
+        removed.append("引用校验未通过，已降级为应用建议")
+
+    return card, removed
 
 
 # --------------------------------------------------------------- 短编号

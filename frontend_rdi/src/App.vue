@@ -66,6 +66,11 @@ const trialId = ref('')
 const finalMessage = ref('')
 const feedbackResult = ref(null)
 
+// 方案修订（反馈里补充新情况 → 只重出方案）
+const reviseNote = ref('')
+// 同一次修订重试必须沿用同一个 turn_id（后端用它判重）
+const revisionTurnId = ref('')
+
 // 长期记忆（阶段 3）
 const memories = ref([])
 const memoryPending = ref(0)
@@ -128,6 +133,27 @@ const accountOptions = computed(() => {
     ]
   }
   return children.value
+})
+
+// 方案按版本分组。修订后当前版本可选，旧版本灰显保留，
+// 家长能看到"第 1 版和第 2 版差在哪"。
+const currentPlanVersion = computed(() =>
+  plans.value.reduce((max, p) => Math.max(max, Number(p.plan_version) || 1), 1),
+)
+const planGroups = computed(() => {
+  const groups = new Map()
+  for (const plan of plans.value) {
+    const version = Number(plan.plan_version) || 1
+    if (!groups.has(version)) groups.set(version, [])
+    groups.get(version).push(plan)
+  }
+  return [...groups.entries()]
+    .sort((a, b) => b[0] - a[0])
+    .map(([version, list]) => ({
+      version,
+      plans: list,
+      archived: version < currentPlanVersion.value,
+    }))
 })
 
 // 下拉里的显示名。
@@ -404,6 +430,8 @@ function resetTurnState() {
   evidenceGaps.value = []
   safetyReview.value = {}
   feedbackResult.value = null
+  reviseNote.value = ''
+  revisionTurnId.value = ''
   memories.value = []
   memoryPending.value = 0
   progressSteps.value = []
@@ -546,6 +574,7 @@ async function submitAnswers(answers) {
 }
 
 async function selectPlan(planId) {
+  const previousTrial = trialId.value
   selectedPlanId.value = planId
   const data = await run(() =>
     api.selectPlan(conversationId.value, { plan_id: planId }),
@@ -554,6 +583,16 @@ async function selectPlan(planId) {
   status.value = data.status
   trialId.value = data.trial_id || ''
   finalMessage.value = data.message || ''
+  // 选了修订版 = 开始新的一次尝试。旧尝试和它的反馈仍在历史里，
+  // 但反馈表单要指向新 trial，不能继续挂着上一版的反馈结果。
+  if (trialId.value && trialId.value !== previousTrial) {
+    feedbackResult.value = null
+    if (previousTrial) {
+      localStorage.removeItem(FEEDBACK_TURN_PREFIX + previousTrial)
+    }
+  }
+  reviseNote.value = ''
+  revisionTurnId.value = ''
   push('bot', finalMessage.value || '已选定方案。')
   await refresh()
 }
@@ -577,6 +616,52 @@ function applyFeedbackResult(result) {
 
 async function submitFeedback(result) {
   applyFeedbackResult(result)
+}
+
+// 反馈里补充新情况，重新出一版方案。
+//
+// **只重出方案，不重新问、不重新查**：后端从"生成建议卡"之前的
+// checkpoint 分叉，事实和证据都沿用。turn_id 在重试时保持不变，
+// 避免连点/网络重试产生第二条分支。
+async function revisePlan() {
+  const note = reviseNote.value.trim()
+  if (!note || !trialId.value || busy.value) return
+  if (!revisionTurnId.value) {
+    revisionTurnId.value = `turn_rev_${trialId.value}_${Date.now()}`
+  }
+  const data = await run(() =>
+    api.revisePlan(trialId.value, {
+      revision_note: note,
+      turn_id: revisionTurnId.value,
+    }),
+  )
+  if (!data) return
+
+  revisionTurnId.value = ''
+  reviseNote.value = ''
+  if (data.conversation_id) {
+    conversationId.value = data.conversation_id
+    localStorage.setItem(CONV_KEY, data.conversation_id)
+  }
+  status.value = data.status
+  plans.value = data.plans || []
+  evidence.value = data.evidence || []
+  evidenceDecision.value = data.evidence_decision || {}
+  evidenceGaps.value = data.evidence_gaps || []
+  safetyReview.value = {}
+  selectedPlanId.value = ''
+  finalMessage.value = data.message || ''
+
+  if (data.status === 'awaiting_plan_selection') {
+    push(
+      'bot',
+      `已经出了第 ${data.plan_version} 版方案，选一张再执行一周。` +
+        '上一版的卡保留在下面，标成已归档。',
+    )
+  } else if (data.message) {
+    push('bot', data.message)
+  }
+  await refreshMemories()
 }
 
 // 刷新/切回会话时，把已经提交过的反馈结果接回来。
@@ -819,6 +904,7 @@ onMounted(async () => {
           <header>
             <h3>候选方案</h3>
             <span class="badge">{{ plans.length }} 张</span>
+            <span class="badge accent">第 {{ currentPlanVersion }} 版</span>
             <span v-if="selectedPlanId" class="badge accent">已选 {{ selectedPlanId }}</span>
             <span
               v-if="evidenceDecision.evidence_status"
@@ -828,11 +914,29 @@ onMounted(async () => {
               {{ EVIDENCE_STATUS_TEXT[evidenceDecision.evidence_status]?.[0] || evidenceDecision.evidence_status }}
             </span>
           </header>
-          <PlanCard v-for="p in plans" :key="p.plan_id" :plan="p"
-                    :evidence="evidence"
-                    :selectable="awaitingPlanSelection"
-                    :selected="p.plan_id === selectedPlanId"
-                    @select="selectPlan" />
+          <!--
+            按版本分组：修订后的当前版本可选，旧版本灰显保留。
+            同一屏里能对照"第 1 版和第 2 版差在哪"。
+          -->
+          <div
+            v-for="g in planGroups"
+            :key="g.version"
+            class="plan-group"
+            :class="{ archived: g.archived }"
+          >
+            <div class="row plan-group-head">
+              <h4>第 {{ g.version }} 版</h4>
+              <span class="badge" :class="g.archived ? '' : 'accent'">
+                {{ g.archived ? '已归档' : '当前版本' }}
+              </span>
+              <span class="badge small">{{ g.plans.length }} 张</span>
+            </div>
+            <PlanCard v-for="p in g.plans" :key="p.plan_id" :plan="p"
+                      :evidence="evidence"
+                      :selectable="awaitingPlanSelection && !g.archived"
+                      :selected="p.plan_id === selectedPlanId"
+                      @select="selectPlan" />
+          </div>
           <!-- 证据缺口：家长该知道"哪一部分我们没找到依据" -->
           <div v-if="evidenceGaps.length" class="small muted" style="margin-top:8px">
             这次没找到依据的地方：{{ evidenceGaps.join('；') }}
@@ -941,6 +1045,33 @@ onMounted(async () => {
               ：{{ e.summary }}
             </div>
           </div>
+
+          <!--
+            情况有变 → 只重出方案。
+            **不重新问家长、不重新查指南**：后端从"生成建议卡"之前
+            的历史 checkpoint 分叉，问过的事实和找到的依据都沿用。
+          -->
+          <div class="field revise-box">
+            <label>情况有变？重新出一版方案</label>
+            <textarea
+              v-model="reviseNote"
+              rows="2"
+              :disabled="busy"
+              placeholder="补充新情况，例如：家里没人帮忙接送，只能晚上做"
+            />
+            <div class="row" style="margin-top:6px;align-items:center">
+              <button
+                class="primary"
+                :disabled="busy || !reviseNote.trim()"
+                @click="revisePlan"
+              >
+                {{ busy ? '正在重新生成…' : '重新生成方案' }}
+              </button>
+              <span class="small muted">
+                不会重新问你，也不会重新查指南，只按新情况重出方案；上一版会归档保留。
+              </span>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -968,3 +1099,20 @@ onMounted(async () => {
     </div>
   </div>
 </template>
+<style scoped>
+.plan-group + .plan-group { margin-top: 14px; }
+.plan-group-head {
+  align-items: center;
+  margin-bottom: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.plan-group-head h4 { margin: 0; }
+/* 旧版本保留可查，但灰掉 —— 一眼能看出它不是当前可选项。 */
+.plan-group.archived { opacity: 0.62; }
+.revise-box {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+</style>

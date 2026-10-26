@@ -8,8 +8,10 @@ LangGraph 恢复时整个节点会重跑，里面任何数据库写入都会翻�
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt
 
 from rdi_agent import llm
@@ -17,11 +19,17 @@ from rdi_agent import progress
 from rdi_agent.config import get_settings
 from rdi_agent.llm import LLMError
 from rdi_agent.memory import service as memory_service
-from rdi_agent.memory.ids import normalize_content
 from rdi_agent.graph.citations import (
     build_evidence_catalogue,
+    sanitize_card_citations,
     translate_short_ids,
     validate_cards,
+)
+from rdi_agent.graph.facts_merge import (
+    filter_forbidden_texts as _filter_forbidden_texts,
+    forbidden_hit as _forbidden_hit,
+    forbidden_terms,
+    restated_terms as _restated_terms,
 )
 from rdi_agent.graph.nodes.interrupt_utils import build_asked_qa, unpack_resume
 from rdi_agent.graph.state import CoachState
@@ -61,6 +69,62 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 # 信息不够也要出方案 —— 建议卡里有 uncertainty_notes，方案本身就会标出
 # 哪里不确定，这比多问一轮有用。
 MAX_FOLLOWUP_ROUNDS = 2
+
+
+def plan_prefix(version: int) -> str:
+    """卡号前缀。第 1 版保持原样，第 2 版起加 ``r2_``。
+
+    **不加前缀会撞车**：模型出的卡号写死是 ``plan_1/plan_2/plan_3``，
+    重新生成时和旧卡同号，``save_candidate_plans`` 会当成"已经存过"
+    直接跳过 —— 新卡根本没落库，家长"选"到的是旧卡。
+    """
+    return "" if version <= 1 else f"r{version}_"
+
+
+_ANY_PLAN_PREFIX = re.compile(r"^r\d+_")
+
+
+def apply_plan_id_prefix(cards: list[RecommendationCard], version: int) -> None:
+    """给模型生成的卡号统一加上版本前缀。
+
+    模型可能照做、可能忽略前缀、也可能自己写了个号。这里不信任模型：
+    先去掉已有的 ``rN_``，保证是 ``plan_x``，再挂上当前版本的前缀。
+    """
+    prefix = plan_prefix(version)
+    if not prefix:
+        return
+    used: set[str] = set()
+    for index, card in enumerate(cards, start=1):
+        base = _ANY_PLAN_PREFIX.sub("", str(card.plan_id or "").strip())
+        if not base.startswith("plan_"):
+            base = f"plan_{index}"
+        candidate = f"{prefix}{base}"
+        suffix = 2
+        while candidate in used:
+            candidate = f"{prefix}{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        card.plan_id = candidate
+
+
+def _current_checkpoint_id(config: RunnableConfig | None) -> str:
+    """当前节点所在的那个 checkpoint id。
+
+    **不能直接读 ``configurable.checkpoint_id``**：LangGraph 1.2 在节点
+    执行时把它设成 None，真实 id 在 runtime 的 ``execution_info``
+    或 ``checkpoint_map[""]`` 里。这两处都是"进入本节点时所在"的
+    checkpoint —— 也就是生成建议卡之前的回溯点。
+    """
+    configurable = ((config or {}).get("configurable") or {})
+    runtime = configurable.get("__pregel_runtime")
+    info = getattr(runtime, "execution_info", None)
+    checkpoint_id = getattr(info, "checkpoint_id", None)
+    if checkpoint_id:
+        return str(checkpoint_id)
+    checkpoint_map = configurable.get("checkpoint_map") or {}
+    if checkpoint_map.get(""):
+        return str(checkpoint_map[""])
+    return str(configurable.get("checkpoint_id") or "")
 
 
 def _bundle_of(state: CoachState) -> EvidenceBundle | None:
@@ -109,80 +173,8 @@ async def load_context(state: CoachState) -> dict[str, Any]:
 
 
 def _forbidden_terms(state: CoachState) -> list[str]:
-    """本轮已作废/已删除的事实，归一化后用于过滤。
-
-    归一化的原因：上一轮存进 ``case_summary`` 的是模型转述，
-    这一轮的家常话里可能是另一种空白/全半角写法。
-    """
-    return [
-        normalized
-        for normalized in (
-            normalize_content(x) for x in (state.get("memory_forbidden_facts") or [])
-        )
-        if normalized
-    ]
-
-
-def _forbidden_hit(fact: str, forbidden: list[str]) -> str:
-    """这条事实命中了哪条已作废的内容。没命中返回空串。
-
-    只看"旧内容是这条事实的全部或一部分" —— 反过来（新事实是旧事实的
-    子串）会误杀，比如删掉"孩子 4 岁，喜欢恐龙"之后，
-    "喜欢恐龙"这条仍然有效。
-    """
-    normalized = normalize_content(fact)
-    if not normalized:
-        return ""
-    for old in forbidden:
-        if old and (normalized == old or old in normalized):
-            return old
-    return ""
-
-
-def _restated_terms(message: str, forbidden: list[str]) -> set[str]:
-    """这一轮家长的原话里，又提到了哪些已作废的内容。
-
-    **为什么要有这个**（2026-10-26 修）：
-    作废内容进 ``forbidden_facts`` 是为了**别再拿旧事实喂模型**，
-    不是为了把家长刚说的话也一起扔掉。
-
-    实测踩过的坑：一条事实被错判成 superseded（被一条完全无关的
-    "孩子最近换过老师"顶掉了），于是家长下一轮**一字不差地又说了
-    同一句**时，那句话被当成"过期信息"丢掉 ——
-    ``observed_facts`` 直接变成空数组，整轮一条事实都没有。
-
-    家长最新的话说了算：他这轮又说了，就是当前事实。
-    """
-    normalized = normalize_content(message)
-    if not normalized:
-        return set()
-    return {old for old in forbidden if old and old in normalized}
-
-
-def _filter_forbidden_texts(
-    values: list[Any],
-    forbidden: list[str],
-    restated: set[str],
-) -> tuple[list[str], int]:
-    """把作废内容从一批文本里剔掉。返回 (留下的, 剔掉几条)。
-
-    ``restated`` 里的是"家长这轮又说了的" —— 这些保留。
-    """
-    kept: list[str] = []
-    dropped = 0
-    for value in values:
-        text = str(value).strip()
-        if not text:
-            continue
-        hit = _forbidden_hit(text, forbidden)
-        if hit and hit not in restated:
-            # 家长刚纠正过 / 刚删掉的事实，不能再并进事实清单 ——
-            # 除非家长这一轮又亲口说了它。
-            dropped += 1
-            continue
-        if text not in kept:
-            kept.append(text)
-    return kept, dropped
+    """本轮已作废/已删除的事实，归一化后用于过滤。"""
+    return forbidden_terms(state.get("memory_forbidden_facts") or [])
 
 
 async def parse_parent_input(state: CoachState) -> dict[str, Any]:
@@ -423,19 +415,30 @@ async def await_user_answer(state: CoachState) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------- 生成
-async def build_recommendation(state: CoachState) -> dict[str, Any]:
+async def build_recommendation(
+    # 注解写 ``RunnableConfig`` 而不是 ``RunnableConfig | None``：
+    # 本文件开了 ``from __future__ import annotations``，注解会变成字符串，
+    # LangGraph 只认几个固定字符串，带 ``| None`` 时它不会注入 config。
+    state: CoachState,
+    config: RunnableConfig = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
     """生成 2–3 张建议卡，并用证据包校验引用。
 
     **引用校验是硬闸**（计划 §9.3）：生成的每一条 ``source_citations``
     都必须在当前证据包里能找到对应的 ``evidence_id``，页码也要对得上。
     找不到就是编造引用 —— 这种卡给家长看等于骗人。
 
-    失败处理（计划 §9.3 原文）：带错误信息**重试一次** → 仍失败则
-    **丢弃该卡**、降级为 ``limited_answer``，并在 trace 里记
-    ``citation_validation_failed``。
+    失败处理：带错误信息**重试一次** → 仍有问题的卡**摘掉对不上的引用**
+    后保留，并把 ``application_label`` 降为 ``ai_adaptation``、在
+    ``uncertainty_notes`` 里说明。只有一张卡都生成不出来时才降级为
+    ``limited_answer``。原因：家长要的是能执行的动作，一条出处对不上
+    不该让整张卡消失。
     """
     bundle = _bundle_of(state)
     evidence = [e.model_dump(mode="json") for e in (bundle.evidence if bundle else [])]
+    # 进入本节点时所在的那个 checkpoint = 生成建议卡之前的回溯点。
+    # 修订时从这里分叉，事实/证据/门控结论原样沿用。
+    fork_checkpoint_id = _current_checkpoint_id(config)
 
     try:
         cards, first_trace, problems, note = await _generate_cards(
@@ -466,39 +469,57 @@ async def build_recommendation(state: CoachState) -> dict[str, Any]:
             retry_cards, retry_notes, retry_problems, retry_note = [], str(e), {}, ""
         note = retry_note or note
         trace_notes.append(retry_notes)
-        if retry_cards:
+        # 第二轮只要有一张通过校验，就用第二轮；否则保留第一轮。
+        # 被摘掉引用的卡不再整张丢，后面统一清洗。
+        retry_good = [c for c in retry_cards if c.plan_id not in retry_problems]
+        if retry_good:
             cards = retry_cards
             problems = retry_problems
-        else:
-            # 第二次全军覆没 —— 退回第一轮里通过校验的那些
-            cards = [c for c in cards if c.plan_id not in problems]
+
+    if problems:
+        validation_bundle = bundle
+        if validation_bundle is None:
+            validation_bundle = EvidenceBundle(
+                original_question="",
+                case_summary=state.get("case_summary") or {},
+                evidence=[],
+                retrieval_version="none",
+            )
+        sanitized: list[RecommendationCard] = []
+        stripped: list[str] = []
+        for card in cards:
+            if card.plan_id in problems:
+                card, removed = sanitize_card_citations(card, validation_bundle)
+                if removed:
+                    stripped.append(f"{card.plan_id} -> {removed[0]}")
+            sanitized.append(card)
+        cards = sanitized
+        if stripped:
+            trace_notes.append("citation_stripped：" + "；".join(stripped))
 
     if not cards:
-        # 一张都留不下 —— 降级为有限回答
+        # 模型一张卡都没生成出来 —— 降级为有限回答
         return {
             "candidate_plans": [],
             "final_answer": "",
             "route_after_recommendation": "limited_answer",
             "trace_metadata": {
                 "build_recommendation": "；".join(trace_notes)
-                + "；citation_validation_failed：全部建议卡的引用都没通过校验"
+                + "；没有生成可用的建议卡"
             },
         }
 
-    # 丢掉的卡要在 trace 里留痕
-    if problems:
-        trace_notes.append(
-            "citation_validation_failed："
-            + "；".join(
-                f"{plan_id} -> {errors[0]}" for plan_id, errors in problems.items()
-            )
-        )
+    # 推荐位兜底：清洗后如果恰好没有 recommended，补第一张。
+    if not any(c.recommended for c in cards):
+        cards[0] = cards[0].model_copy(update={"recommended": True})
 
     return {
         "candidate_plans": [c.model_dump(mode="json") for c in cards],
         "comparison_note": note,
         "final_answer": "",
         "route_after_recommendation": "plans",
+        # 落进 plans.fork_checkpoint_id，下次修订从这里分叉。
+        "fork_checkpoint_id": fork_checkpoint_id,
         "trace_metadata": {"build_recommendation": "；".join(trace_notes)},
     }
 
@@ -509,9 +530,14 @@ async def _generate_cards(
     evidence: list[dict[str, Any]],
     validation_errors: dict[str, list[str]] | None,
 ) -> tuple[list[RecommendationCard], str, dict[str, list[str]], str]:
-    """生成一轮建议卡并做引用校验。返回 (通过校验的卡, 过程说明, 有问题的卡)。"""
+    """生成一轮建议卡并做引用校验。
+
+    返回 ``(全部卡, 过程说明, {plan_id: 错误}, 比较说明)``。
+    这里不筛卡 —— 有问题的卡由调用方摘引用后保留。
+    """
     # 清单和编号映射必须出自**同一次**调用：编号指错了段落，
     # 后面每一处引用都会指向错误的地方。
+    version = int(state.get("plan_version") or 1)
     catalogue, id_map = build_evidence_catalogue(evidence)
     system, user = P.build_recommendation(
         case_summary=state.get("case_summary") or {},
@@ -521,6 +547,9 @@ async def _generate_cards(
         evidence_catalogue=catalogue,
         validation_errors=validation_errors,
         asked_qa=list(state.get("asked_qa_pairs") or []),
+        plan_version=version,
+        plan_id_prefix=plan_prefix(version),
+        revision_note=state.get("revision_note") or "",
     )
     result, trace = await llm.chat_json(
         system=system,
@@ -541,6 +570,9 @@ async def _generate_cards(
     # 模型看到的是 E1/E2 这种短编号，这里换回真实的 evidence_id。
     # 换完之后，卡上的 id 和证据包里的 id 是同一套，校验器只认真实 id。
     translate_short_ids(result.plans, id_map)
+    # 版本前缀由代码兜底：模型可能忽略 prompt 里的前缀要求。
+    # 必须在引用校验之前改，否则 problems 的 key 和最终落库的卡号对不上。
+    apply_plan_id_prefix(result.plans, version)
 
     bundle = _bundle_of(state)
     if bundle is None:
@@ -552,14 +584,10 @@ async def _generate_cards(
             retrieval_version="none",
         )
     problems = validate_cards(result.plans, bundle)
-    good = [c for c in result.plans if c.plan_id not in problems]
 
-    # 恰好一张 recommended 被丢掉了的话，补一张上去 ——
-    # 少了这一条，渲染出来的回答就不知道推荐哪张。
-    if good and not any(c.recommended for c in good):
-        good[0] = good[0].model_copy(update={"recommended": True})
-
-    return good, trace.brief(), problems, result.comparison_note
+    # 返回**全部**卡，不只返回通过校验的：
+    # 调用方会把有问题的卡摘掉引用后保留，而不是整张丢掉。
+    return list(result.plans), trace.brief(), problems, result.comparison_note
 
 
 async def present_plans(state: CoachState) -> dict[str, Any]:
@@ -567,6 +595,14 @@ async def present_plans(state: CoachState) -> dict[str, Any]:
     # 打点：这一步之前家长等的是"安全检查"，之后就该看到卡了。
     # 少了这一条，进度条会停在"正在做安全检查"然后突然蹦出三张卡。
     progress.emit("present_plans")
-    selection = interrupt({"kind": "plan_selection", "plans": state.get("candidate_plans", [])})
+    version = int(state.get("plan_version") or 1)
+    # 卡上带版本，刷新页面/修订后前端才能按版本分组。
+    plans = [
+        {**p, "plan_version": version, "is_current_version": True}
+        for p in (state.get("candidate_plans") or [])
+    ]
+    selection = interrupt(
+        {"kind": "plan_selection", "plans": plans, "plan_version": version}
+    )
     plan_id = selection.get("plan_id") if isinstance(selection, dict) else str(selection)
     return {"selected_plan_id": plan_id}

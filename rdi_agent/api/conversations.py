@@ -210,13 +210,13 @@ def _status_of(
     """这一轮的状态。
 
     阶段 2C 之后多了一种"跑完了但没给建议卡"的情况 ——
-    证据不够（limited_answer）或者家长报告了风险信号
+    建议卡没生成出来（limited_answer）或者家长报告了风险信号
     （needs_professional_support）。这两种都要和"正常完成"区分开，
     否则前端会把"我没给建议"当成"建议生成完了"。
 
     **判断依据要看 ``answer_mode``，不是只看 ``evidence_decision``**：
-    证据门控判的是 "recommend"（证据够），但建议卡生成可能整体失败
-    （schema 连着几次不合规、引用校验全挂）—— 这时图走的是
+    证据门控判的是 "recommend"，但建议卡生成可能整体失败
+    （schema 连着几次不合规、模型一张卡都没生成）—— 这时图走的是
     ``build_limited_answer``，家长拿到的是一段文字而不是方案卡。
     只看 evidence_decision 会把这种情况报成 "completed"，
     前端就以为流程正常跑完了，家长一脸莫名其妙。
@@ -235,12 +235,11 @@ def _status_of(
     # 反馈迭代的"证据支撑的调整建议"：不是方案卡，也不是拒答，单独一种状态。
     if values.get("answer_mode") == "adjustment":
         return "adjustment"
-    # 图走到了有限回答这一路 —— 不管是因为证据不够，还是因为生成建议卡失败了。
+    # 图走到了有限回答这一路 —— 建议卡没有生成出来。
     #
     # **判断依据是 ``answer_mode``，不是 ``decision``**：
-    # ``decision`` 是模型填的自由字段，门控的路由早就不看它了
-    # （2026-10-26 起只有 high_risk 能挡住建议卡）。
-    # 模型填了 ``decision="limited_answer"`` 但图其实出了卡的时候，
+    # 门控路由只看 high_risk（2026-10-26 起只有 high_risk 能挡住建议卡）
+    # 和反馈入口；旧状态里可能还留着 ``decision="limited_answer"``，
     # 拿它当依据会报出"证据不够" —— 家长看到的和实际拿到的不一样。
     if values.get("answer_mode") in ("limited", "risk"):
         if values.get("answer_mode") == "risk":
@@ -474,13 +473,19 @@ def _turn_payload(conversation_id: str, result: dict[str, Any]) -> dict[str, Any
     evidence = _evidence_panel(result.get("evidence_bundle"))
     decision = result.get("evidence_decision") or {}
     assistant_text = result.get("_assistant_text") or result.get("final_answer") or ""
+    plan_version = int(result.get("plan_version") or 1)
+    plans = [
+        {**p, "plan_version": plan_version, "is_current_version": True}
+        for p in (interrupt_payload or {}).get("plans", [])
+    ]
 
     return {
         "conversation_id": conversation_id,
         "turn_id": result.get("_turn_id"),
         "status": status,
         "questions": (interrupt_payload or {}).get("questions", []),
-        "plans": (interrupt_payload or {}).get("plans", []),
+        "plans": plans,
+        "plan_version": plan_version,
         "message": assistant_text,
         "trial_id": result.get("trial_id"),
         # 证据面板：家长能看见"这次依据的是书里哪几段"
@@ -699,14 +704,27 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
     except RuntimeError:
         values = {}
 
+    current_version = int(values.get("plan_version") or 1)
+
     # 停在选方案中断上时，**用中断里那份候选卡**。
     #
     # **为什么**：数据库里的 plans 是落库后的行（status/recommended 这些
     # 字段是后来改的），而中断里的是"当时给家长看的那三张卡"——
     # 引用、家长可以做的事、观察指标都在里面。刷新页面后前端要
     # 把卡原样接回来，用落库那份会丢掉引用。
+    #
+    # **旧版本要一起回**：修订之后只给当前版，家长就没法对照
+    # "第 1 版和第 2 版差在哪"了。旧版从库里按版本取。
     if pending and pending.get("kind") == "plan_selection" and pending.get("plans"):
-        plans = list(pending["plans"])
+        version = int(pending.get("plan_version") or current_version)
+        current = [
+            {**p, "plan_version": version, "is_current_version": True}
+            for p in pending["plans"]
+        ]
+        archived = [
+            p for p in plans if int(p.get("plan_version") or 1) < version
+        ]
+        plans = current + archived
 
     return {
         "conversation_id": conversation_id,
@@ -717,6 +735,7 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
         "pending_interrupt": pending,
         "interactions": interactions,
         "plans": plans,
+        "plan_version": current_version,
         # 选了方案之后 trial 才落库。刷新页面后前端要靠它把反馈表单接回来 ——
         # 少了这个字段，刷新一次反馈表单就没了，家长以为没提交成功。
         "trial_id": values.get("trial_id"),

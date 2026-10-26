@@ -4,7 +4,6 @@
 
     rewrite_query → retrieve_knowledge → rerank_and_expand → evidence_gate
                                                               ├─ recommend → build_recommendation
-                                                              ├─ limited_answer → build_limited_answer
                                                               ├─ professional_support → build_limited_answer
                                                               └─ followup → generate_evidence_followup
 
@@ -458,7 +457,9 @@ async def safety_review(state: CoachState) -> dict[str, Any]:
 
 
 # findings 的格式是 "[plan_1] 出现了…" —— 被点名的卡 id 在方括号里。
-_FLAGGED_PLAN_RE = re.compile(r"^\[(plan_[A-Za-z0-9_-]+)\]")
+# 修订版的卡号是 r2_plan_1，前缀也要能认出来，否则被拦下的卡
+# 不会被逐卡丢弃，整组又连坐。
+_FLAGGED_PLAN_RE = re.compile(r"^\[((?:r\d+_)?plan_[A-Za-z0-9_-]+)\]")
 
 
 def _flagged_plan_ids(review: Any) -> set[str]:

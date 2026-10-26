@@ -342,6 +342,9 @@ def build_recommendation(
     evidence_catalogue: str | None = None,
     validation_errors: dict[str, list[str]] | None = None,
     asked_qa: list[dict[str, Any]] | None = None,
+    plan_version: int = 1,
+    plan_id_prefix: str = "",
+    revision_note: str = "",
 ) -> tuple[str, str]:
     """生成建议卡。返回 (system, user)。
 
@@ -404,10 +407,31 @@ def build_recommendation(
 如果某张卡实在找不到能支撑它的证据，就不要给它写引用。
 """
 
+    plan_id_rule = (
+        f"plan_id 必须以 {plan_id_prefix} 开头，写成 "
+        f"{plan_id_prefix}plan_1 / {plan_id_prefix}plan_2 这种短 id，不要用随机数。"
+        if plan_id_prefix
+        else "plan_id 用 plan_1 / plan_2 / plan_3 这种短 id，不要用随机数。"
+    )
+    revision_block = (
+        f"""
+**这是第 {plan_version} 版，是在上一版基础上的修订。**
+家长补充的新情况：{revision_note}
+
+- 这一版的依据**沿用上一版**，不要重新检索、也不要编造新的指南内容。
+- 新卡要针对补充的新情况调整做法；仍然有效的地方可以保留。
+- 如果新情况和上一版的依据对不上，写进 uncertainty_notes，不要说成指南结论。
+- 在 title 里不要重复写"第 N 版"，版次由系统显示。
+"""
+        if revision_note
+        else ""
+    )
+
     system = (
         _COMMON_RULES
         + evidence_rules
         + retry_block
+        + revision_block
         + """
 生成 {n} 张建议卡，视角不同，让家长能比较着选。
 
@@ -441,15 +465,17 @@ def build_recommendation(
   说成家长已经做过 —— 那是两回事。
 - 已经作废或删除的记忆不会出现在这里，不要凭印象补回来。
 
-plan_id 用 plan_1 / plan_2 / plan_3 这种短 id，不要用随机数。
-"""
-    ).format(n=n_plans)
+""" + plan_id_rule
+    # 不用 str.format：家长补充的原话里可能带花括号，会被当成占位符。
+    ).replace("{n}", str(n_plans))
     user = json.dumps(
         {
             "case_summary": case_summary,
             "child_context": child_context or {},
             "可引用的证据": catalogue,
             "已问过的问题和家长的回答": asked_qa or [],
+            "方案版本": plan_version,
+            "本次修订说明": revision_note,
         },
         ensure_ascii=False,
         indent=2,

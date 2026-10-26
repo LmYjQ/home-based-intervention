@@ -619,7 +619,7 @@ class RecommendationCard(BaseModel):
 
 **硬规则**：
 
-1. `RecommendationCard` 的每一条 `source_citations` 必须能在当前 `EvidenceBundle` 中找到对应 `evidence_id`；找不到就判定为编造引用，整张卡重试或降级为 `limited_answer`。
+1. `RecommendationCard` 的每一条 `source_citations` 必须能在当前 `EvidenceBundle` 中找到对应 `evidence_id`；找不到就判定为编造引用 —— 带错误重试一次，仍有问题的引用由 `sanitize_card_citations` 摘掉，卡片保留并降级为 `ai_adaptation`。只有一张卡都没生成出来才走 `limited_answer`。
 2. `success_indicators` 和 `stop_conditions` 不得为空，由 Pydantic 强制。
 3. `source_summary` 必须有 citation；没有直接证据时只能是 `ai_adaptation`。
 4. `expert_reviewed` 第一阶段不实现，出现即拒绝。
@@ -877,16 +877,20 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 
 ### 5.5 证据门控（Evidence Gate）
 
-回答生成前必须判断证据够不够。门控输出 `EvidenceDecision`，路由到四条路径。
+回答生成前判断证据够不够。门控输出 `EvidenceDecision`，**走哪条路由由代码按硬规则算**（`decide_flow`），模型只负责描述证据。
 
 | 条件 | `evidence_status` | 系统行为 | 路由 |
 |---|---|---|---|
 | 有直接相关且定位准确的证据 | `direct` | 可解释相关原则，引用章节和页码 | `recommend` |
-| 只有间接相关证据 | `indirect` | 明确说这是可能参考，不声称指南直接回答了该情形 | `limited_answer` |
-| 检索结果互相矛盾 | `conflicting` | 呈现分歧或标记待审，不静默挑选 | `limited_answer` |
-| 没有可靠证据 | `none` | 说明知识库暂未找到依据；可给低风险观察建议，标明不是指南结论 | `limited_answer` |
+| 只有间接相关证据 | `indirect` | 出卡；说明是可能参考，不声称指南直接回答了该情形 | `recommend` |
+| 检索结果互相矛盾 | `conflicting` | 出卡；呈现分歧，不静默挑选 | `recommend` |
+| 没有可靠证据 | `none` | 照样出卡；按 `ai_adaptation` 生成，不挂指南引用，说明知识库暂未找到依据 | `recommend` |
 | 缺失信息会改变建议 | `none/indirect` + `needs_followup` | 先追问 | `followup` |
 | 诊断、治疗决策或明显风险 | `risk` | 不凭 RAG 下结论，转向专业支持 | `professional_support` |
+
+**2026-10-26 最终规则**：`decide_flow` 只保留两条 ——
+`high_risk`（或 `serious_signals` 命中）→ `professional_support`，
+其余一律 `recommend`。证据不足不再挡卡；引用校验改为逐卡摘引用、保留卡片。
 
 门控输出示例：
 
@@ -896,10 +900,8 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
   "supported_claims": ["不同情境下孩子的参与表现可能存在差异"],
   "unsupported_claims": ["孩子哭泣一定是因为社交动机不足"],
   "missing_information": ["噪声敏感性", "活动前后的情绪变化"],
-  "can_support_personalized_advice": false,
   "high_risk": false,
-  "needs_followup": false,
-  "decision": "limited_answer"
+  "needs_followup": false
 }
 ```
 
@@ -933,8 +935,8 @@ async def retrieve_evidence(query: str, child_context, filters) -> EvidenceBundl
 
 ### 5.7 无命中、冲突与风险
 
-- **无命中**：明确说“当前知识库没有找到足够依据”，可以给一般性低风险观察建议，但必须标为 `ai_adaptation`，不得编造书名、章节或页码。
-- **冲突**：呈现分歧，说明来源和局限；不静默选一个。首版没有人工审核队列，冲突时路由到 `limited_answer` 并标记 `needs_human_review`。
+- **无命中**：照样出建议卡，但必须标为 `ai_adaptation`，明确说“当前知识库没有找到足够依据”，不得编造书名、章节或页码。
+- **冲突**：照样出卡，呈现分歧，说明来源和局限；不静默选一个。
 - **风险**：优先给专业支持建议，不继续普通检索—建议流程。不要自行给诊断或治疗建议。
 
 ---
@@ -1397,7 +1399,7 @@ plan_1 的标题是「尝试忽略孩子的哭闹，让孩子逐渐适应出门�
 
    ```
    有高风险                    → professional_support
-   一条可用证据都没有          → limited_answer
+   一条可用证据都没有          → limited_answer   # 8.6.8 已删掉这条
    其余                        → recommend（一律出卡）
    ```
 
@@ -1424,6 +1426,29 @@ plan_1 的标题是「尝试忽略孩子的哭闹，让孩子逐渐适应出门�
 **副作用**：`decision` 不再是模型契约的一部分，所以
 `tests/test_graph_flow.py` 等文件里构造 `EvidenceDecision` 的地方
 要去掉 `decision=` —— 那些是**模拟模型返回**，现在模型不再返回它。
+
+#### 8.6.8 门控不再因证据不足挡卡 + 引用失败保留卡片（2026-10-26 最终）
+
+**现象**：§8.6.7 之后真实一轮仍然落到 `limited_answer`。
+
+**根因**（查 checkpoint 确认）：`evidence_gate` 返回的确实是 `recommend`，
+卡也生成出来了；是 `build_recommendation` 的**引用校验**判定所有卡
+引用不通过，然后整批丢弃、降级为 `limited_answer`。前端显示"证据不够"，
+但真实原因与证据无关。
+
+**改法**：
+
+1. `decide_flow` 删掉"一条可用证据都没有 → `limited_answer`"这条，
+   只剩：`high_risk` / `serious_signals` → `professional_support`，
+   其余一律 `recommend`。证据不足的卡按 `ai_adaptation` 生成、不挂引用。
+2. 引用校验失败时**不丢卡**：重试一次仍有问题，由
+   `sanitize_card_citations` 摘掉该卡有问题的 `source_citations` 和
+   `evidence_ids`，降级为 `ai_adaptation` 并追加不确定说明；
+   trace 记 `citation_stripped`。
+3. 只有**一张卡都没生成出来**（或 LLM 失败）才走 `limited_answer`。
+
+**覆盖用例**：`tests/test_graph_flow.py`（引用失败仍保留卡片、
+好卡不受影响）、`tests/test_evidence_gate_decision.py`（无证据 → `recommend`）。
 
 ### 8.7 交付物
 
@@ -1850,7 +1875,7 @@ recall@5 = **0.8529**（29/34），MRR = 0.5515，页码可定位 100%，硬凑�
 
 #### 目标
 
-让主流程真正基于证据生成建议，并且在证据不足时明确拒答或降级，而不是编造指南观点。
+让主流程真正基于证据生成建议；证据不足时仍出卡但标明 `ai_adaptation`、不挂指南出处；只有高风险才拒答并转专业支持。
 
 #### 新增节点
 
@@ -1859,24 +1884,29 @@ recall@5 = **0.8529**（29/34），MRR = 0.5515，页码可定位 100%，硬凑�
 | `rewrite_query` | `case_summary` | 生成语义查询、分词关键词、概念 ID | `retrieval_queries` |
 | `retrieve_knowledge` | 查询、过滤器 | 向量 + FTS 召回 | `retrieval_candidates` |
 | `rerank_and_expand` | 候选 | 去重、重排、父块扩展 | `evidence_bundle` |
-| `evidence_gate` | 证据包、事实摘要 | 判断证据是否足够、是否高风险 | `evidence_decision` |
+| `evidence_gate` | 证据包、事实摘要 | 判断是否高风险、是否需要追问 | `evidence_decision` |
 | `build_recommendation` | 事实、证据、历史 | 生成 2–3 张建议卡 | `candidate_plans` |
-| `build_limited_answer` | 事实、证据缺口 | 生成有限回答/低风险观察建议 | `final_answer` |
+| `build_limited_answer` | 事实 | 高风险/生成失败时的专业支持话术 | `final_answer` |
 | `safety_review` | 建议卡/回答 | 检查诊断、强迫、越界、引用错误 | `safety_review` |
 | `render_answer` | 审核结果 | 输出家长可读回答 | `final_answer` |
 
 #### 路由
 
 ```python
+def decide_flow(decision, bundle, case_summary) -> str:
+    # 代码算，模型不参与
+    if decision.high_risk or serious_signals(case_summary):
+        return "professional_support"
+    return "recommend"
+
+
 def route_after_evidence_gate(state: CoachState) -> str:
     d = state["evidence_decision"]
-    if d["high_risk"]:
+    if d.get("decision") == "professional_support":
         return "professional_support"
-    if d["needs_followup"]:
-        return "followup"
-    if d["decision"] == "recommend":
-        return "recommend"
-    return "limited_answer"
+    if state.get("entrypoint") == "feedback":
+        return "feedback_adjustment"
+    return "recommend"
 ```
 
 #### 生成约束
@@ -1903,7 +1933,9 @@ def route_after_evidence_gate(state: CoachState) -> str:
 任何一条失败：
 
 1. 带错误信息重试一次；
-2. 仍失败则丢弃该卡，降级为 `limited_answer`，并在 trace 中记录 `citation_validation_failed`。
+2. 仍失败则**保留卡片**，由 `sanitize_card_citations` 摘掉有问题的引用/`evidence_ids`，
+   把该卡降级为 `ai_adaptation` 并加一条不确定说明，trace 记 `citation_stripped`；
+3. 只有一张卡都没生成出来（或 LLM 失败）才走 `limited_answer`。
 
 #### 安全审查
 
@@ -1928,13 +1960,13 @@ def route_after_evidence_gate(state: CoachState) -> str:
       `rewrite_query` → `retrieve_knowledge` → `rerank_and_expand` →
       `evidence_gate` → `build_recommendation` / `build_limited_answer` →
       `safety_review` → `render_answer`。
-- [x] 实现 `evidence_gate` 的结构化输出和四条路由。
+- [x] 实现 `evidence_gate` 的结构化输出和路由。
       `rdi_agent/graph/evidence_gate.py`：**规则优先，LLM 为辅** ——
-      证据包为空、家长报了严重风险信号、没有任何证据达到采信门槛，
-      这三条写死在代码里，LLM 说什么都不能推翻。
-- [x] 修改 `build_recommendation`：有证据时使用证据，无证据时生成 `limited_answer`。
-      引用校验失败 → 带错误信息重试一次 → 仍失败丢卡降级为 `limited_answer`，
-      trace 里记 `citation_validation_failed`。
+      高风险（含 `serious_signals` 命中的严重信号）写死在代码里，
+      LLM 说什么都不能推翻；其余一律出卡。
+- [x] 修改 `build_recommendation`：没有可用证据也出卡，标明 `ai_adaptation`。
+      引用校验失败 → 带错误信息重试一次 → 仍失败由 `sanitize_card_citations`
+      摘引用、保留卡片，trace 里记 `citation_stripped`；一张卡都没生成出来才走 `limited_answer`。
 - [x] 实现引用校验器，并写“编造引用必须失败”的测试。
       `rdi_agent/graph/citations.py` + `tests/test_citations.py`。
       校验三件事：`source_id`（= `evidence_id`）在证据包里、章节对得上、页码对得上。
@@ -1955,7 +1987,7 @@ def route_after_evidence_gate(state: CoachState) -> str:
 |---|---|---|
 | 直接证据问题：建议卡有真实章节和页码，能回到 PDF 核对 | `frontend_rdi/MANUAL_TEST.md` §10.1 | **待手动验收**（脚本在 `evals/demo_paths.py`） |
 | 间接证据问题：明确写“这是可能参考”，不声称原书直接回答 | 同上 §10.2 | **待手动验收** |
-| 无证据问题：明确说知识库没有足够依据，不出现虚构书名/章节/页码 | 同上 §10.3 | **待手动验收**（`evidence_status='none'` → `limited_answer`） |
+| 无证据问题：照样出卡，明确说知识库没有足够依据，不出现虚构书名/章节/页码 | 同上 §10.3 | **待手动验收**（`evidence_status='none'` → `recommend` + `ai_adaptation`） |
 | 信息不足：先追问，不硬给建议 | 同上 §10.4 | **待手动验收** |
 | 风险信号：走专业支持，不继续给干预方案 | 同上 §10.5 | **待手动验收**（`serious_signals()` 命中 → `professional_support`） |
 | 编造 citation 的测试用例被校验器拦截 | `tests/test_citations.py` | ✅ 已落地 |
@@ -2185,6 +2217,8 @@ next_step
 - [x] 实现历史对比：读取同一 child 过去的 trials 和 observations，生成对比摘要。
 - [x] 实现 `next_step`：continue / adjust / followup / stop 四选一。
 - [x] 需要新证据时重新进入检索，不重复使用上一轮证据包。
+  （**方案修订 §11.7 是明确例外**：家长只补充背景、没有要求换依据时，
+  沿用上一版证据包，不重新检索。）
 - [x] 反馈提交按 `(trial_id, turn_id)` 幂等。
 - [x] 写测试：单次改善不归因、执行失败可记录、反例削弱假设。
 
@@ -2203,8 +2237,11 @@ next_step
 
 **两个设计决定**：
 
-1. **adjust 只出文字，不出新卡**。反馈迭代调整的是正在执行的这一条，
-   再生成 2–3 张新卡会让家长不知道该继续哪条；也不新建 trial。
+1. **自动 adjust 只出文字；家长主动"情况有变"时走方案修订（§11.7）**。
+   自动 adjust 是系统判断原方案需要微调，再生成 2–3 张新卡会让家长
+   不知道该继续哪条；而家长补充"只能晚上做/怕的不是分离是声音"这类
+   背景变化时，是**家长明确要求换一版方案**，走修订接口重新出卡、
+   由家长重新选择，并建新的 trial。两者不要混用。
 2. **执行状态和"已分析"分开**：`trials.status` 记 `attempted /
    not_attempted / stopped`，`feedbacks.completed_at` 表示这次反馈处理完了。
    不拿 `reviewed` 覆盖执行状态，否则"没做"这个信息会丢。
@@ -2221,6 +2258,73 @@ next_step
 ### 11.6 交付物
 
 连续的反馈分析与方案调整闭环。
+
+---
+
+### 11.7 阶段 4.5：方案修订（把 Time Travel 变成产品能力）
+
+**问题**：家长执行一周后回填反馈，才发现"情况有变"——原来计划早上送园，
+现在只有晚上有时间；原来以为孩子怕分离，现在发现怕的是声音。
+重新开一段对话会让前面问清的事实、找到的指南依据全部作废；
+接受现有方案又是在给一份不贴合当前情况的建议。
+
+**做法**：从**生成建议卡之前**的历史 checkpoint 派生同线程分支，
+只重跑"生成卡 → 安全审查 → 渲染 → 落库 → 等家长选"，其余全部沿用。
+
+```text
+理解（问清什么）─┐
+取证（找到什么）─┼─→ ★ 分叉点 → 生成建议卡 → 安全审查 → 渲染 → 落库 → 等家长选
+门控（够不够）──┘
+```
+
+- **复用**：记忆上下文、充分性判断/追问、查询改写/检索/重排/父块扩展、
+  证据包落库、证据门控结论。家长不会被重新问，也不会重新查指南。
+- **重跑**：生成建议卡、安全审查、渲染、候选卡落库、选卡中断、选定建 trial。
+- **同一条会话线程**：分叉落在原 thread 上，选卡仍复用
+  `POST /api/conversations/{id}/select-plan`，不新增中断类型；
+  调试面板的 checkpoint 历史里自然出现分支。
+
+**三条必须配套的规则**：
+
+1. **新信息并进事实要在接口层做，不能让图自动跑**。图里的
+   `parse_parent_input` 排在充分性判断之前；要让它跑，分叉点就得往前挪，
+   家长又会被重新问一遍。接口直接调用纯函数
+   `graph/facts_merge.py::merge_parent_supplement`，把新情况作为
+   "家长补充"通道塞进 `case_summary.observed_facts`，并传入作废事实清单
+   保留原有过滤。
+2. **新信息里的风险信号必须复查**。门控不重跑，"孩子最近开始打人"
+   这类新风险不会被发现。接口层用纯规则
+   （`evidence_gate.serious_signals`，零模型调用）判一次；
+   命中就把 `evidence_decision.decision` 改写成 `professional_support`，
+   路由函数读这个字段会自动改道，不出卡。
+3. **卡号必须带版本前缀**。模型写死的 `plan_1/plan_2/plan_3` 会和旧卡撞号，
+   `save_candidate_plans` 把新卡当成"已存过"直接跳过，
+   家长选到的还是旧卡。第 1 版保持原样，第 2 版起用 `r2_plan_1`；
+   前缀在生成提示里就告诉模型，代码再做一次兜底归一。
+
+**数据**：`plans` 加 `source_turn_id`（产生这一版的轮次，同时做幂等键）
+和 `fork_checkpoint_id`（分叉起点）；卡号前缀保证同会话多版本不冲突。
+旧版本的卡和旧 trial 都不删，前端按 `plan_version` 分组，旧版标"已归档"。
+
+**接口**：
+
+```text
+POST /api/trials/{trial_id}/revise
+{ "revision_note": "家里没人帮忙接送，只能晚上做", "turn_id": "turn_rev_..." }
+```
+
+返回状态、当前版本候选卡、版本号、复用/重跑环节清单。同一个 `turn_id`
+重复提交只返回已有结果，不产生第二条分支。修订成功后把这次补充记进
+`interactions`，同时作为风险分支（不出卡）的幂等标记。
+
+**验收**：补充新情况能拿到新卡；过程中没有被重新提问；新卡引用同一证据包；
+补充攻击行为时不出卡、改走专业支持；新旧卡号不撞车；选新卡建新 trial，
+旧 trial/反馈仍在；同一 `turn_id` 只产生一条分支；旧版本可查看。
+
+**落地位置**：`rdi_agent/api/revision.py`（接口 + 分叉 + 风险复查）、
+`graph/facts_merge.py`（纯函数事实合并）、`graph/nodes/chat_nodes.py`
+（版本前缀 + 回溯点捕获）、迁移 `010_plan_revision.py`、前端
+`App.vue`（修订入口 + 版本分组）。
 
 ---
 
@@ -2309,8 +2413,8 @@ LangGraph 恢复 `interrupt` 时，包含中断的节点会重新执行。因此
 | LLM 超时/5xx | 有限重试（2 次），指数退避 | 稍后重试或降级话术 |
 | 结构化输出不合 schema | 带错误信息重试 1 次，仍失败则降级 | 明确说明本次生成失败，不编造 |
 | Embedding 服务失败 | 退回 PostgreSQL 关键词检索，标记降级 | “本次仅使用关键词检索” |
-| 检索无命中 | `evidence_status='none'` | “当前知识库没有找到足够依据” |
-| 引用校验失败 | 重试 1 次，仍失败降级为 limited_answer | 不展示未经验证的出处 |
+| 检索无命中 | `evidence_status='none'`，照常出 `ai_adaptation` 卡 | 卡片 + “当前知识库没有找到足够依据” |
+| 引用校验失败 | 重试 1 次，仍失败摘掉该卡引用、保留卡片并降级为 `ai_adaptation` | 卡片仍在，但不展示未经验证的出处 |
 | Postgres 连接池耗尽/锁等待/事务失败 | 短重试 + 事务回滚 + 连接池告警 | 明确提示保存失败 |
 | Checkpointer 失败 | 请求失败，不继续执行 | “会话状态保存失败” |
 | replay 文件缺失 | 直接失败，不静默回落 live | 面试现场能发现配置问题 |
@@ -2582,7 +2686,7 @@ DEMO_MODE=replay uvicorn rdi_agent.api.main:app --reload
 1. **SQLite + FTS5 + Chroma -> PostgreSQL + pgvector + 内置全文检索**：目标环境是 k8s，多副本、事务、备份和 Checkpointer 都需要 Postgres；本地用 Docker Compose 保持同一套实现，避免“本地跑通、上 k8s 重写”。
 2. **通用 `memory_items` -> 四张语义表**：避免事实、假设、观察、尝试混在一张表里，生命周期和校验规则不同。
 3. **四层知识全部做 -> 只强制 A 层**：先保证引用可追溯，再逐步补概念和应用模式，避免首版被知识工程拖死。
-4. **人工审核队列 -> 标记 + 降级**：首版不做审核工作台，冲突或高风险走 `limited_answer` 并标记 `needs_human_review`。
+4. **人工审核队列 -> 标记 + 降级**：首版不做审核工作台；冲突照常出卡并说明分歧，高风险转专业支持。
 5. **入库时全量生成摘要 -> 命中后按需生成**：节省成本，避免摘要错误污染整个索引。
 6. **每个回答都写记忆 -> 反馈入口必写，聊天入口只提交候选**：避免把寒暄和临时情绪写成长期记忆。
 7. **默认严格 BM25 -> 默认 Postgres 内置全文检索 + 可选 `pg_search`**：单书 + 语义检索为主，内置 FTS 足够；只有检索评测证明关键词通道是瓶颈时，才引入 BM25 扩展。

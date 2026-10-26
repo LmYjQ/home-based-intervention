@@ -13,7 +13,6 @@
                                                 → rerank_and_expand
                                                 → evidence_gate
                                                    ├─ recommend  → build_recommendation
-                                                   ├─ limited    → build_limited_answer
                                                    ├─ risk       → build_limited_answer
                                                    └─ followup   → generate_evidence_followup
                                                 → safety_review
@@ -146,7 +145,6 @@ def build_graph(checkpointer: Any | None = None) -> Any:
         ret.route_after_evidence_gate,
         {
             "recommend": "build_recommendation",
-            "limited_answer": "build_limited_answer",
             "professional_support": "build_limited_answer",
             "followup": "generate_evidence_followup",
             "feedback_adjustment": "build_feedback_adjustment",

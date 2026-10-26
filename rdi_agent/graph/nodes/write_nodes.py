@@ -72,6 +72,8 @@ async def persist_candidate_plans(state: CoachState) -> dict[str, Any]:
         return {"plan_db_ids": {}}
     raw_bundle_id = state.get("evidence_bundle_db_id")
     evidence_bundle_id = uuid.UUID(str(raw_bundle_id)) if raw_bundle_id else None
+    version = int(state.get("plan_version") or 1)
+    revision_source = state.get("revision_source") or {}
     async with session_scope() as session:
         repo = Repository(session)
         mapping = await repo.save_candidate_plans(
@@ -80,6 +82,14 @@ async def persist_candidate_plans(state: CoachState) -> dict[str, Any]:
             child_id=state.get("child_id"),
             cards=cards,
             evidence_bundle_id=evidence_bundle_id,
+            plan_version=version,
+            # 产生这一版的轮次：首版是聊天 turn，修订版是修订 turn。
+            source_turn_id=state.get("turn_id") or None,
+            fork_checkpoint_id=(
+                state.get("fork_checkpoint_id")
+                or revision_source.get("fork_checkpoint_id")
+                or None
+            ),
         )
     return {"plan_db_ids": {k: str(v) for k, v in mapping.items()}}
 

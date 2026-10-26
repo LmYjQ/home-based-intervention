@@ -85,10 +85,13 @@ def test_evidence_available_goes_to_recommend():
     assert out == "recommend"
 
 
-def test_no_usable_evidence_goes_to_limited_answer():
-    """一条可用证据都没有 → 有限回答（没东西可引）。"""
+def test_no_usable_evidence_still_goes_to_recommend():
+    """一条可用证据都没有 → 仍然出卡，只是不挂指南引用。
+
+    门控不再用"证据够不够"挡卡；引用校验会把编造的出处摘掉。
+    """
     out = decide_flow(_decision(), bundle=_bundle(with_evidence=False), case_summary={})
-    assert out == "limited_answer"
+    assert out == "recommend"
 
 
 def test_high_risk_goes_to_professional_support():
@@ -108,9 +111,8 @@ def test_evidence_status_does_not_affect_flow():
     """``evidence_status`` 只是描述，**不决定**给不给卡。
 
     以前模型的 ``decision`` 和证据状态对不上就掉进 limited_answer，
-    家长拿到什么成了掷骰子。现在证据状态再差，只要不是高风险、
-    也有可引用的证据，一律出卡 ——
-    够不够由引用校验把关。
+    家长拿到什么成了掷骰子。现在证据状态再差，只要不是高风险，
+    一律出卡 —— 够不够由引用校验把关。
     """
     for status in ("direct", "indirect", "conflicting"):
         out = decide_flow(
@@ -133,7 +135,8 @@ def test_route_uses_the_computed_flow():
     assert route_after_evidence_gate(state) == "recommend"
 
 
-def test_route_respects_limited_answer():
+def test_route_ignores_legacy_limited_answer():
+    """旧检查点里可能留着 ``limited_answer``，现在不再挡卡。"""
     state = {
         "evidence_decision": {
             "evidence_status": "none",
@@ -142,7 +145,7 @@ def test_route_respects_limited_answer():
             "needs_followup": False,
         }
     }
-    assert route_after_evidence_gate(state) == "limited_answer"
+    assert route_after_evidence_gate(state) == "recommend"
 
 
 def test_route_respects_professional_support():
