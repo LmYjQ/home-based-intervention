@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from rdi_agent.api.children import router as children_router
 from rdi_agent.api.conversations import router as conversations_router
 from rdi_agent.api.health import check_all
 from rdi_agent.api.memory import router as memory_router
@@ -42,6 +43,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.include_router(children_router)
 app.include_router(conversations_router)
 app.include_router(memory_router)
 

@@ -25,6 +25,7 @@ from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
+from rdi_agent.age import parse_birth_date
 from rdi_agent.db.engine import session_scope
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.db.repositories.memory import list_memories as list_memories_repo
@@ -45,6 +46,8 @@ class CreateConversationRequest(BaseModel):
     child_id: str | None = None
     display_label: str = "孩子"
     age_band: str | None = None
+    # 出生年月（YYYY-MM 或 YYYY-MM-DD）。年龄不存，读的时候现算。
+    birth_date: str | None = None
 
 
 class FollowupAnswer(BaseModel):
@@ -298,10 +301,15 @@ async def create_conversation(req: CreateConversationRequest) -> dict[str, Any]:
             # family_id 必须是 UUID —— children.family_id 是 UUID 列，
             # 而且 conversation_id 靠 "." 分段解析出它，前缀 id 解析不出来。
             family_id = req.family_id or str(uuid.uuid4())
+            try:
+                birth = parse_birth_date(req.birth_date)
+            except ValueError as e:
+                raise HTTPException(400, str(e)) from None
             child = await repo.ensure_child(
                 family_id=family_id,
                 display_label=req.display_label,
                 age_band=req.age_band,
+                birth_date=birth,
             )
             child_id, family_uuid = str(child.id), str(child.family_id)
 
@@ -615,6 +623,10 @@ async def get_conversation(conversation_id: str) -> dict[str, Any]:
         interactions = await repo.list_interactions(conversation_id)
         plans = await repo.list_plans(conversation_id)
         context = await repo.child_context(child_id)
+        # 孩子档案没了（清过库/换过库），这条会话也就不存在了。
+        # 不报 404 的话前端会拿着一个空会话继续用，发消息才炸。
+        if not context:
+            raise HTTPException(404, "孩子档案不存在")
         # 直接复用当前 session —— 另开一个 ``session_scope`` 会多占一条连接，
         # 而且和这里的外层事务没有任何协同的必要。
         memories = await list_memories_repo(

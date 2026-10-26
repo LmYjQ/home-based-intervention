@@ -262,7 +262,7 @@ def _card_texts(card: RecommendationCard) -> list[str]:
     """卡里所有可能出现在家长眼前的文字。"""
     texts: list[str] = [
         card.title,
-        card.explanation,
+        card.explanation_text,
         *card.observed_facts,
         *card.tentative_interpretations,
         *card.uncertainty_notes,

@@ -12,12 +12,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Computed,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -192,8 +193,13 @@ class Child(Base):
         UUID(as_uuid=True), primary_key=True, default=_uuid
     )
     family_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
-    display_label: Mapped[str] = mapped_column(String(128), nullable=False)
+    # 称呼。**不限制长度**（TEXT）—— 手动测试台里这个字段实际被当成
+    # "孩子的描述"用，有人会写一长串背景情况。见迁移 007。
+    display_label: Mapped[str] = mapped_column(Text, nullable=False)
     age_band: Mapped[str | None] = mapped_column(String(32))
+    # 年龄不存，读的时候按这个日期现算（见 rdi_agent/age.py）。
+    # 老档案没有出生日期，继续用 age_band 兜底。
+    birth_date: Mapped[date | None] = mapped_column(Date)
     communication_profile_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     strengths_interests_json: Mapped[list] = mapped_column(JSONB, default=list)
     support_preferences_json: Mapped[dict] = mapped_column(JSONB, default=dict)

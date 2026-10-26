@@ -9,9 +9,16 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # ``source_summary`` = 这张卡的主要依据是知识库原文（现在是指南）。
 # 以前叫 ``book_summary`` —— 知识库从英文书换成中文指南之后，
@@ -50,6 +57,20 @@ def _require_source_citations(schema: dict) -> None:
         required.append("source_citations")
 
 
+def _require_explanation_parts(schema: dict) -> None:
+    """把 ``explanation_parts`` 塞进 required 列表。
+
+    和 ``recommended`` / ``source_citations`` 同样的道理：这个字段有默认值
+    （空列表），所以结构化输出允许模型整张卡都不写它。
+
+    而"说明"是家长最先读的一段 —— 缺了它，卡就只剩动作清单，
+    家长不知道"为什么要这么做"。所以要求模型必须给。
+    """
+    required = schema.get("required")
+    if isinstance(required, list) and "explanation_parts" not in required:
+        required.append("explanation_parts")
+
+
 class SourceCitation(BaseModel):
     source_id: str
     source_type: Literal[
@@ -65,12 +86,34 @@ class SourceCitation(BaseModel):
     claim_supported: str
 
 
+class ExplanationPart(BaseModel):
+    """建议卡里的一段话 + 它依据的证据。
+
+    **为什么要拆成片段**：一段说明里常常混着两种东西 ——
+    "指南里说的"和"我们根据指南的说法做的应用转化"。
+    整张卡只有一个 ``application_label``，分不开这两者；
+    拆成片段之后，每一段各自带自己的 ``evidence_ids``，
+    "这一句的依据是哪一条"就成了确定关系，而不是靠模型自觉。
+
+    **evidence_ids 允许为空**：空 = 这一段是我们的应用转化，不是指南原话。
+    校验器会对"带指南术语却不挂证据"的片段报错（见
+    ``rdi_agent/graph/citations.py``）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
 class ParentAction(BaseModel):
     action: str
     context: str
     steps: list[str] = Field(default_factory=list)
     observe: list[str] = Field(default_factory=list)
     reduce_or_stop_if: list[str] = Field(default_factory=list)
+    # 这个动作依据的是哪几条证据。空 = 纯执行细节，不主张专业依据。
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class RecommendationCard(BaseModel):
@@ -91,6 +134,7 @@ class RecommendationCard(BaseModel):
         json_schema_extra=lambda schema: (
             _require_recommended(schema),
             _require_source_citations(schema),
+            _require_explanation_parts(schema),
         ),
     )
 
@@ -98,7 +142,16 @@ class RecommendationCard(BaseModel):
     title: str
     observed_facts: list[str]
     tentative_interpretations: list[str] = Field(default_factory=list)
-    explanation: str
+    # 说明，拆成片段，每段带自己的依据。
+    #
+    # **兼容老数据**：``explanation``（一整段字符串）仍然能读进来，
+    # 自动包成一段没有依据的片段。理由：数据库里已经落了一批老卡
+    # （``plans.plan_json``），改了字段名它们就全成废数据。
+    # 新的生成路径只写 ``explanation_parts``。
+    explanation_parts: list[ExplanationPart] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("explanation_parts", "explanation"),
+    )
     parent_actions: list[ParentAction]
     success_indicators: list[str]
     stop_conditions: list[str]
@@ -107,6 +160,19 @@ class RecommendationCard(BaseModel):
     uncertainty_notes: list[str] = Field(default_factory=list)
     follow_up_questions: list[str] = Field(default_factory=list)
     recommended: bool = False
+
+    @field_validator("explanation_parts", mode="before")
+    @classmethod
+    def accept_legacy_explanation(cls, value: Any) -> Any:
+        """老形状（字符串）包成一段；``["文字"]`` 也包一下。"""
+        if isinstance(value, str):
+            return [{"text": value}] if value.strip() else []
+        if isinstance(value, list):
+            return [
+                {"text": item} if isinstance(item, str) else item
+                for item in value
+            ]
+        return value
 
     @field_validator("success_indicators", "stop_conditions")
     @classmethod
@@ -119,4 +185,16 @@ class RecommendationCard(BaseModel):
     def source_summary_needs_citation(self):
         if self.application_label == "source_summary" and not self.source_citations:
             raise ValueError("source_summary 必须至少有一条真实引用")
+        if not self.explanation_parts:
+            raise ValueError("建议卡必须至少有一段说明（explanation_parts）")
         return self
+
+    # ---- 给内部用的便捷视图 ----
+    @property
+    def explanation_text(self) -> str:
+        """整张卡的说明，纯文本。
+
+        安全审查、CLI 打印这些地方要的是"卡上所有文字"，
+        不关心片段和引用怎么对应。
+        """
+        return "\n".join(p.text for p in self.explanation_parts if p.text)

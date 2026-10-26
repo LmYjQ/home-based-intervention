@@ -11,6 +11,16 @@
 > 这消掉了原来的一整层跨语言机器（英文书 → 中文查询、zh→en 术语桥接、
 > `to_tsvector('english')`），代价是**中文分词**成为关键词路的必要条件。
 > 详见 §0.1。
+>
+> **v3.1 变更（2026-10-26）：引用下沉到片段**。
+> 原来一张卡只有 `source_citations`，能回答"这张卡依据了哪几条"，
+> 回答不了"**这句话**依据的是哪一条"。现在把说明拆成
+> `explanation_parts`（每段带自己的 `evidence_ids`），
+> `parent_actions` 也带 `evidence_ids`。
+> 校验跟着下沉：片段引用的 id 必须在证据包里，片段里的指南术语
+> 必须出现在**它引用的那条**证据里。
+> 给模型看的编号是 `E1`/`E2`（UUID 太长，抄错一位就变成编造引用），
+> 由代码翻译回真实 id。契约见 §4.3，硬规则第 5、6 条。
 
 ---
 
@@ -553,6 +563,22 @@ class ParentAction(BaseModel):
     steps: list[str] = Field(default_factory=list)
     observe: list[str] = Field(default_factory=list)
     reduce_or_stop_if: list[str] = Field(default_factory=list)
+    # 这个动作依据的是哪几条证据。空 = 纯执行细节，不主张专业依据。
+    evidence_ids: list[str] = Field(default_factory=list)
+
+
+class ExplanationPart(BaseModel):
+    """建议卡里的一段话 + 它依据的证据。
+
+    **为什么拆成片段**：一段说明里常常混着"指南里说的"和
+    "我们根据指南的说法做的应用转化"。整张卡只有一个
+    ``application_label``，分不开这两者；拆成片段之后，
+    每一段各自带自己的 ``evidence_ids``，
+    "这一句的依据是哪一条"就成了确定关系。
+    """
+    text: str
+    # 允许为空 = 这一段是我们的应用转化，不是指南原话
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class RecommendationCard(BaseModel):
@@ -560,7 +586,12 @@ class RecommendationCard(BaseModel):
     title: str
     observed_facts: list[str]
     tentative_interpretations: list[str] = Field(default_factory=list)
-    explanation: str
+    # 说明，拆成片段，每段带自己的依据。
+    # 兼容老数据：一整段 explanation 仍能读进来，自动包成一段。
+    explanation_parts: list[ExplanationPart] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("explanation_parts", "explanation"),
+    )
     parent_actions: list[ParentAction]
     success_indicators: list[str]
     stop_conditions: list[str]
@@ -581,6 +612,8 @@ class RecommendationCard(BaseModel):
     def source_summary_needs_citation(self):
         if self.application_label == "source_summary" and not self.source_citations:
             raise ValueError("source_summary 必须至少有一条真实引用")
+        if not self.explanation_parts:
+            raise ValueError("建议卡必须至少有一段说明（explanation_parts）")
         return self
 ```
 
@@ -590,6 +623,8 @@ class RecommendationCard(BaseModel):
 2. `success_indicators` 和 `stop_conditions` 不得为空，由 Pydantic 强制。
 3. `source_summary` 必须有 citation；没有直接证据时只能是 `ai_adaptation`。
 4. `expert_reviewed` 第一阶段不实现，出现即拒绝。
+5. **片段级（v3.1 新增）**：`explanation_parts[].evidence_ids` 和 `parent_actions[].evidence_ids` 里的每个 id 都必须在当前 `EvidenceBundle` 里；片段文本中出现的**指南术语**必须出现在它所引用的那些证据的摘要或原文里 —— 挂错证据和编造一样判失败。标成 `source_summary` 的卡，带术语的片段必须挂证据。
+6. **给模型的编号是 `E1`/`E2`**，不是 `evidence_id`（UUID 有 36 个字符，抄错一位在下游就变成"编造引用"）。清单和编号映射由 `rdi_agent/graph/citations.py::build_evidence_catalogue` 一次生成，生成后由 `translate_short_ids` 换回真实 id，校验器只认真实 id。
 
 ### 4.4 PostgreSQL 表设计
 
@@ -614,7 +649,7 @@ class RecommendationCard(BaseModel):
 
 | 表 | 作用 | 关键字段 | 约束/说明 |
 |---|---|---|---|
-| `children` | 稳定档案 | `id`, `family_id`, `display_label`, `age_band`, `communication_profile_json`, `strengths_interests_json`, `support_preferences_json`, `family_goals_json`, `known_contexts_json`, `confirmed_facts_json`, `created_at`, `updated_at` | 不要求真实姓名；只存对建议有帮助的信息 |
+| `children` | 稳定档案 | `id`, `family_id`, `display_label`（TEXT）, `age_band`, `communication_profile_json`, `strengths_interests_json`, `support_preferences_json`, `family_goals_json`, `known_contexts_json`, `confirmed_facts_json`, `created_at`, `updated_at` | 不要求真实姓名；只存对建议有帮助的信息。`display_label` 是 **TEXT 不限长度**（迁移 007）—— 手动测试台把它当"孩子的描述"用，会写很长的一段背景 |
 | `interactions` | 原始交互 | `id`, `family_id`, `child_id`, `conversation_id`, `thread_id`, `turn_id`, `role`, `content`, `trace_json`, `created_at` | `UNIQUE(conversation_id, turn_id, role)`；幂等 |
 | `evidence_bundles` | 证据包审计 | `id`, `conversation_id`, `turn_id`, `bundle_json`, `retrieval_version`, `created_at` | 用于回答后追溯“当时检索到了什么” |
 | `plans` | 候选/选中方案 | `id`, `family_id`, `child_id`, `conversation_id`, `plan_version`, `plan_json`, `evidence_bundle_id`, `application_label`, `recommended`, `status`, `created_at` | `status`: `proposed / selected / discarded`；一张卡一行 |

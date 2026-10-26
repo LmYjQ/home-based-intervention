@@ -21,12 +21,12 @@ from typing import Any
 from rdi_agent.db.engine import dispose_engine
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 
-# 固定演示输入：开场白 + **一轮**追问的回答。
+# 固定演示输入：开场白 + 追问的回答。
 #
-# 为什么是一轮：只允许追问一轮（MAX_FOLLOWUP_ROUNDS = 1），
-# 家长答完这一轮就直接出方案。所以演示只需要一条回答。
+# 备了几条回答，具体用几条看 ``MAX_FOLLOWUP_ROUNDS``：
+# 图一进方案选择，循环就 break，多出来的回答不会被用到。
 #
-# 这条回答把 check_sufficiency 关心的四件事一次补齐：
+# 第一条回答把 check_sufficiency 关心的四件事一次补齐：
 # 场景（几点、在哪、持续多久）、孩子的具体行为、试过什么效果如何、家长的目标。
 DEMO_ANSWER_1 = (
     "早上从家门口走到楼下大概五分钟，一直抱着我腿不说话。到幼儿园门口就大哭，"
@@ -35,9 +35,15 @@ DEMO_ANSWER_1 = (
     "目标是能正常入园、别在门口哭半小时，晚十分钟到也接受。"
 )
 
+DEMO_ANSWER_2 = (
+    "补充：家里还有个弟弟，两个人偶尔抢玩具。她在幼儿园不太主动找小朋友，"
+    "老师说她午睡时也要拍一会儿才睡。我们希望她早上能自己走进教室。"
+)
+
 DEMO_MESSAGES = [
     "孩子 4 岁，最近不愿意去幼儿园，早上出门就哭。",
     DEMO_ANSWER_1,
+    DEMO_ANSWER_2,
 ]
 
 
@@ -46,7 +52,16 @@ def _show_plan(plan: dict[str, Any]) -> None:
           f"{'  ★推荐' if plan.get('recommended') else ''} ---")
     print(f"依据事实：{'; '.join(plan.get('observed_facts', [])) or '（无）'}")
     print(f"可能解释：{'; '.join(plan.get('tentative_interpretations', [])) or '（无）'}")
-    print(f"说明：{plan.get('explanation', '')}")
+    # 说明是**片段**：每段带自己的依据（evidence_ids）。
+    # 老卡（数据库里已经落库的那些）只有一整段 explanation，这里兜住。
+    parts = plan.get("explanation_parts") or []
+    if not parts and plan.get("explanation"):
+        parts = [{"text": plan["explanation"], "evidence_ids": []}]
+    print("说明：")
+    for part in parts:
+        ids = part.get("evidence_ids") or []
+        suffix = f"　[{'、'.join(ids)}]" if ids else ""
+        print(f"  · {part.get('text', '')}{suffix}")
     for action in plan.get("parent_actions", []):
         print(f"  · {action['action']}（情境：{action.get('context', '')}）")
         for step in action.get("steps", []):

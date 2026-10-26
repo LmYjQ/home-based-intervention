@@ -411,7 +411,7 @@ def _review_content(
     if answer_text:
         parts.append(answer_text)
     for card in cards:
-        parts.append(f"[{card.plan_id}] {card.title}\n{card.explanation}")
+        parts.append(f"[{card.plan_id}] {card.title}\n{card.explanation_text}")
         for action in card.parent_actions:
             parts.append(f"  动作：{action.action}（{action.context}）")
             parts.extend(f"    - {s}" for s in action.steps)
@@ -455,17 +455,44 @@ def render_answer(state: CoachState) -> dict[str, Any]:
 
 
 def _render_cards(cards: list[RecommendationCard], bundle: EvidenceBundle | None) -> str:
+    """渲染建议卡。
+
+    **片段级引用**：说明被拆成片段，每段后面挂一个编号（``[1]``），
+    编号对应回答末尾的"这次的指南依据"清单 —— 家长能顺着编号
+    找到"这一句的依据是指南第几页的那一段"。
+
+    编号是**这张卡内部**的编号（从 1 开始），只给推荐卡编号；
+    另外两张卡只给一句话摘要，不参与编号 —— 编号乱了家长就没法核了。
+    """
     recommended = next((c for c in cards if c.recommended), cards[0])
     others = [c for c in cards if c is not recommended]
+    index = {e.evidence_id: e for e in (bundle.evidence if bundle else [])}
     lines: list[str] = []
 
+    # 编号表：按卡里第一次出现的顺序
+    order: list[str] = []
+
+    def number_of(evidence_id: str) -> int | None:
+        """给一个 evidence_id 编号。查不到就返回 None（不显示标记）。"""
+        if evidence_id not in index:
+            return None
+        if evidence_id not in order:
+            order.append(evidence_id)
+        return order.index(evidence_id) + 1
+
+    def markers(evidence_ids: list[str]) -> str:
+        nums = [n for n in (number_of(e) for e in evidence_ids) if n is not None]
+        return "".join(f"[{n}]" for n in nums)
+
     lines.append(f"【建议先做这个】{recommended.title}")
-    if recommended.explanation:
-        lines.append(recommended.explanation)
+    for part in recommended.explanation_parts:
+        if not part.text:
+            continue
+        lines.append(part.text + markers(part.evidence_ids))
     lines.append("")
     lines.append("怎么做：")
     for i, action in enumerate(recommended.parent_actions, start=1):
-        lines.append(f"{i}. {action.action}（{action.context}）")
+        lines.append(f"{i}. {action.action}（{action.context}）{markers(action.evidence_ids)}")
         for step in action.steps:
             lines.append(f"   - {step}")
         for observe in action.observe:
@@ -480,19 +507,22 @@ def _render_cards(cards: list[RecommendationCard], bundle: EvidenceBundle | None
     if recommended.uncertainty_notes:
         lines.append("还不确定的地方：" + "；".join(recommended.uncertainty_notes))
 
-    if recommended.source_citations:
+    # 卡级引用也进编号表 —— 它们指向的是同一批指南段落
+    for citation in recommended.source_citations:
+        number_of(citation.source_id)
+
+    if order:
         lines.append("")
         lines.append("这次的指南依据：")
-        index = {e.evidence_id: e for e in (bundle.evidence if bundle else [])}
-        for citation in recommended.source_citations:
-            item = index.get(citation.source_id)
+        for n, evidence_id in enumerate(order, start=1):
+            item = index.get(evidence_id)
             if item is None:
                 continue
             pages = ""
             if item.pdf_page_start is not None:
                 pages = f"，PDF 第 {item.pdf_page_start}-{item.pdf_page_end} 页"
             lines.append(
-                f"- 《{item.section_title or item.title}》{pages}：{item.summary}"
+                f"[{n}] 《{item.section_title or item.title}》{pages}：{item.summary}"
             )
     else:
         lines.append("")
@@ -502,7 +532,8 @@ def _render_cards(cards: list[RecommendationCard], bundle: EvidenceBundle | None
         lines.append("")
         lines.append("另外两个可以试的方向：")
         for card in others:
-            lines.append(f"- {card.title}：{card.explanation}")
+            summary = " ".join(p.text for p in card.explanation_parts if p.text)
+            lines.append(f"- {card.title}：{summary}")
 
     return "\n".join(lines)
 

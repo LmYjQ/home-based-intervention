@@ -16,6 +16,7 @@ from langgraph.types import Command
 
 from rdi_agent import llm
 from rdi_agent.graph.builder import build_graph
+from rdi_agent.graph.nodes.chat_nodes import MAX_FOLLOWUP_ROUNDS
 from rdi_agent.graph.nodes import (
     chat_nodes,
     memory_nodes,
@@ -35,6 +36,7 @@ from rdi_agent.schemas.evidence import EvidenceDecision
 from rdi_agent.schemas.feedback import FeedbackAnalysis
 from rdi_agent.schemas.memory import MemoryExtractionResult
 from rdi_agent.schemas.recommendation import (
+    ExplanationPart,
     ParentAction,
     RecommendationCard,
     SourceCitation,
@@ -405,8 +407,8 @@ async def test_answer_resumes_from_the_same_interrupt(
 
 
 @pytest.mark.asyncio
-async def test_followup_stops_after_one_round(patched_llm, no_writes, no_retrieval):
-    """只允许追问**一轮**。家长答完就必须出方案，不能再问第二遍。
+async def test_followup_stops_at_round_limit(patched_llm, no_writes, no_retrieval):
+    """追问到 ``MAX_FOLLOWUP_ROUNDS`` 就必须收手，不能再问。
 
     模型永远说"不够" —— 靠 followup_rounds 兜底。
     """
@@ -430,10 +432,14 @@ async def test_followup_stops_after_one_round(patched_llm, no_writes, no_retriev
     await graph.ainvoke(_state("还是不清楚"), config=cfg)
     assert _count_followups(fake) == 1
 
-    # 答完这一轮就该出方案，而不是再问一轮
-    result = await graph.ainvoke(Command(resume="还是不清楚"), config=cfg)
-    assert _interrupt(result)["kind"] == "plan_selection"
-    assert _count_followups(fake) == 1, "答完一轮还在追问"
+    # 每答一轮模型都想再问；到上限那一次必须强制出方案。
+    for round_no in range(1, MAX_FOLLOWUP_ROUNDS + 1):
+        result = await graph.ainvoke(Command(resume="还是不清楚"), config=cfg)
+        if round_no < MAX_FOLLOWUP_ROUNDS:
+            assert _interrupt(result)["kind"] == "followup"
+            assert _count_followups(fake) == round_no + 1
+    assert _interrupt(result)["kind"] == "plan_selection", "到上限还在追问"
+    assert _count_followups(fake) == MAX_FOLLOWUP_ROUNDS
 
 
 @pytest.mark.asyncio
@@ -732,3 +738,90 @@ def _async_value(value: dict):
         return value
 
     return _f
+
+# ------------------------------------------------------------------ 片段级引用
+@pytest.mark.asyncio
+async def test_short_ids_are_translated_to_real_evidence_ids(patched_llm):
+    """模型看到的是 E1，节点里必须换回真的 evidence_id。
+
+    **不换会怎样**：片段的引用永远对不上证据包，校验器会把卡全丢掉，
+    整轮退化成有限回答 —— 而且 trace 里看不出为什么。
+    """
+    card = RecommendationCard(
+        plan_id="plan_1",
+        title="方案 1",
+        observed_facts=["早上出门会哭"],
+        explanation_parts=[
+            ExplanationPart(
+                text="书里讲的是 guided participation",
+                evidence_ids=["E1"],
+            )
+        ],
+        parent_actions=[
+            ParentAction(action="提前十分钟出门", context="早上", evidence_ids=["E1"])
+        ],
+        success_indicators=["哭的时间变短"],
+        stop_conditions=["一周没变化就停下重新评估"],
+        application_label="source_summary",
+        source_citations=[
+            SourceCitation(
+                source_id="E1",
+                source_type="guideline",
+                title="Guided Participation",
+                chapter="Guided Participation",
+                pdf_page_start=154,
+                pdf_page_end=155,
+                claim_supported="书里讲的是 guided participation",
+            )
+        ],
+        uncertainty_notes=["还不确定原因"],
+        recommended=True,
+    )
+    patched_llm(
+        {RecommendationSet: RecommendationSet(plans=[card], comparison_note="")}
+    )
+    state = {
+        "case_summary": {},
+        "child_context": {},
+        "evidence_bundle": _bundle(),
+    }
+    out = await chat_nodes.build_recommendation(state)
+    plans = out["candidate_plans"]
+    # 卡片留下来了（引用校验通过）
+    assert len(plans) == 1, out.get("trace_metadata")
+    # 编号换成了真实的 evidence_id
+    assert plans[0]["explanation_parts"][0]["evidence_ids"] == [EVIDENCE_ID]
+    assert plans[0]["parent_actions"][0]["evidence_ids"] == [EVIDENCE_ID]
+    assert plans[0]["source_citations"][0]["source_id"] == EVIDENCE_ID
+
+
+@pytest.mark.asyncio
+async def test_fragment_citing_unknown_evidence_is_dropped(patched_llm):
+    """片段引用了不存在的那条 —— 这张卡要被丢掉，不能带病放行。"""
+    card = RecommendationCard(
+        plan_id="plan_1",
+        title="方案 1",
+        observed_facts=["早上出门会哭"],
+        explanation_parts=[
+            ExplanationPart(text="书里讲的是 guided participation", evidence_ids=["E9"])
+        ],
+        parent_actions=[ParentAction(action="提前十分钟出门", context="早上")],
+        success_indicators=["哭的时间变短"],
+        stop_conditions=["一周没变化就停下重新评估"],
+        application_label="ai_adaptation",
+        uncertainty_notes=["还不确定原因"],
+        recommended=True,
+    )
+    patched_llm(
+        {RecommendationSet: RecommendationSet(plans=[card], comparison_note="")}
+    )
+    state = {
+        "case_summary": {},
+        "child_context": {},
+        "evidence_bundle": _bundle(),
+    }
+    out = await chat_nodes.build_recommendation(state)
+    assert out["candidate_plans"] == []
+    # 降级成有限回答，并且 trace 里留了痕
+    assert out["route_after_recommendation"] == "limited_answer"
+    assert "citation_validation_failed" in out["trace_metadata"]["build_recommendation"]

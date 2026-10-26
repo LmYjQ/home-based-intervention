@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
 from typing import Any
 
 from sqlalchemy import select
@@ -42,6 +43,7 @@ class Repository:
         family_id: str,
         display_label: str,
         age_band: str | None = None,
+        birth_date: date | None = None,
         child_id: str | None = None,
     ) -> Child:
         """按 child_id 或 (family_id, label) 拿档案，没有就建。
@@ -69,6 +71,7 @@ class Repository:
             family_id=fam,
             display_label=display_label,
             age_band=age_band,
+            birth_date=birth_date,
         )
         self.session.add(child)
         await self.session.flush()
@@ -77,6 +80,25 @@ class Repository:
     async def get_child(self, child_id: str) -> Child | None:
         """按 id 取档案。给"复用已有孩子开新会话"用。"""
         return await self.session.get(Child, uuid.UUID(str(child_id)))
+
+    async def list_children(
+        self, *, limit: int = 100, label_prefix: str | None = None
+    ) -> list[Child]:
+        """列出孩子，新建的排在前面。
+
+        只给手动测试台的账号下拉用 —— **不按 family 过滤**，
+        因为测试台本来就是一个人在自己电脑上对比几套数据。
+
+        ``label_prefix`` 用来只看测试账号：老的演示孩子全叫"孩子"，
+        混进下拉里会出现几十个同名选项，没法选。
+        """
+        stmt = select(Child)
+        if label_prefix:
+            stmt = stmt.where(Child.display_label.like(f"{label_prefix}%"))
+        rows = await self.session.execute(
+            stmt.order_by(Child.created_at.desc()).limit(limit)
+        )
+        return list(rows.scalars().all())
 
     async def child_context(self, child_id: str) -> dict[str, Any]:
         """给 prompt 用的最小上下文。刻意很薄，别把整张表塞进去。
@@ -87,15 +109,24 @@ class Repository:
 
         旧数据是裸字符串数组，:func:`normalize_fact_items` 兼容。
         """
+        from rdi_agent.age import describe_age
         from rdi_agent.memory.facts import active_facts, normalize_fact_items
 
         child = await self.session.get(Child, uuid.UUID(str(child_id)))
         if child is None:
             return {}
         live = active_facts(normalize_fact_items(child.confirmed_facts_json))
+        # **年龄每次现算**：家长可能用这个系统好几年，
+        # 存下来的年龄过一年就是错的。
+        age = describe_age(child.birth_date)
         return {
             "display_label": child.display_label,
-            "age_band": child.age_band,
+            "birth_date": age.get("birth_date"),
+            "age_display": age.get("age_display"),
+            "age_years": age.get("age_years"),
+            "age_months": age.get("age_months"),
+            # 有出生日期就以现算的段位为准；老档案退回存量的 age_band
+            "age_band": age.get("age_band") or child.age_band,
             "family_goals": child.family_goals_json or [],
             "known_contexts": child.known_contexts_json or [],
             "confirmed_facts": [

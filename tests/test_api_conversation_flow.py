@@ -25,6 +25,7 @@ from rdi_agent.api import conversations as api
 from rdi_agent.db.engine import dispose_engine, get_engine
 from rdi_agent.db.models import Trial
 from rdi_agent.graph.nodes import retrieval_nodes
+from rdi_agent.graph.nodes.chat_nodes import MAX_FOLLOWUP_ROUNDS
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 from rdi_agent.schemas.case import CaseSummary
 from rdi_agent.schemas.conversation import (
@@ -228,14 +229,35 @@ async def _new_conversation() -> str:
     return conv["conversation_id"]
 
 
+async def _send_until_plan_selection(cid: str) -> dict:
+    """发第一条消息，然后按配置的追问上限把问答完，直到出方案。
+
+    轮数跟着 ``MAX_FOLLOWUP_ROUNDS`` 走，不写死 —— 调那个常量
+    不该让这个文件一起变红。
+    """
+    res = await api.send_message(
+        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
+    )
+    turn = 1
+    while res["status"] == "awaiting_followup":
+        turn += 1
+        assert turn <= MAX_FOLLOWUP_ROUNDS + 1, (
+            f"追问兜底没生效：已经问了 {turn} 轮还没出方案"
+        )
+        res = await api.send_message(
+            cid,
+            api.SendMessageRequest(message=f"补充信息 {turn}", turn_id=f"t{turn}"),
+        )
+    return res
+
+
 @pytest.mark.asyncio
 async def test_followup_resume_increments_rounds(no_retrieval, graph, always_wants_more):
     """回答追问必须**恢复**中断，不能让图从 START 重跑。
 
     断言两件事：
     1. 回答之后 `followup_rounds` 真的 +1（重跑的话它永远是 0）；
-    2. 兜底生效：`MAX_FOLLOWUP_ROUNDS = 1` 之后，家长答完一轮就出方案，
-       不会再问第二遍。
+    2. 兜底生效：答满 `MAX_FOLLOWUP_ROUNDS` 轮就强制出方案，不再继续问。
     """
     from rdi_agent.graph.runtime import config_for, get_graph
 
@@ -246,19 +268,25 @@ async def test_followup_resume_increments_rounds(no_retrieval, graph, always_wan
     )
     assert res["status"] == "awaiting_followup"
 
-    # 唯一的一轮追问，答完就出方案（MAX_FOLLOWUP_ROUNDS 现在是 1）
-    res = await api.send_message(
-        cid,
-        api.SendMessageRequest(message="第 2 轮补充信息", turn_id="t2"),
-    )
-    state = await get_graph().aget_state(config_for(cid))
-    assert state.values.get("followup_rounds") == 1, (
-        f"答完一轮后 followup_rounds 应该是 1，"
-        f"实际 {state.values.get('followup_rounds')} —— "
-        "多半是图被重跑了而不是从中断恢复"
-    )
+    # 每答一轮，followup_rounds 都要 +1；到上限就强制出方案。
+    # 如果图是从 START 重跑而不是 resumes 中断，这个计数会一直是 0。
+    for round_no in range(1, MAX_FOLLOWUP_ROUNDS + 1):
+        res = await api.send_message(
+            cid,
+            api.SendMessageRequest(
+                message=f"第 {round_no + 1} 轮补充信息",
+                turn_id=f"t{round_no + 1}",
+            ),
+        )
+        state = await get_graph().aget_state(config_for(cid))
+        assert state.values.get("followup_rounds") == round_no, (
+            f"答完第 {round_no} 轮追问后 followup_rounds 应该是 {round_no}，"
+            f"实际 {state.values.get('followup_rounds')} —— "
+            "多半是图被重跑了而不是从中断恢复"
+        )
+
     assert res["status"] == "awaiting_plan_selection", (
-        "追问一轮后应该强制出方案，实际状态："
+        "到追问上限后应该强制出方案，实际状态："
         f"{res['status']} —— MAX_FOLLOWUP_ROUNDS 兜底没生效"
     )
     assert len(res["plans"]) == 2
@@ -368,17 +396,12 @@ async def test_select_plan_creates_trial(no_retrieval, graph, always_wants_more)
     """
     cid = await _new_conversation()
 
-    res = await api.send_message(
-        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
-    )
-    res = await api.send_message(
-        cid, api.SendMessageRequest(message="补充信息 2", turn_id="t2")
-    )
+    res = await _send_until_plan_selection(cid)
     assert res["status"] == "awaiting_plan_selection"
 
     plan_id = next(p["plan_id"] for p in res["plans"] if p.get("recommended"))
     sel = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t-select")
     )
 
     assert sel["status"] == "completed"
@@ -402,19 +425,14 @@ async def test_select_plan_is_idempotent(no_retrieval, graph, always_wants_more)
     """重发同一次选择，不该建出第二条 trial。"""
     cid = await _new_conversation()
 
-    res = await api.send_message(
-        cid, api.SendMessageRequest(message="孩子 4 岁，早上出门哭", turn_id="t1")
-    )
-    res = await api.send_message(
-        cid, api.SendMessageRequest(message="补充信息 2", turn_id="t2")
-    )
+    res = await _send_until_plan_selection(cid)
     plan_id = next(p["plan_id"] for p in res["plans"] if p.get("recommended"))
 
     first = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t-select")
     )
     second = await api.select_plan(
-        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t3")
+        cid, api.SelectPlanRequest(plan_id=plan_id, turn_id="t-select")
     )
     assert first["trial_id"] == second["trial_id"], "重发选了两次，建了两条 trial"
 

@@ -8,13 +8,13 @@
 //
 // 走通的顺序：建会话 → 发消息（可能停在追问）→ 答完追问
 // → 停在方案选择 → 选一张 → trial 落库 → 录反馈。
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api, streamMessage } from './api.js'
 import PlanCard from './components/PlanCard.vue'
-import EvidencePanel from './components/EvidencePanel.vue'
 import FeedbackForm from './components/FeedbackForm.vue'
 import FollowupStepper from './components/FollowupStepper.vue'
 import MemoryPanel from './components/MemoryPanel.vue'
+import MonthPicker from './components/MonthPicker.vue'
 
 // 快捷填入的演示回答。只问一轮（后端 MAX_FOLLOWUP_ROUNDS = 1），
 // 所以一条回答就把场景、行为、试过什么、目标都补齐了。
@@ -32,11 +32,22 @@ const CONV_KEY = 'rdi.conversation_id'
 // 换会话不换孩子才能看到上一轮记住的东西。
 const FAMILY_KEY = 'rdi.family_id'
 const CHILD_KEY = 'rdi.child_id'
+// 每个孩子记住自己上次用的会话 id —— 切账号回来能接着上次的上下文，
+// 而不是从一张白纸重新开始。
+const CHILD_CONV_PREFIX = 'rdi.conversation_id.child.'
 const conversationId = ref(localStorage.getItem(CONV_KEY) || '')
 const familyId = ref(localStorage.getItem(FAMILY_KEY) || '')
 const childId = ref(localStorage.getItem(CHILD_KEY) || '')
-const displayLabel = ref('孩子')
-const ageBand = ref('3-4岁')
+
+// 测试账号列表（新建的在前）。切换它 = 切换"当前在看哪个孩子的数据"。
+const children = ref([])
+const loadingChildren = ref(false)
+// 新建账号要填的东西：**姓名和出生年月都必填**。
+// 年龄不存 —— 只存出生日期，显示和给模型用的年龄都由后端按当天现算。
+// 姓名不限长度：这里实际被当"孩子的描述"用。
+const newName = ref('')
+// 日历控件选出来的年月（YYYY-MM）
+const newBirth = ref('')
 
 const messages = ref([])
 const status = ref('')
@@ -67,19 +78,52 @@ const stepper = ref(null)
 // "理解 → 判断 → 检索 → 整理建议"这条线，知道系统在往哪儿走。
 const progressSteps = ref([])
 
-// 建议卡引用到的证据 id 集合 —— 右侧证据面板靠它标"已引用"。
-//
-// **为什么需要它**：卡上的引用和右侧的证据说的是同一段东西，
-// 但分属两个组件，谁也不认识谁。把 id 收集上来传下去，
-// 右侧才能标出"这 8 条里有 2 条真被用了"。
-const citedIds = ref([])
-
 // ---- 派生 ----
 // 只认后端真的声明过的状态，别猜。
 const awaitingFollowup = computed(() => status.value === 'awaiting_followup')
 const awaitingPlanSelection = computed(() => status.value === 'awaiting_plan_selection')
 const canSend = computed(() => conversationId.value && !busy.value && !awaitingPlanSelection.value)
 const needsFeedback = computed(() => Boolean(trialId.value) && !feedbackResult.value)
+// 新建账号：姓名和出生年月都必须填
+const canCreateAccount = computed(
+  () => Boolean(newName.value.trim()) && Boolean(newBirth.value) && !busy.value,
+)
+
+// 下拉选项。当前孩子如果不在列表里（老会话、换过库），也要能显示出来 ——
+// 否则 select 会变成"没有任何选项被选中"，看起来像坏了。
+const accountOptions = computed(() => {
+  if (childId.value && !children.value.some((c) => c.child_id === childId.value)) {
+    return [
+      {
+        child_id: childId.value,
+        family_id: familyId.value,
+        display_label: '当前孩子（不在列表中）',
+        age_display: '',
+        age_band: '',
+      },
+      ...children.value,
+    ]
+  }
+  return children.value
+})
+
+// 下拉里的显示名。
+//
+// **要截断**：姓名/描述可能是一长串（"四岁男孩，确诊孤独症，合并语言迟缓……"），
+// 全塞进下拉选项会把整个下拉撑成一行行长文本。
+// 只取第一行、超过 40 字截断 —— 完整内容还在档案里。
+function shortLabel(text) {
+  const first = String(text || '').split('\n')[0].trim()
+  return first.length > 40 ? `${first.slice(0, 40)}…` : first
+}
+
+// 日历控件的上限：不允许选到未来
+const today = computed(() => {
+  const now = new Date()
+  const m = String(now.getMonth() + 1).padStart(2, '0')
+  const d = String(now.getDate()).padStart(2, '0')
+  return `${now.getFullYear()}-${m}-${d}`
+})
 
 const STATUS_TEXT = {
   awaiting_followup: ['追问中', 'warn'],
@@ -96,6 +140,16 @@ const STATUS_HINT = {
   limited_answer: '证据不够，给了有限回答，没有方案卡。',
   needs_professional_support: '门控判成高风险，建议转专业支持。',
   completed: '本轮跑完了。',
+}
+
+// 证据门控的结论。右侧的证据清单取消之后，这个状态挪到方案卡头上 ——
+// 家长还是要知道"这次是有依据的，还是没找到依据"。
+const EVIDENCE_STATUS_TEXT = {
+  direct: ['有直接依据', 'ok'],
+  indirect: ['只有间接参考', 'warn'],
+  conflicting: ['证据互相矛盾', 'warn'],
+  none: ['没找到足够依据', 'warn'],
+  risk: ['需要专业支持', 'err'],
 }
 
 // ---- 动作 ----
@@ -170,25 +224,120 @@ function onProgress(ev) {
   })
 }
 
-// 建会话。
+// ---- 测试账号（一键新建 + 下拉切换）----
 //
-// ``reuseChild=true`` 是**同一个孩子再开一个会话** —— 长期记忆挂在孩子上，
-// 验收"第二轮咨询会主动使用第一轮的事实"必须走这条路。
-// 新建孩子的话，上一轮记住的东西挂在另一个 child_id 上，永远看不到。
-async function createConversation(reuseChild = false) {
-  const payload =
-    reuseChild && childId.value
-      ? { family_id: familyId.value || undefined, child_id: childId.value }
-      : { display_label: displayLabel.value, age_band: ageBand.value }
+// 一个账号 = 一个新家庭 + 一个新孩子。长期记忆挂在孩子上，
+// 所以不同账号之间天然隔离，适合并排对比几种情况。
 
-  const data = await run(() => api.createConversation(payload))
+async function loadChildren() {
+  loadingChildren.value = true
+  try {
+    // **不过滤前缀**：名字是家长自己写的（可能是一长串描述），
+    // 按"测试账号"前缀过滤会把它们全藏掉。
+    // 老演示数据里那些叫"孩子"的也会出现，但新账号排在最前面
+    // （后端按创建时间倒序），当前正在用的孩子由 accountOptions 兜底。
+    const data = await api.listChildren()
+    children.value = data.children || []
+  } catch {
+    // 账号列表拉不到不该挡住主流程 —— 当前孩子照样能对话
+    children.value = []
+  } finally {
+    loadingChildren.value = false
+  }
+}
+
+// 新建账号，并直接切过去开一个新会话。
+//
+// **姓名和出生年月都必须填**：
+//   - 姓名不填 → 自动命名出来的账号在列表里长得一模一样，分不清谁是谁
+//   - 出生年月不填 → 年龄只能靠 age_band 兜底，算出来的段位经常是错的
+//
+// 姓名**不限制长度**：这个字段实际被当"孩子的描述"用。
+async function createAccount() {
+  if (!canCreateAccount.value) return
+  const data = await run(() =>
+    api.createChild({
+      display_label: newName.value.trim(),
+      // 日历选的就是 'YYYY-MM'，后端按当月 1 号存
+      // （见 rdi_agent/age.py::parse_birth_date）
+      birth_date: newBirth.value,
+    }),
+  )
   if (!data) return
-  conversationId.value = data.conversation_id
-  familyId.value = data.family_id
+  newName.value = ''
+  newBirth.value = ''
+  await loadChildren()
   childId.value = data.child_id
-  localStorage.setItem(CONV_KEY, data.conversation_id)
+  familyId.value = data.family_id
   localStorage.setItem(FAMILY_KEY, data.family_id)
   localStorage.setItem(CHILD_KEY, data.child_id)
+  await createConversation()
+}
+
+async function switchChild(nextChildId) {
+  if (!nextChildId || nextChildId === childId.value) return
+  const target = accountOptions.value.find((c) => c.child_id === nextChildId)
+  if (!target) return
+
+  childId.value = target.child_id
+  familyId.value = target.family_id
+  localStorage.setItem(FAMILY_KEY, target.family_id)
+  localStorage.setItem(CHILD_KEY, target.child_id)
+
+  // 先把上一个孩子的界面清掉，免得网络慢时看起来像两套数据串在一起
+  resetTurnState()
+  conversationId.value = ''
+  localStorage.removeItem(CONV_KEY)
+
+  // 这个孩子上次的会话还在就接回来；接不回来（换过库/被清了）就开新的
+  const saved = localStorage.getItem(CHILD_CONV_PREFIX + nextChildId)
+  if (saved && (await hydrateConversation(saved))) return
+  if (saved) localStorage.removeItem(CHILD_CONV_PREFIX + nextChildId)
+  await createConversation()
+}
+
+// 把一个已有会话接回界面。返回 false 表示后端不认这个 id。
+async function hydrateConversation(targetId) {
+  let data = null
+  try {
+    data = await api.getConversation(targetId)
+  } catch {
+    return false
+  }
+  if (!data) return false
+
+  resetTurnState()
+  conversationId.value = targetId
+  localStorage.setItem(CONV_KEY, targetId)
+  status.value = data.status
+  familyId.value = data.family_id || familyId.value
+  childId.value = data.child_id || childId.value
+  if (familyId.value) localStorage.setItem(FAMILY_KEY, familyId.value)
+  if (childId.value) {
+    localStorage.setItem(CHILD_KEY, childId.value)
+    localStorage.setItem(CHILD_CONV_PREFIX + childId.value, targetId)
+  }
+  evidence.value = data.evidence || []
+  evidenceDecision.value = data.evidence_decision || {}
+  trialId.value = data.trial_id || ''
+  selectedPlanId.value = data.selected_plan_id || ''
+  if (data.plans?.length) plans.value = data.plans
+  memories.value = data.memories || []
+  memoryPending.value = data.memory_pending || 0
+  for (const it of data.interactions || []) {
+    push(it.role === 'user' ? 'user' : 'bot', it.content)
+  }
+  // 停在追问中断上时，题目要从 pending_interrupt 里取出来重新渲染
+  const pending = data.pending_interrupt
+  if (pending?.kind === 'followup') {
+    questions.value = pending.questions || []
+  }
+  return true
+}
+
+// 清掉"这一轮/这个会话"的所有展示状态。切账号和开新会话都要用，
+// 漏一个字段就会出现"上一个孩子的方案卡还挂在下面"这种事。
+function resetTurnState() {
   messages.value = []
   status.value = ''
   questions.value = []
@@ -202,6 +351,31 @@ async function createConversation(reuseChild = false) {
   feedbackResult.value = null
   memories.value = []
   memoryPending.value = 0
+  progressSteps.value = []
+  lastRaw.value = null
+  input.value = ''
+  stepper.value?.reset?.()
+}
+
+// 开新会话：**永远复用当前孩子** —— 长期记忆挂在孩子上，
+// 换会话不换孩子才能看到上一轮记住的东西。
+async function createConversation() {
+  if (!childId.value) return
+  const data = await run(() =>
+    api.createConversation({
+      family_id: familyId.value || undefined,
+      child_id: childId.value,
+    }),
+  )
+  if (!data) return
+  conversationId.value = data.conversation_id
+  familyId.value = data.family_id
+  childId.value = data.child_id
+  localStorage.setItem(CONV_KEY, data.conversation_id)
+  localStorage.setItem(FAMILY_KEY, data.family_id)
+  localStorage.setItem(CHILD_KEY, data.child_id)
+  localStorage.setItem(CHILD_CONV_PREFIX + data.child_id, data.conversation_id)
+  resetTurnState()
   await refreshMemories()
 }
 
@@ -255,34 +429,8 @@ async function onMemoryDelete(item) {
   if (data) await refreshMemories()
 }
 
-// 收集每张卡引用到的证据 id。
-//
-// 卡组件用 defineExpose 把 citedIds 露出来 —— 它比父组件自己
-// 再算一遍靠谱：那边已经解析过引用和证据的对应关系了。
-const planRefs = new Map()
-
-function registerPlan(plan, el) {
-  if (!el) {
-    planRefs.delete(plan.plan_id)
-    return
-  }
-  planRefs.set(plan.plan_id, el)
-  syncCitedIds()
-}
-
-function syncCitedIds() {
-  const ids = new Set()
-  for (const el of planRefs.values()) {
-    for (const id of el?.citedIds || []) ids.add(id)
-  }
-  const next = [...ids]
-  // **必须比对再赋值**：每次都赋一个新数组的话，
-  // citedIds 变化 → 重渲染 → registerPlan → syncCitedIds → 又赋新数组
-  // → 无限递归。Vue 会报 "Maximum recursive updates exceeded"。
-  const prev = citedIds.value
-  if (prev.length === next.length && next.every((id, i) => prev[i] === id)) return
-  citedIds.value = next
-}
+// 建议卡的"依据"由卡片自己渲染（片段带编号，点编号展开），
+// 右侧不再单独列一份证据清单 —— 同一件事显示两遍，家长会不知道该看哪边。
 
 function applyTurn(data) {
   status.value = data.status
@@ -375,63 +523,35 @@ async function refresh() {
   memoryPending.value = data.memory_pending || 0
 }
 
-// 刷新页面后把上次那个会话接回来 ——
-// 光有 conversation_id 不够，还要把状态、消息、追问题重新填上。
+// 刷新页面后把上次那个会话接回来。
+// 不弹红条：恢复失败不是"操作出错"，只是没有可恢复的会话。
 async function restoreSession() {
   if (!conversationId.value) return
-  // 这里不用 run()：恢复失败不是"操作出错"，不该在页面上弹红条。
-  let data = null
-  try {
-    data = await api.getConversation(conversationId.value)
-  } catch {
-    data = null
-  }
-  if (!data) {
-    // 存的 id 后端认不出来（比如换了数据库、或者是从 mock 那边留下的）——
-    // 清掉它，不然这个页面会一直卡在"发送按钮是灰的"状态。
-    localStorage.removeItem(CONV_KEY)
-    conversationId.value = ''
-    status.value = ''
-    return
-  }
-  status.value = data.status
-  // 刷新页面后 family/child 也要接回来 —— 记忆面板靠它拉数据
-  familyId.value = data.family_id || familyId.value
-  childId.value = data.child_id || childId.value
-  if (familyId.value) localStorage.setItem(FAMILY_KEY, familyId.value)
-  if (childId.value) localStorage.setItem(CHILD_KEY, childId.value)
-  evidence.value = data.evidence || []
-  evidenceDecision.value = data.evidence_decision || {}
-  trialId.value = data.trial_id || ''
-  selectedPlanId.value = data.selected_plan_id || ''
-  if (data.plans?.length) plans.value = data.plans
-  memories.value = data.memories || []
-  memoryPending.value = data.memory_pending || 0
-  // 把历史对话显示出来，家长刷新一次还能看到自己说过什么
-  for (const it of data.interactions || []) {
-    push(it.role === 'user' ? 'user' : 'bot', it.content)
-  }
-  // 停在追问中断上时，题目要从 pending_interrupt 里取出来重新渲染
-  const pending = data.pending_interrupt
-  if (pending?.kind === 'followup') {
-    questions.value = pending.questions || []
-  }
+  const stored = conversationId.value
+  if (await hydrateConversation(stored)) return
+  // 存的 id 后端认不出来（清过库、换了数据库）——
+  // 连同 family/child 一起清掉，不然下拉里会挂着一个已经不存在的
+  // "当前孩子（不在列表中）"，点什么都报 404。
+  localStorage.removeItem(CONV_KEY)
+  localStorage.removeItem(FAMILY_KEY)
+  localStorage.removeItem(CHILD_KEY)
+  conversationId.value = ''
+  familyId.value = ''
+  childId.value = ''
+  status.value = ''
+  memories.value = []
+  memoryPending.value = 0
 }
 
-onMounted(() => {
+onMounted(async () => {
   checkHealth()
-  restoreSession()
+  await loadChildren()
+  await restoreSession()
+  // 没有可恢复的会话，但记住了孩子 —— 记忆面板也该显示这个孩子的数据
+  if (!conversationId.value && childId.value && familyId.value) {
+    await refreshMemories()
+  }
 })
-
-// 证据或方案卡变了，"哪些证据被引用了"要重新算一遍。
-//
-// **为什么要 watch**：卡组件的 citedIds 是从 props 算出来的，
-// 而证据面板的序号是按 evidence 数组的位置算的 ——
-// 证据晚到一步（先出卡后出证据）的话，卡里的"第 N 条"就指错了。
-// 所以两边都变了就得重算。
-watch([evidence, plans], () => {
-  nextTick(syncCitedIds)
-}, { deep: true })
 </script>
 
 <template>
@@ -471,31 +591,71 @@ watch([evidence, plans], () => {
             <span v-if="conversationId" class="badge small">{{ conversationId }}</span>
           </header>
 
-          <div class="row" style="margin-bottom:10px">
-            <div class="field" style="flex:1;margin:0">
-              <label>孩子称呼</label>
-              <input v-model="displayLabel" />
+          <div class="row" style="margin-bottom:6px">
+            <div class="field" style="flex:2;margin:0">
+              <label>测试账号（每个账号一套独立记忆）</label>
+              <select
+                :value="childId"
+                :disabled="busy || loadingChildren"
+                @change="switchChild($event.target.value)"
+              >
+                <option value="" disabled>
+                  {{ loadingChildren ? '加载中…' : '选择账号…' }}
+                </option>
+                <option v-for="c in accountOptions" :key="c.child_id" :value="c.child_id">
+                  {{ shortLabel(c.display_label) }}{{ c.age_display ? ` · ${c.age_display}` : '' }}
+                </option>
+              </select>
             </div>
-            <div class="field" style="flex:1;margin:0">
-              <label>年龄段</label>
-              <input v-model="ageBand" />
-            </div>
-            <button style="align-self:flex-end" @click="createConversation()" :disabled="busy">
-              新建会话
-            </button>
             <button
               style="align-self:flex-end"
               :disabled="busy || !childId"
-              :title="childId ? '同一个孩子开新会话，长期记忆会带过来' : '先建一个会话'"
-              @click="createConversation(true)"
+              :title="childId ? '同一个孩子开新会话，长期记忆会带过来' : '先新建或选择一个账号'"
+              @click="createConversation"
             >
-              同一孩子新会话
+              新会话
             </button>
+          </div>
+
+          <div class="row" style="margin-bottom:10px;align-items:flex-end">
+            <div class="field" style="flex:1;margin:0">
+              <label>姓名 / 孩子的描述</label>
+              <!--
+                用 textarea 而不是 input：这个字段实际是当"孩子的描述"用的，
+                有人会写一长串背景情况（诊断、语言状况、平时怎么沟通）。
+                **不限制长度** —— 后端这一列是 TEXT。
+              -->
+              <textarea
+                v-model="newName"
+                rows="2"
+                placeholder="写名字，或者一句话描述这个孩子的情况（不限制长度）"
+              ></textarea>
+            </div>
+            <div class="field" style="flex:0 0 170px;margin:0">
+              <label>出生年月</label>
+              <!--
+                自己画的年月日历：点开是年份 + 12 个月的格子。
+                不用原生 input[type=date] —— 出生日期只精确到月，
+                让家长去挑一个"具体哪天"是假精度。
+              -->
+              <MonthPicker v-model="newBirth" :max="today" placeholder="选择年月" />
+            </div>
+            <button
+              style="align-self:flex-end"
+              :disabled="!canCreateAccount"
+              :title="canCreateAccount ? '' : '姓名和出生年月都要填'"
+              @click="createAccount"
+            >
+              ＋ 新建账号
+            </button>
+          </div>
+          <div v-if="!canCreateAccount" class="small muted" style="margin:-4px 0 10px">
+            姓名和出生年月都要填才能新建账号。
           </div>
 
           <div class="msgs">
             <div v-if="!messages.length" class="small muted">
-              还没开始。先「新建会话」，再在下面说孩子的表现。
+              还没开始。先「新建账号」或从下拉选一个，再在下面说孩子的表现。
             </div>
             <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
               <div class="who">{{ m.role === 'user' ? '家长' : '教练' }} · {{ m.at }}</div>
@@ -560,13 +720,23 @@ watch([evidence, plans], () => {
             <h3>候选方案</h3>
             <span class="badge">{{ plans.length }} 张</span>
             <span v-if="selectedPlanId" class="badge accent">已选 {{ selectedPlanId }}</span>
+            <span
+              v-if="evidenceDecision.evidence_status"
+              class="badge"
+              :class="EVIDENCE_STATUS_TEXT[evidenceDecision.evidence_status]?.[1] || ''"
+            >
+              {{ EVIDENCE_STATUS_TEXT[evidenceDecision.evidence_status]?.[0] || evidenceDecision.evidence_status }}
+            </span>
           </header>
           <PlanCard v-for="p in plans" :key="p.plan_id" :plan="p"
-                    :ref="(el) => registerPlan(p, el)"
                     :evidence="evidence"
                     :selectable="awaitingPlanSelection"
                     :selected="p.plan_id === selectedPlanId"
                     @select="selectPlan" />
+          <!-- 证据缺口：家长该知道"哪一部分我们没找到依据" -->
+          <div v-if="evidenceGaps.length" class="small muted" style="margin-top:8px">
+            这次没找到依据的地方：{{ evidenceGaps.join('；') }}
+          </div>
         </div>
 
         <div v-if="awaitingPlanSelection" class="notice">
@@ -610,9 +780,6 @@ watch([evidence, plans], () => {
           @correct="onMemoryCorrect"
           @delete="onMemoryDelete"
         />
-
-        <EvidencePanel :evidence="evidence" :decision="evidenceDecision" :gaps="evidenceGaps"
-                       :cited-ids="citedIds" />
 
         <div class="card" v-if="lastRaw">
           <header>

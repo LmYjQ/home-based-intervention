@@ -18,7 +18,11 @@ from rdi_agent.config import get_settings
 from rdi_agent.llm import LLMError
 from rdi_agent.memory import service as memory_service
 from rdi_agent.memory.ids import normalize_content
-from rdi_agent.graph.citations import validate_set_citations
+from rdi_agent.graph.citations import (
+    build_evidence_catalogue,
+    translate_short_ids,
+    validate_cards,
+)
 from rdi_agent.graph.state import CoachState
 from rdi_agent.prompts import chat as P
 from rdi_agent.schemas.case import CaseSummary
@@ -44,7 +48,7 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 #
 # 信息不够也要出方案 —— 建议卡里有 uncertainty_notes，方案本身就会标出
 # 哪里不确定，这比多问一轮有用。
-MAX_FOLLOWUP_ROUNDS = 1
+MAX_FOLLOWUP_ROUNDS = 2
 
 
 def _bundle_of(state: CoachState) -> EvidenceBundle | None:
@@ -433,11 +437,15 @@ async def _generate_cards(
     validation_errors: dict[str, list[str]] | None,
 ) -> tuple[list[RecommendationCard], str, dict[str, list[str]], str]:
     """生成一轮建议卡并做引用校验。返回 (通过校验的卡, 过程说明, 有问题的卡)。"""
+    # 清单和编号映射必须出自**同一次**调用：编号指错了段落，
+    # 后面每一处引用都会指向错误的地方。
+    catalogue, id_map = build_evidence_catalogue(evidence)
     system, user = P.build_recommendation(
         case_summary=state.get("case_summary") or {},
         child_context=state.get("child_context"),
         n_plans=3,
         evidence=evidence,
+        evidence_catalogue=catalogue,
         validation_errors=validation_errors,
     )
     result, trace = await llm.chat_json(
@@ -456,8 +464,20 @@ async def _generate_cards(
         timeout_s=120.0,
     )
 
+    # 模型看到的是 E1/E2 这种短编号，这里换回真实的 evidence_id。
+    # 换完之后，卡上的 id 和证据包里的 id 是同一套，校验器只认真实 id。
+    translate_short_ids(result.plans, id_map)
+
     bundle = _bundle_of(state)
-    problems = validate_set_citations(result.plans, bundle) if bundle else {}
+    if bundle is None:
+        # 没有证据包也要校验：模型凭空引一个 id 出来，同样得拦住
+        bundle = EvidenceBundle(
+            original_question="",
+            case_summary=state.get("case_summary") or {},
+            evidence=[],
+            retrieval_version="none",
+        )
+    problems = validate_cards(result.plans, bundle)
     good = [c for c in result.plans if c.plan_id not in problems]
 
     # 恰好一张 recommended 被丢掉了的话，补一张上去 ——

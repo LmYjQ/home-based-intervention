@@ -204,10 +204,14 @@ def generate_followup(
 # 不是 knowledge_sources.source_id（the_rdi_book_2009）。
 # 计划 §9.3 的验收是"citation.source_id 是否存在"——
 # 放来源 id 的话，校验器没法判断"页码对不对得上"，整张卡会被判成编造引用。
+#
+# **但给模型看的是短编号（E1、E2）**：UUID 36 个字符，抄错一位
+# 在下游就变成"引用了一段不存在的内容" —— 整张卡被丢。
+# 短编号由代码翻译回真实 id（``graph/citations.py::translate_short_ids``）。
 _CITATION_CONTRACT = """
 source_citations 的写法（**必须严格照做**）：
-- source_id 只能填下面 "可引用的证据" 清单里的 evidence_id 字段值，
-  一个字符都不能改，也不能填指南名、章节名或自己编的 id。
+- source_id 只能填下面 "可引用的证据" 清单里的**编号**（E1、E2…），
+  不能填指南名、章节名，也不能自己编编号。
   **填错就是编造引用，整张卡会被丢掉。**
 - pdf_page_start / pdf_page_end 必须和这条证据的页码完全一致。
 - chapter 填这条证据的章节名。
@@ -245,26 +249,43 @@ def build_recommendation(
     child_context: dict[str, Any],
     n_plans: int,
     evidence: list[dict[str, Any]] | None = None,
+    evidence_catalogue: str | None = None,
     validation_errors: dict[str, list[str]] | None = None,
 ) -> tuple[str, str]:
     """生成建议卡。返回 (system, user)。
 
     ``evidence`` 是证据包里的证据（可引用清单）。
+    ``evidence_catalogue`` 是给模型看的**带编号**的清单（E1、E2…）——
+    由 ``graph/citations.py::build_evidence_catalogue`` 生成，
+    清单和编号映射必须出自同一次调用，否则编号会指错段落。
     ``validation_errors`` 是上一轮生成的引用校验错误 —— 传进来就会在
     prompt 里点名，模型重试时照着改。
     """
     evidence = evidence or []
     has_evidence = bool(evidence)
+    catalogue = evidence_catalogue if evidence_catalogue is not None else _evidence_lines(evidence)
     if has_evidence:
         evidence_rules = (
             """
-这次有可引用的指南内容。每条专业主张都要挂一个 evidence_id：
+这次有可引用的指南内容。每条专业主张都要挂一个证据编号：
 - 依据"可引用的证据"清单里的内容来写，不要写清单之外的指南观点。
 - **证据不足的部分不要补写指南观点**。清单里没有的，就说"这一点我不确定"，
   写进 uncertainty_notes。
 - application_label：这张卡的主要依据来自指南原文，填 "source_summary"；
   如果主要依据是你基于指南说法做的应用转化，填 "ai_adaptation"。
   两种都要在卡里说清楚哪些是"指南里说的"、哪些是"我们建议的"。
+
+**片段要拆开**（这一版新增）：
+- explanation_parts：说明拆成 1–4 段，每段 1–2 句。
+  每段带自己的 evidence_ids，填清单里的编号（E1、E2…）。
+  **一段里只讲一件事**：要么是"指南里说的"（挂编号），
+  要么是"我们根据指南做的应用转化"（evidence_ids 留空数组）。
+  把两种混在一段里，就说不清这段到底依据哪一条了。
+- 段落里提到了指南的术语（"消退""前因干预""正强化"这类），
+  就**必须**挂上真的包含这个术语的那条证据的编号。
+  挂错证据和编造一样会被判失败。
+- parent_actions 里每个动作也带 evidence_ids：这个动作依据哪几条。
+  纯执行细节（"提前十分钟出门"）可以不挂，留空数组。
 """
             + _CITATION_CONTRACT
         )
@@ -272,6 +293,7 @@ def build_recommendation(
         evidence_rules = """
 这次知识库里**没有**可引用的证据：
 - source_citations 必须是空数组。
+- explanation_parts 里每一段的 evidence_ids 都必须是空数组。
 - application_label 只能填 "ai_adaptation"。
 - 不许写任何"指南说""指南提到"的内容 —— 手上没有依据就不能说有。
 """
@@ -286,7 +308,8 @@ def build_recommendation(
 上一次生成的引用**没有通过校验**，请照着下面的问题改：
 {detail}
 
-再生成一遍时：source_id 只能填清单里的 evidence_id，页码必须和清单一致。
+再生成一遍时：source_id 和 evidence_ids 只能填清单里的编号（E1、E2…），
+页码必须和清单一致。
 如果某张卡实在找不到能支撑它的证据，就不要给它写引用。
 """
 
@@ -301,9 +324,11 @@ def build_recommendation(
 - title：一句话说清这张卡想改变什么（例如"先把出门这件事变短"）。
 - observed_facts：这张卡依据的事实，只用 case_summary 里有的。
 - tentative_interpretations：对事实的可能解释，必须写成"可能"。
-- explanation：家长能看懂的道理，2–4 句。
+- explanation_parts：说明拆成 1–4 段，每段 1–2 句，家长能看懂的道理。
+  每段带自己的 evidence_ids（清单里的编号；没有依据的段落留空数组）。
 - parent_actions：1–3 个具体动作。每个动作写清楚在什么情境下做、
   家长说什么做什么、做完观察什么、什么情况下减量或停。
+  每个动作带自己的 evidence_ids。
 - success_indicators：可观察的变化，不是"孩子变自信了"这种没法看的。
 - stop_conditions：出现什么就减量或停。
 - uncertainty_notes：这条建议的不确定之处，必填。
@@ -332,7 +357,7 @@ plan_id 用 plan_1 / plan_2 / plan_3 这种短 id，不要用随机数。
         {
             "case_summary": case_summary,
             "child_context": child_context or {},
-            "可引用的证据": _evidence_lines(evidence),
+            "可引用的证据": catalogue,
         },
         ensure_ascii=False,
         indent=2,

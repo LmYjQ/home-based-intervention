@@ -20,6 +20,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from rdi_agent.age import describe_age
 from rdi_agent.db.models import (
     Child,
     Hypothesis,
@@ -619,11 +620,14 @@ async def list_memories(
     for item in items:
         counts[item["kind"]] = counts.get(item["kind"], 0) + 1
 
+    age = describe_age(child.birth_date)
     return {
         "child_id": child_id,
         "family_id": str(child.family_id),
         "display_label": child.display_label,
-        "age_band": child.age_band,
+        "birth_date": age.get("birth_date"),
+        "age_display": age.get("age_display"),
+        "age_band": age.get("age_band") or child.age_band,
         "memories": items[:limit],
         "counts": counts,
         "pending_confirmation": sum(

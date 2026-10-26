@@ -1,22 +1,25 @@
 <script setup>
 // 一张建议卡。
 //
-// 刻意把 application_label 显示出来：这一版的验收重点之一就是
-// "引用校验有没有真的生效" —— 标了 source_summary 却拿不出对应证据的卡
-// 应该被丢掉，这里能一眼看出来。
+// 这一版把**引用下沉到片段**：
+// 说明被拆成 explanation_parts，每段带自己的 evidence_ids，
+// 段后面挂一个编号（[1]、[2]…），编号对应卡下方"依据"里的那一条。
+// 家长点编号就能看到"这一句的依据是指南第几页的那一段"。
 //
-// **标签显示中文**：`source_summary` / `ai_adaptation` 是内部契约值，
-// 直接显示给家长看是英文的机器名。家长需要看懂的是
-// "这条是指南里说的" 还是 "这是我们根据指南做的应用转化" ——
-// 这两件事必须让家长分得清，所以显示中文。
-import { computed } from 'vue'
+// **依据默认折叠**：家长先要读的是建议本身，依据是"想核对时再看"的东西。
+// 折叠起来卡片才不会被一屏引用淹掉。
+//
+// **为什么是点开而不是 hover**：hover 隐藏内容在触屏上根本点不到，
+// 而且"鼠标移到哪"是不可发现的 —— 用户不会知道那里有东西。
+// 显式的开关（带条数）才既可发现又可控。
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   plan: { type: Object, required: true },
   selectable: { type: Boolean, default: false },
   selected: { type: Boolean, default: false },
-  // 本轮的证据清单。用来把卡上的引用和右侧证据面板**对上** ——
-  // 引用里的 source_id 就是证据的 evidence_id。
+  // 本轮的证据清单。用来把片段上的 evidence_ids 和指南段落对上 ——
+  // 片段里存的是 id，章节和页码在证据那边。
   evidence: { type: Array, default: () => [] },
 })
 defineEmits(['select'])
@@ -32,40 +35,72 @@ const labelText = computed(
 )
 
 // 证据按 evidence_id 建索引。
-//
-// **为什么要这个**：引用里的 ``source_id`` 填的就是证据的 ``evidence_id``
-// （约定见 ``rdi_agent/prompts/chat.py`` 的 _CITATION_CONTRACT）。
-// 卡上写的是"这是哪一段"，证据面板写的是"这段的章节、页码、大意"，
-// 两边说的其实是同一段东西 —— 但分开看就是两堆对不上的文字。
-// 在这里 join 一次，家长才能看见"这条建议引的是右侧第 3 条"。
 const evidenceIndex = computed(() => {
   const map = new Map()
-  const list = props.evidence || []
-  list.forEach((e, i) => {
-    if (e?.evidence_id) map.set(e.evidence_id, { item: e, row: i + 1 })
-  })
+  for (const e of props.evidence || []) {
+    if (e?.evidence_id) map.set(e.evidence_id, e)
+  }
   return map
 })
 
-// 每条引用解析成"引用 + 它对应的那条证据（可能没有）"。
-function resolveCitation(citation) {
-  const found = evidenceIndex.value.get(citation.source_id)
-  return {
-    citation,
-    item: found?.item || null,
-    // 右侧证据面板里的第几条（1 起）。家长照着这个号就能在右边找到它。
-    row: found?.row || null,
+// 说明的片段。老卡（数据库里已经落库的那些）只有一整段 explanation，
+// 这里兜住，别让老数据显示成空白。
+const parts = computed(() => {
+  const list = props.plan.explanation_parts || []
+  if (list.length) return list
+  if (props.plan.explanation) return [{ text: props.plan.explanation, evidence_ids: [] }]
+  return []
+})
+
+// 编号表：按"说明段 → 动作 → 卡级引用"的顺序给证据编号。
+//
+// **顺序必须和后端一致**（graph/nodes/retrieval_nodes.py::_render_cards）：
+// 教练回复那段文字里的 [1] 就是这里的 [1]。两边顺序不一样，
+// 家长对着文字和卡片会看到两个不同的编号。
+const numbered = computed(() => {
+  const order = []
+  const push = (id) => {
+    if (id && !order.includes(id)) order.push(id)
   }
+  for (const p of parts.value) for (const id of p.evidence_ids || []) push(id)
+  for (const a of props.plan.parent_actions || []) for (const id of a.evidence_ids || []) push(id)
+  for (const c of props.plan.source_citations || []) push(c.source_id)
+  return order.map((id, i) => ({
+    no: i + 1,
+    id,
+    item: evidenceIndex.value.get(id) || null,
+  }))
+})
+
+const numberOf = (id) => numbered.value.find((n) => n.id === id)?.no || null
+
+// ---- 依据区块的展开/收起 ----
+const showEvidence = ref(false)
+// 点某个编号时展开并滚到那一条
+const activeNo = ref(null)
+const evidenceRefs = ref({})
+
+function toggleEvidence() {
+  showEvidence.value = !showEvidence.value
+  if (!showEvidence.value) activeNo.value = null
 }
 
-const resolvedCitations = computed(
-  () => (props.plan.source_citations || []).map(resolveCitation),
-)
+function jumpTo(no) {
+  showEvidence.value = true
+  activeNo.value = no
+  // 等 DOM 出来再滚
+  setTimeout(() => {
+    evidenceRefs.value[no]?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, 0)
+}
 
-// 这张卡引用到的证据 id —— 右侧证据面板靠它标出"哪几条真被用了"。
-const citedIds = computed(() =>
-  resolvedCitations.value.map((r) => r.citation.source_id).filter(Boolean),
-)
+function setEvidenceRef(no, el) {
+  if (el) evidenceRefs.value[no] = el
+  else delete evidenceRefs.value[no]
+}
+
+// 这张卡引用到的证据 id（调试用）
+const citedIds = computed(() => numbered.value.map((n) => n.id))
 
 defineExpose({ citedIds })
 </script>
@@ -93,16 +128,39 @@ defineExpose({ citedIds })
       <ul><li v-for="(f, i) in plan.tentative_interpretations" :key="i">{{ f }}</li></ul>
     </section>
 
-    <section v-if="plan.explanation">
+    <section v-if="parts.length">
       <h4>说明</h4>
-      <div>{{ plan.explanation }}</div>
+      <!--
+        每段自己带依据。编号是可点的 —— 点一下就展开下方"依据"里对应的那一条。
+        没有依据的段落（应用转化）不显示编号，这样家长一眼能看出
+        哪句话是指南说的、哪句话是我们建议的。
+      -->
+      <p v-for="(p, i) in parts" :key="i" class="part">
+        {{ p.text
+        }}<button
+          v-for="(id, j) in (p.evidence_ids || []).filter((x) => numberOf(x) !== null)"
+          :key="j"
+          class="marker"
+          :title="`看这条的依据（${numberOf(id)}）`"
+          @click="jumpTo(numberOf(id))"
+        >{{ numberOf(id) }}</button>
+      </p>
     </section>
 
     <section v-if="plan.parent_actions?.length">
       <h4>家长可以做的事</h4>
       <div v-for="(a, i) in plan.parent_actions" :key="i" class="action">
-        <div>{{ a.action }}</div>
-        <div v-if="a.context" class="small muted">情境：{{ a.context }}</div>
+        <div>
+          {{ a.action
+          }}<button
+            v-for="(id, j) in (a.evidence_ids || []).filter((x) => numberOf(x) !== null)"
+            :key="j"
+            class="marker"
+            :title="`看这条的依据（${numberOf(id)}）`"
+            @click="jumpTo(numberOf(id))"
+          >{{ numberOf(id) }}</button>
+          <span v-if="a.context" class="small muted">情境：{{ a.context }}</span>
+        </div>
         <ul v-if="a.steps?.length"><li v-for="(s, j) in a.steps" :key="j">{{ s }}</li></ul>
         <ul v-if="a.observe?.length">
           <li v-for="(s, j) in a.observe" :key="j">观察：{{ s }}</li>
@@ -123,41 +181,47 @@ defineExpose({ citedIds })
       <ul><li v-for="(f, i) in plan.stop_conditions" :key="i">{{ f }}</li></ul>
     </section>
 
+    <!-- 依据：默认折叠，点开才展开 -->
     <section>
-      <h4>引用（source_citations）</h4>
-      <div v-if="!resolvedCitations.length" class="small muted">
-        （空）—— 这张卡没有直接引用指南原文。
-      </div>
-      <div v-for="({ citation: c, item, row }, i) in resolvedCitations" :key="i" class="small cite">
-        <!--
-          引用上写的是"哪一段"，页码和章节从**证据**那边取，不从引用上取。
-          模型填的页码经常是空的（见下面的"没对上"分支），
-          用证据里的页码才准 —— 证据才是从库里读出来的那一份。
-        -->
-        <div>
-          <template v-if="item">
-            《{{ item.section_title || item.title }}》
-            <span v-if="item.pdf_page_start != null">
-              · PDF 第 {{ item.pdf_page_start }}–{{ item.pdf_page_end }} 页
-            </span>
-          </template>
-          <template v-else>
-            {{ c.title }}
-            <span v-if="c.chapter"> · {{ c.chapter }}</span>
-            <span v-if="c.pdf_page_start != null">
-              · PDF 第 {{ c.pdf_page_start }}–{{ c.pdf_page_end }} 页
-            </span>
-          </template>
+      <button class="toggle" @click="toggleEvidence">
+        <span class="caret">{{ showEvidence ? '▾' : '▸' }}</span>
+        这次的依据（{{ numbered.length }} 条{{ showEvidence ? '' : '，点开看章节和页码' }}）
+      </button>
+
+      <div v-if="showEvidence" class="evidence-box">
+        <div v-if="!numbered.length" class="small muted">
+          （空）—— 这张卡没有直接引用指南原文，是根据你描述的情况给出的。
         </div>
-        <div class="muted">
-          {{ c.source_type === 'guideline' ? '指南' : c.source_type }}
-          <span v-if="row">· 见右侧证据第 {{ row }} 条</span>
+        <div
+          v-for="n in numbered"
+          :key="n.no"
+          :ref="(el) => setEvidenceRef(n.no, el)"
+          class="small cite"
+          :class="{ active: activeNo === n.no }"
+        >
+          <div>
+            <span class="cite-no">{{ n.no }}</span>
+            <template v-if="n.item">
+              《{{ n.item.section_title || n.item.title }}》
+              <span v-if="n.item.pdf_page_start != null">
+                · PDF 第 {{ n.item.pdf_page_start }}–{{ n.item.pdf_page_end }} 页
+              </span>
+            </template>
+            <template v-else>
+              <span class="warn-text">⚠ 没在本次证据里找到这一条</span>
+              <code>{{ n.id }}</code>
+            </template>
+          </div>
+          <div v-if="n.item" class="muted">这段的大意：{{ n.item.summary }}</div>
+          <!-- 卡级引用里的"支撑了哪句话"也要能看到 -->
+          <div
+            v-for="(c, i) in (plan.source_citations || []).filter((x) => x.source_id === n.id)"
+            :key="i"
+            class="muted"
+          >
+            支撑：{{ c.claim_supported }}
+          </div>
         </div>
-        <div v-if="item" class="muted">这段的大意：{{ item.summary }}</div>
-        <div v-else class="muted warn-text">
-          ⚠ 没在本次证据里找到这一条（source_id: <code>{{ c.source_id }}</code>）
-        </div>
-        <div>支撑：{{ c.claim_supported }}</div>
       </div>
     </section>
 
@@ -176,8 +240,60 @@ defineExpose({ citedIds })
 
 <style scoped>
 .action { margin-bottom: 8px; }
+.part { margin: 4px 0; }
 .cite { border-left: 2px solid var(--line); padding-left: 9px; margin-bottom: 7px; }
 code { font-size: 11px; color: var(--fg-dim); }
 /* 引用没对上证据 —— 这是要立刻看见的问题，不该灰着过去 */
 .warn-text { color: #fde68a; }
+
+/* 片段里的编号角标：像脚注一样，但可点 */
+.marker {
+  display: inline-block;
+  min-width: 16px;
+  height: 16px;
+  margin: 0 1px 0 3px;
+  padding: 0 4px;
+  border: 1px solid var(--accent, #7dd3fc);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--accent, #7dd3fc);
+  font-size: 11px;
+  line-height: 14px;
+  vertical-align: super;
+  cursor: pointer;
+}
+.marker:hover { background: rgba(125, 211, 252, 0.15); }
+
+/* 依据区块的开关 */
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.toggle:hover { color: var(--fg); }
+.caret { font-size: 10px; }
+.evidence-box {
+  border-left: 2px solid var(--line);
+  padding-left: 9px;
+  margin-bottom: 8px;
+}
+.cite.active {
+  border-left-color: var(--accent, #7dd3fc);
+  background: rgba(125, 211, 252, 0.06);
+}
+.cite-no {
+  display: inline-block;
+  min-width: 16px;
+  margin-right: 4px;
+  color: var(--accent, #7dd3fc);
+  font-weight: 600;
+}
 </style>

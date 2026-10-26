@@ -39,6 +39,15 @@ async function request(path, { method = 'GET', body } = {}) {
 export const api = {
   health: () => request('/health'),
 
+  // ---- 测试账号（手动测试台用）----
+  listChildren: (params = {}) => {
+    const query = new URLSearchParams(params).toString()
+    return request(`/api/children${query ? `?${query}` : ''}`)
+  },
+
+  createChild: (payload = {}) =>
+    request('/api/children', { method: 'POST', body: payload }),
+
   createConversation: (payload) =>
     request('/api/conversations', { method: 'POST', body: payload }),
 

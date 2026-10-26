@@ -34,12 +34,27 @@
 "前因干预"）和英文词。这些词不会凭空出现。
 
 **纯泛泛的中文主张不做校验**：查不了就不假装能查。
+
+---
+
+**片段级引用**（``explanation_parts``）：
+
+卡级引用只能回答"这张卡依据了哪几条"，回答不了"**这句话**依据的是哪一条"。
+所以说明被拆成片段，每段带自己的 ``evidence_ids``。这一层校验：
+
+1. 片段引用的 ``evidence_id`` 必须在本次证据包里
+2. 片段里的**指南术语**必须出现在它引用的那些证据里
+3. 标成 ``source_summary`` 的卡，带术语的片段必须挂证据
+
+**给模型看的编号是 E1/E2**，不是 UUID —— UUID 有 36 个字符，
+模型抄错一位就变成"编造引用"，整张卡被丢。短编号由代码映射回真实 id。
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 
 from rdi_agent.rag.ingest.clean import GUIDELINE_TERMS
 from rdi_agent.schemas.evidence import EvidenceBundle, EvidenceItem
@@ -253,3 +268,201 @@ def validate_set_citations(
         if errors:
             problems[card.plan_id] = errors
     return problems
+
+
+# --------------------------------------------------------------- 片段级
+def validate_card_fragments(
+    card: RecommendationCard,
+    bundle: EvidenceBundle,
+) -> list[str]:
+    """片段级引用校验。返回错误列表，空列表 = 通过。
+
+    校验三件事：
+
+    1. 片段引用的 ``evidence_id`` 必须在本次证据包里
+    2. 片段里的**指南术语**必须出现在它引用的那些证据里
+       （术语在别的证据里有不算 —— 挂错证据和编造一样是错的）
+    3. 标成 ``source_summary`` 的卡，带术语的片段必须挂证据
+       （"这段是指南里的"却没指出是哪一段 —— 家长核不了）
+    """
+    errors: list[str] = []
+    index = {e.evidence_id: e for e in bundle.evidence}
+    # source_summary 的卡才要求"带术语就得挂证据"：
+    # ai_adaptation 的卡本来就是在讲"我们怎么用"，术语出现是正常的。
+    require_binding = card.application_label == "source_summary"
+
+    for i, part in enumerate(card.explanation_parts, start=1):
+        errors += _check_fragment(
+            part.text,
+            part.evidence_ids,
+            index,
+            where=f"说明第 {i} 段",
+            require_binding=require_binding,
+        )
+
+    for i, action in enumerate(card.parent_actions, start=1):
+        text = " ".join(
+            [
+                action.action,
+                action.context,
+                *action.steps,
+                *action.observe,
+                *action.reduce_or_stop_if,
+            ]
+        )
+        errors += _check_fragment(
+            text,
+            action.evidence_ids,
+            index,
+            where=f"动作 {i}（{action.action}）",
+            require_binding=require_binding,
+        )
+    return errors
+
+
+def _check_fragment(
+    text: str,
+    evidence_ids: list[str],
+    index: dict[str, EvidenceItem],
+    *,
+    where: str,
+    require_binding: bool,
+) -> list[str]:
+    """一个片段的校验。"""
+    errors: list[str] = []
+    cited: list[EvidenceItem] = []
+    for eid in evidence_ids:
+        item = index.get(eid)
+        if item is None:
+            errors.append(
+                f"{where}：引用的证据 {eid} 不在本次证据包里"
+                "（只能填证据清单里的编号）"
+            )
+        else:
+            cited.append(item)
+
+    terms = _chinese_terms(text) | _english_terms(text)
+    if not terms:
+        # 这段话里没有可核对的专有词 —— 查不了就不假装能查
+        return errors
+
+    if not cited:
+        if require_binding:
+            errors.append(
+                f"{where}：提到了指南术语 {'、'.join(sorted(terms))}，"
+                "却没有挂任何证据 —— 这张卡标的是 source_summary，"
+                "每一句专业主张都要指出依据"
+            )
+        return errors
+
+    haystack = " ".join(_evidence_text(item) for item in cited).lower()
+    missing = sorted(t for t in terms if t not in haystack)
+    if missing:
+        errors.append(
+            f"{where}：术语 {'、'.join(missing)} 不在它引用的证据里，"
+            "要么挂错了证据，要么这段话是编的"
+        )
+    return errors
+
+
+def validate_cards(
+    cards: list[RecommendationCard],
+    bundle: EvidenceBundle,
+) -> dict[str, list[str]]:
+    """卡级 + 片段级一起校验。返回 {plan_id: 错误列表}。"""
+    problems: dict[str, list[str]] = {}
+    for card in cards:
+        errors = validate_card_citations(card, bundle)
+        errors += validate_card_fragments(card, bundle)
+        if errors:
+            problems[card.plan_id] = errors
+    return problems
+
+
+# --------------------------------------------------------------- 短编号
+# 模型看到的编号：E1、E2……
+#
+# **为什么不用 UUID**：evidence_id 是 chunk 的 UUID，36 个字符，
+# 模型抄错一位在下游看起来就是"引用了一段不存在的内容" —— 整张卡被丢。
+# 短编号短得多，而且映射由代码维护：编号写错最多是"引用不到"，
+# 不会变成伪造的出处。
+_SHORT_ID = re.compile(r"^E\d+$", re.IGNORECASE)
+
+
+def build_evidence_catalogue(
+    evidence: list[dict[str, Any]],
+) -> tuple[str, dict[str, str]]:
+    """把证据包渲染成"可引用的证据"清单 + 短编号映射。
+
+    返回 ``(清单文本, {"E1": evidence_id, ...})``。
+
+    清单和映射必须**一次生成**：编号和真实 id 的对应关系一旦错位，
+    模型引用的每一句都会指向错误的段落。
+    """
+    mapping: dict[str, str] = {}
+    lines: list[str] = []
+    for index, item in enumerate(evidence, start=1):
+        evidence_id = str(item.get("evidence_id") or "")
+        if not evidence_id:
+            continue
+        short = f"E{len(mapping) + 1}"
+        mapping[short] = evidence_id
+        pages = ""
+        if item.get("pdf_page_start") is not None:
+            pages = f"，PDF 第 {item['pdf_page_start']}-{item['pdf_page_end']} 页"
+        lines.append(
+            f"- {short}｜《{item.get('section_title') or item.get('title') or '-'}》{pages}\n"
+            f"  摘要：{item.get('summary') or '-'}\n"
+            f"  来源标签：{item.get('source_type')}"
+            f"　审核状态：{item.get('review_status')}"
+        )
+    if not lines:
+        return "（这次没有检索到可引用的证据）", mapping
+    return "\n".join(lines), mapping
+
+
+def _resolve_short_id(value: str, mapping: dict[str, str]) -> str:
+    """把一个引用值翻译成真实的 evidence_id。
+
+    已经是真实 id 的原样返回 —— 模型偶尔会直接填 UUID（清单里也看得到），
+    那种情况不该被判成"引用不到"。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return text
+    hit = mapping.get(text.upper())
+    if hit:
+        return hit
+    if _SHORT_ID.match(text):
+        # 编号但映射里没有 —— 原样留着，让校验器报错
+        return text
+    return text
+
+
+def translate_short_ids(
+    cards: list[RecommendationCard],
+    mapping: dict[str, str],
+) -> int:
+    """把卡里的短编号（E1/E2）换成真实的 evidence_id。返回替换次数。
+
+    翻译之后，卡上的 id 就和 ``EvidenceBundle`` 里的 id 是同一套，
+    后面所有校验都只认真实 id。
+    """
+    if not mapping:
+        return 0
+    count = 0
+    for card in cards:
+        for citation in card.source_citations:
+            new = _resolve_short_id(citation.source_id, mapping)
+            if new != citation.source_id:
+                citation.source_id = new
+                count += 1
+        for part in card.explanation_parts:
+            resolved = [_resolve_short_id(x, mapping) for x in part.evidence_ids]
+            count += sum(1 for a, b in zip(part.evidence_ids, resolved) if a != b)
+            part.evidence_ids = resolved
+        for action in card.parent_actions:
+            resolved = [_resolve_short_id(x, mapping) for x in action.evidence_ids]
+            count += sum(1 for a, b in zip(action.evidence_ids, resolved) if a != b)
+            action.evidence_ids = resolved
+    return count
