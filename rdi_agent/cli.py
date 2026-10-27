@@ -23,7 +23,7 @@ from rdi_agent.graph.runtime import setup_graph, shutdown_graph
 
 # 固定演示输入：开场白 + 追问的回答。
 #
-# 备了几条回答，具体用几条看 ``MAX_FOLLOWUP_ROUNDS``：
+# 备了几条回答，具体用几条看 ``Settings.followup_max_rounds``：
 # 图一进方案选择，循环就 break，多出来的回答不会被用到。
 #
 # 第一条回答把 check_sufficiency 关心的四件事一次补齐：

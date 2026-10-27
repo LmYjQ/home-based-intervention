@@ -51,10 +51,22 @@ from rdi_agent.schemas.feedback import FeedbackAnalysis, FeedbackSubmission
 
 # 反馈不足时最多追问几轮。
 #
-# **只追问一轮**：和聊天入口一致（MAX_FOLLOWUP_ROUNDS = 1）。
+# **默认只追问一轮**：和聊天入口一致（都是 1）。
 # 一轮 = 最多 3 个问题，答完就必须给下一步。追问环回到 ``analyze_feedback``，
 # 没有上限会一直问下去；有上限也会让家长觉得在填表。
+#
+# **和聊天入口分开配**（2026-10-27）：这是**选了方案卡、录完反馈之后**的追问，
+# 和"新会话开始时的追问"是两条独立的链，家长在这两个场景的耐心不一样。
+# 见 ``Settings.feedback_followup_max_rounds``。
 MAX_FEEDBACK_FOLLOWUP_ROUNDS = 1
+
+
+def max_feedback_followup_rounds() -> int:
+    """反馈追问的上限（可配）。默认 1（``Settings.feedback_followup_max_rounds``）。
+
+    下限夹在 0：配成 0 = 反馈没说清就直接给下一步，不追问。
+    """
+    return max(0, get_settings().feedback_followup_max_rounds)
 
 
 def _feedback_text(feedback: dict[str, Any]) -> str:
@@ -363,6 +375,7 @@ async def next_step(state: CoachState) -> dict[str, Any]:
         history=state.get("feedback_history") or [],
         child_context=state.get("child_context") or {},
         followup_rounds=rounds,
+        max_followup_rounds=max_feedback_followup_rounds(),
     )
     result, trace = await llm.chat_json(
         system=system,
@@ -392,7 +405,7 @@ def route_after_next_step(state: CoachState) -> str:
     """
     decision = (state.get("next_step") or {}).get("decision") or "continue"
     rounds = int(state.get("feedback_followup_rounds") or 0)
-    if decision == "followup" and rounds < MAX_FEEDBACK_FOLLOWUP_ROUNDS:
+    if decision == "followup" and rounds < max_feedback_followup_rounds():
         return "followup"
     if decision == "adjust":
         return "retrieve"

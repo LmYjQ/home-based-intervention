@@ -12,6 +12,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { api, streamMessage } from './api.js'
 import PlanCard from './components/PlanCard.vue'
 import FeedbackForm from './components/FeedbackForm.vue'
+import FollowupStepper from './components/FollowupStepper.vue'
 import MemoryPanel from './components/MemoryPanel.vue'
 import MonthPicker from './components/MonthPicker.vue'
 import DebugPanel from './components/DebugPanel.vue'
@@ -83,6 +84,8 @@ const input = ref('')
 const busy = ref(false)
 const error = ref('')
 const lastRaw = ref(null)
+// 追问作答组件的实例 —— 新一轮追问来时要重置它的内部状态
+const stepper = ref(null)
 
 // 进度（方案 A：流式推进度，不流半截答案）
 //
@@ -102,12 +105,6 @@ const feedbackFollowup = computed(
 )
 const feedbackQuestions = computed(() =>
   feedbackFollowup.value ? feedbackResult.value?.questions || [] : [],
-)
-// **一个对话框**（2026-10-27）：家长说话、答追问、答反馈追问，
-// 都在下面那一个输入框里 —— 不再另起一个"逐题作答"的界面。
-const answering = computed(() => awaitingFollowup.value || feedbackFollowup.value)
-const inputLabel = computed(() =>
-  answering.value ? '回答上面的问题' : '描述孩子的情况',
 )
 const needsFeedback = computed(
   () => Boolean(trialId.value) && !feedbackResult.value,
@@ -313,23 +310,6 @@ const EVIDENCE_STATUS_TEXT = {
 // ---- 动作 ----
 function push(role, text, meta = {}) {
   messages.value.push({ role, text, at: new Date().toLocaleTimeString(), ...meta })
-}
-
-// 把一轮追问的问题推进对话流。
-//
-// **为什么进对话流而不是另开一个"逐题作答"的界面**：
-// 页面上只留一个输入框 —— 家长面对"我该在哪儿说话"只有一个答案。
-// 有选项的问题把选项也写出来，家长照着写就行。
-function pushQuestions(list) {
-  for (const q of list || []) {
-    const text = String(q?.question || '').trim()
-    if (!text) continue
-    // 已经显示过就不重复推 —— 刷新页面后题目是从历史消息里读回来的。
-    const last = messages.value[messages.value.length - 1]
-    if (last && last.role === 'bot' && last.text.includes(text)) continue
-    const options = (q?.options || []).join(' / ')
-    push('bot', options ? `${text}\n（可选：${options}）` : text)
-  }
 }
 
 async function checkHealth() {
@@ -543,12 +523,8 @@ async function hydrateConversation(targetId) {
   const pending = data.pending_interrupt
   if (pending?.kind === 'followup') {
     questions.value = pending.questions || []
-    // 题目推进对话流 —— 家长刷新完还是在同一个框里回答。
-    pushQuestions(questions.value)
   }
   await restoreFeedback()
-  // 反馈追问同理
-  if (feedbackFollowup.value) pushQuestions(feedbackQuestions.value)
   // 会话列表最后刷 —— child_id 这时才是准的
   await loadConversations()
   return true
@@ -579,6 +555,7 @@ function resetTurnState() {
   progressSteps.value = []
   lastRaw.value = null
   input.value = ''
+  stepper.value?.reset?.()
 }
 
 // 开新会话：**永远复用当前孩子** —— 长期记忆挂在孩子上，
@@ -659,9 +636,10 @@ function applyTurn(data) {
   if (data.plans?.length) plans.value = data.plans
 
   if (data.status === 'awaiting_followup') {
-    // 追问的问题**直接进对话流** —— 家长在同一个框里回答。
-    // （后端返回的 message 就是这几道题本身，别再推一遍，重复了看不清）
-    pushQuestions(questions.value)
+    // 消息区只留个引子 —— 具体题目由 FollowupStepper 渲染，
+    // 不然消息区会有一份、stepper 又有一份，重复得看不清。
+    push('bot', `（${questions.value.length} 个问题）`)
+    stepper.value?.reset()
   } else if (data.message) {
     push('bot', data.message)
   }
@@ -678,41 +656,27 @@ async function send(text) {
   input.value = ''
   push('user', msg)
 
-  // 追问和反馈追问都在**同一个框**里回答 —— 还是这个"发送"动作，
-  // 只是后端恢复的位置不一样。
-  if (feedbackFollowup.value) {
-    await answerFeedbackFollowup(msg)
-    return
-  }
-  if (awaitingFollowup.value) {
-    await answerFollowup(msg)
-    return
-  }
-
   const data = await runStreaming(() =>
     streamMessage(conversationId.value, { message: msg }, { onProgress }),
   )
   if (data) applyTurn(data)
 }
 
-// 把家长在框里写的一段话，变成后端要的 [{question, answer}, ...]。
+// 提交一轮追问的回答。
 //
-// **一道题时归到那道题** —— 后端靠问答对把答案确定性地并进事实，
-// 归不上的话模型看到的是"问了但没答"，还想再问一遍。
-// **多道题时归成"补充"**：家长是一段话回过来的，硬切分只会切错。
-function followupAnswers(list, msg) {
-  const qs = list || []
-  return qs.length === 1
-    ? [{ question: qs[0].question, answer: msg }]
-    : [{ question: '', answer: msg }]
-}
+// answers 是 [{question, answer}, ...] —— 每条带原问题，
+// 后端拼成给图看的文本时不会把多题串味。
+async function submitAnswers(answers) {
+  if (!answers?.length) return
+  const summary = answers
+    .map((a) => `${a.question}\n${a.answer}`)
+    .join('\n\n')
+  push('user', summary)
 
-async function answerFollowup(msg) {
-  const answers = followupAnswers(questions.value, msg)
   const data = await runStreaming(() =>
     streamMessage(
       conversationId.value,
-      { message: msg, answers },
+      { message: '', answers },
       { onProgress },
     ),
   )
@@ -752,9 +716,8 @@ function applyFeedbackResult(result) {
   }
   finalMessage.value = result.message || finalMessage.value
   if (result.status === 'awaiting_feedback_followup') {
-    // 反馈追问的问题也进对话流 —— 家长在同一个框里回答。
-    if (result.message) push('bot', result.message)
-    pushQuestions(result.questions || [])
+    // 题目由 FollowupStepper 渲染，消息区只留一句引子。
+    push('bot', `（反馈还缺 ${result.questions?.length || 0} 个信息）`)
   } else if (result.message) {
     push('bot', result.message)
   }
@@ -826,13 +789,13 @@ async function restoreFeedback() {
 
 // 回答反馈追问。turn_id 沿用第一次提交时的 —— 后端用它找到
 // 停在 interrupt 上的那条 checkpoint 线程。
-async function answerFeedbackFollowup(msg) {
-  if (!feedbackResult.value?.turn_id) return
-  const answers = followupAnswers(feedbackQuestions.value, msg)
+async function submitFeedbackAnswers(answers) {
+  if (!answers?.length || !feedbackResult.value?.turn_id) return
+  const summary = answers.map((a) => `${a.question}\n${a.answer}`).join('\n\n')
+  push('user', summary)
   const data = await run(() =>
     api.resumeFeedback(trialId.value, {
       turn_id: feedbackResult.value.turn_id,
-      message: msg,
       answers,
     }),
   )
@@ -1051,27 +1014,36 @@ onMounted(async () => {
             </div>
           </div>
 
+          <!-- 追问：逐题作答，左右切换，最后一次性提交 -->
+          <FollowupStepper
+            v-if="awaitingFollowup && questions.length"
+            ref="stepper"
+            :questions="questions"
+            :busy="busy"
+            @submit="submitAnswers"
+          />
+
           <!--
-            **一个对话框**（2026-10-27）：家长说话、答追问、答反馈追问，
-            都在这个框里。追问的问题已经进了上面的对话流。
+            追问期间**不显示这个输入框**：家长去卡片上答，
+            别处也能打字会让人以为答错了地方。
           -->
-          <div class="field">
-            <label>{{ inputLabel }}</label>
+          <div v-else-if="!feedbackFollowup" class="field">
+            <label>描述孩子的情况</label>
             <textarea v-model="input"
                       @keydown.enter.exact.prevent="send()"
                       placeholder="Enter 直接发送" />
           </div>
 
-          <div class="row">
+          <div v-if="!awaitingFollowup && !feedbackFollowup" class="row">
             <button class="primary"
                     :disabled="!canSend || !input.trim()"
                     @click="send()">
-              {{ busy ? '处理中…' : (answering ? '回答' : '发送') }}
+              {{ busy ? '处理中…' : '发送' }}
             </button>
             <span v-if="busy" class="small muted">图在跑，别重复点</span>
           </div>
 
-          <details v-if="!answering" style="margin-top:10px">
+          <details v-if="!awaitingFollowup && !feedbackFollowup" style="margin-top:10px">
             <summary>快捷填入演示答案（回车逐条提交）</summary>
             <button v-for="(a, i) in DEMO_ANSWERS" :key="i" class="small"
                     style="margin:2px 4px 2px 0"
@@ -1149,6 +1121,14 @@ onMounted(async () => {
         </div>
 
         <FeedbackForm v-if="needsFeedback" :trial-id="trialId" @done="submitFeedback" />
+
+        <!-- 反馈不足：图停在 feedback_followup 中断上 -->
+        <FollowupStepper
+          v-if="feedbackFollowup"
+          :questions="feedbackQuestions"
+          :busy="busy"
+          @submit="submitFeedbackAnswers"
+        />
 
         <div class="card" v-if="feedbackResult && !feedbackFollowup">
           <header>
@@ -1271,10 +1251,6 @@ onMounted(async () => {
           @delete="onMemoryDelete"
         />
 
-        <!--
-          调试用的东西**默认收起来**（2026-10-27）：
-          家长看的是对话，不是 trace。要对照验收点时再展开。
-        -->
         <DebugPanel :conversation-id="conversationId" />
 
         <details class="card" v-if="lastRaw">

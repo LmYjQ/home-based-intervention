@@ -98,6 +98,28 @@ class Settings(BaseSettings):
     # 版权上可以给家长看（may_quote_to_user 仍然恒为 False）。
     summary_zh_enabled: bool = False
 
+    # ---- 追问轮数上限（两处，分开配）----
+    #
+    # **两个地方是两条独立的追问链**：
+    #
+    # 1. ``followup_max_rounds`` —— **新会话开始时**的追问。
+    #    家长第一次描述孩子的情况，系统判断信息够不够，够就出方案。
+    #    这一轮追问最"值钱"（问对了，后面方案直接能用），也最烦
+    #    （家长还没进入状态）。默认 1。
+    #
+    # 2. ``feedback_followup_max_rounds`` —— **选了方案卡、录完反馈之后**
+    #    的追问。家长已经执行过了，这时候追问"你做的时候具体怎么样"
+    #    是为了让下一步建议更准。默认 1。
+    #
+    # **为什么分开**：两个场景家长承受的耐心不一样 ——
+    # 开始时他对系统还不熟，反馈时他已经跑完一轮了。
+    # 用一个常量就必然有一头不合适。
+    #
+    # 调大之后风险不变：重复提问靠 ``asked_qa_pairs`` 透传防住，
+    # 不靠轮数（见计划 §8.6.1）。
+    followup_max_rounds: int = 1
+    feedback_followup_max_rounds: int = 1
+
     # ---- 关键词检索后端 ----
     #
     # postgres_fts（默认，Postgres 内置 tsvector + ts_rank_cd）

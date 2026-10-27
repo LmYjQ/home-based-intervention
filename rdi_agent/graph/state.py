@@ -60,7 +60,8 @@ class CoachState(TypedDict, total=False):
     #   2. 答案是空的/答不上来 → 换个**角度**问，问得更具体，
     #      但不要换个说法重问原问题。
     asked_qa_pairs: list[dict[str, Any]]
-    # 已经追问几轮。到 MAX_FOLLOWUP_ROUNDS 就强制收手，否则会无限追问下去
+    # 已经追问几轮。到上限（Settings.followup_max_rounds）就强制收手，
+    # 否则会无限追问下去
     followup_rounds: int
     # generate_followup 发现没东西可问时，直接跳去出方案，省掉一次空中断
     route_override: str

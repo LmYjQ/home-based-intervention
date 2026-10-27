@@ -72,6 +72,17 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 MAX_FOLLOWUP_ROUNDS = 1
 
 
+def max_followup_rounds() -> int:
+    """新会话入口的追问上限（可配）。
+
+    **为什么是函数不是常量**：家长想多问一轮要改配置重起服务，
+    不该去改代码。默认值仍然是 1（``Settings.followup_max_rounds``）。
+
+    **下限夹在 0**：配成 0 = 一次都不问，直接出方案。
+    """
+    return max(0, get_settings().followup_max_rounds)
+
+
 def plan_prefix(version: int) -> str:
     """卡号前缀。第 1 版保持原样，第 2 版起加 ``r2_``。
 
@@ -295,7 +306,7 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
     system, user = P.check_sufficiency(
         case_summary=state.get("case_summary") or {},
         followup_rounds=rounds,
-        max_followup_rounds=MAX_FOLLOWUP_ROUNDS,
+        max_followup_rounds=max_followup_rounds(),
         asked_questions=list(state.get("asked_questions") or []),
         asked_qa=list(state.get("asked_qa_pairs") or []),
         child_context=state.get("child_context"),
@@ -309,7 +320,7 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
         temperature=0.0,
     )
     # 模型说够，但已经追问到上限还拿不准 —— 尊重模型的判断，只是不让它无休止地问下去。
-    if rounds >= MAX_FOLLOWUP_ROUNDS and decision.requires_followup:
+    if rounds >= max_followup_rounds() and decision.requires_followup:
         decision = SufficiencyDecision(
             requires_followup=False,
             reasons=[

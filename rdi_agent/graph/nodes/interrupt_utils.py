@@ -68,7 +68,7 @@ def build_asked_qa(
     # （没带原问题）—— 那段话就是这道题的答案。
     #
     # **不归的话**：模型看到的是"问了但没答"，会想再问一遍
-    # —— 而家长面前只有一次追问的机会（MAX_FOLLOWUP_ROUNDS = 1）。
+    # —— 而家长面前只有一次追问的机会（默认 1 轮，见 Settings.followup_max_rounds）。
     if len(questions) == 1:
         only = str(questions[0].get("question") or "").strip()
         orphan = next(

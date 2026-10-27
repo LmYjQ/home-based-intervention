@@ -718,6 +718,7 @@ def next_step(
     history: list[dict[str, Any]] | None = None,
     child_context: dict[str, Any] | None = None,
     followup_rounds: int = 0,
+    max_followup_rounds: int = 1,
 ) -> tuple[str, str]:
     """给下一步。返回 (system, user)。
 
@@ -737,7 +738,7 @@ decision 只能是下面四个之一：
 - adjust：方案本身需要换一种做法（比如对送园的人不友好、
   孩子拒绝的是某一步），需要重新查指南并给证据支撑的调整。
 - followup：这次反馈太模糊，先问清 1–3 个会改变建议的问题。
-  **已经追问过 {followup_rounds} 轮，达到 1 轮就不能再选 followup。**
+  **已经追问过 {followup_rounds} 轮，达到 {max_followup_rounds} 轮就不能再选 followup。**
 - stop：出现风险信号、持续执行不下去、或家长负担已经超过收益。
   这时要明确说"先停下来"，并给出什么时候找专业人士。
 
