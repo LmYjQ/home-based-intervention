@@ -18,9 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
@@ -664,6 +664,27 @@ async def select_plan(conversation_id: str, req: SelectPlanRequest) -> dict[str,
         "trial_id": result.get("trial_id"),
         "message": result.get("final_answer", ""),
     }
+
+
+@router.get("/children/{child_id}/conversations")
+async def list_child_conversations(
+    child_id: str,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> dict[str, Any]:
+    """这个孩子的会话列表（新的在前）。
+
+    给手动测试台用：家长在一个孩子下开过好几个会话，
+    需要能下拉切回之前那个，而不是只能开新的。
+
+    **列表从 ``interactions`` 表 group by 出来** —— 没有单独的会话表，
+    会话本身就是"这个孩子的一段对话"。
+    """
+    async with session_scope() as session:
+        repo = Repository(session)
+        if await repo.get_child(child_id) is None:
+            raise HTTPException(404, "孩子档案不存在")
+        items = await repo.list_conversations(child_id, limit=limit)
+    return {"child_id": child_id, "conversations": items}
 
 
 @router.get("/conversations/{conversation_id}")

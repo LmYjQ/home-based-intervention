@@ -48,6 +48,10 @@ export const api = {
   createChild: (payload = {}) =>
     request('/api/children', { method: 'POST', body: payload }),
 
+  // 这个孩子的会话列表（新的在前）
+  listChildConversations: (childId) =>
+    request(`/api/children/${childId}/conversations`),
+
   createConversation: (payload) =>
     request('/api/conversations', { method: 'POST', body: payload }),
 

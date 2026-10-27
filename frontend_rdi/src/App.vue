@@ -45,6 +45,9 @@ const childId = ref(localStorage.getItem(CHILD_KEY) || '')
 // 测试账号列表（新建的在前）。切换它 = 切换"当前在看哪个孩子的数据"。
 const children = ref([])
 const loadingChildren = ref(false)
+// 当前孩子的会话列表（新的在前）。切换它 = 切回之前那轮对话。
+const conversations = ref([])
+const loadingConversations = ref(false)
 // 新建账号要填的东西：**姓名和出生年月都必填**。
 // 年龄不存 —— 只存出生日期，显示和给模型用的年龄都由后端按当天现算。
 // 姓名不限长度：这里实际被当"孩子的描述"用。
@@ -216,6 +219,27 @@ function shortLabel(text) {
   return first.length > 40 ? `${first.slice(0, 40)}…` : first
 }
 
+// 会话列表里的时间。
+//
+// **只显示"多久之前"**：会话 id 后面跟一串 ISO 时间戳没法看，
+// 而家长要判断的是"这是不是刚才那次"——
+// 今天/昨天/更早，三档就够用了。
+function formatTime(iso) {
+  if (!iso) return ''
+  const then = new Date(iso)
+  if (Number.isNaN(then.getTime())) return ''
+  const diff = Date.now() - then.getTime()
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+  if (diff < minute) return '刚刚'
+  if (diff < hour) return `${Math.floor(diff / minute)} 分钟前`
+  if (diff < day) return `${Math.floor(diff / hour)} 小时前`
+  if (diff < 2 * day) return '昨天'
+  if (diff < 30 * day) return `${Math.floor(diff / day)} 天前`
+  return then.toLocaleDateString()
+}
+
 // 日历控件的上限：不允许选到未来
 const today = computed(() => {
   const now = new Date()
@@ -375,6 +399,39 @@ async function loadChildren() {
   }
 }
 
+// 拉当前孩子的会话列表（新的在前）。
+//
+// **拉不到不该挡住主流程** —— 当前会话照样能用，
+// 只是下拉里是空的。
+async function loadConversations() {
+  if (!childId.value) {
+    conversations.value = []
+    return
+  }
+  loadingConversations.value = true
+  try {
+    const data = await api.listChildConversations(childId.value)
+    conversations.value = data.conversations || []
+  } catch {
+    conversations.value = []
+  } finally {
+    loadingConversations.value = false
+  }
+}
+
+// 切换到当前孩子的另一个会话。
+//
+// **接不回来就留在原地**：会话可能已经被清库/清掉了，
+// 这时别把界面清空 —— 家长正在看的内容比列表更重要。
+async function switchConversation(nextConversationId) {
+  if (!nextConversationId || nextConversationId === conversationId.value) return
+  const ok = await hydrateConversation(nextConversationId)
+  if (!ok) {
+    error.value = '这个会话已经不在了（可能被清过库），列表已刷新'
+    await loadConversations()
+  }
+}
+
 // 新建账号，并直接切过去开一个新会话。
 //
 // **姓名和出生年月都必须填**：
@@ -420,7 +477,10 @@ async function switchChild(nextChildId) {
 
   // 这个孩子上次的会话还在就接回来；接不回来（换过库/被清了）就开新的
   const saved = localStorage.getItem(CHILD_CONV_PREFIX + nextChildId)
-  if (saved && (await hydrateConversation(saved))) return
+  if (saved && (await hydrateConversation(saved))) {
+    await loadConversations()
+    return
+  }
   if (saved) localStorage.removeItem(CHILD_CONV_PREFIX + nextChildId)
   await createConversation()
 }
@@ -462,6 +522,8 @@ async function hydrateConversation(targetId) {
     questions.value = pending.questions || []
   }
   await restoreFeedback()
+  // 会话列表最后刷 —— child_id 这时才是准的
+  await loadConversations()
   return true
 }
 
@@ -484,6 +546,7 @@ function resetTurnState() {
   revisionTurnId.value = ''
   activeVersion.value = null
   activeCardIndex.value = {}
+  conversations.value = []
   memories.value = []
   memoryPending.value = 0
   progressSteps.value = []
@@ -512,6 +575,7 @@ async function createConversation() {
   localStorage.setItem(CHILD_CONV_PREFIX + data.child_id, data.conversation_id)
   resetTurnState()
   await refreshMemories()
+  await loadConversations()
 }
 
 // ---- 长期记忆 ----
@@ -590,6 +654,8 @@ function applyTurn(data) {
 
   // 这一轮可能新记/纠正/删了记忆，面板跟着刷一次
   refreshMemories()
+  // 说过话 = 这个会话有内容了，列表里要出现
+  loadConversations()
 }
 
 async function send(text) {
@@ -827,6 +893,33 @@ onMounted(async () => {
             <h3>会话</h3>
             <span v-if="conversationId" class="badge small">{{ conversationId }}</span>
           </header>
+
+          <!--
+            当前孩子的会话列表。以前这里只显示一个会话 id，
+            家长开过新会话就找不到之前那轮了 —— 下拉能切回去。
+          -->
+          <div class="row" style="margin-bottom:6px">
+            <div class="field" style="flex:2;margin:0">
+              <label>会话（当前孩子的历史对话）</label>
+              <select
+                :value="conversationId"
+                :disabled="busy || loadingConversations || !childId"
+                @change="switchConversation($event.target.value)"
+              >
+                <option v-if="!conversationId" value="" disabled>
+                  {{ loadingConversations ? '加载中…' : '还没有会话' }}
+                </option>
+                <option
+                  v-for="c in conversations"
+                  :key="c.conversation_id"
+                  :value="c.conversation_id"
+                >
+                  {{ c.title || c.conversation_id.slice(-12) }}
+                  （{{ c.message_count }} 条 · {{ formatTime(c.last_at) }}）
+                </option>
+              </select>
+            </div>
+          </div>
 
           <div class="row" style="margin-bottom:6px">
             <div class="field" style="flex:2;margin:0">

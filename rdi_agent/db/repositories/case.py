@@ -14,7 +14,7 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -197,6 +197,69 @@ class Repository:
         ]
 
     # ------------------------------------------------------------ 证据包
+    async def list_conversations(
+        self, child_id: str, *, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """这个孩子的会话列表（新的在前）。
+
+        **会话从哪来**：``interactions`` 表里每条交互都带 conversation_id，
+        所以"这个孩子聊过哪几个会话"不用另建一张会话表 ——
+        从交互记录里 group by 出来就行。
+
+        **只列有交互的**：光建了没说话的会话不进列表 ——
+        那只是一次误点，不是家长想找回来的对话。
+
+        每条给出：会话 id、第一条家长说的话（当标题）、
+        消息条数、最后一条交互的时间。
+        """
+        child_uuid = uuid.UUID(str(child_id))
+        rows = (
+            await self.session.execute(
+                select(
+                    Interaction.conversation_id,
+                    func.count(Interaction.id).label("n"),
+                    func.max(Interaction.created_at).label("last_at"),
+                )
+                .where(Interaction.child_id == child_uuid)
+                .group_by(Interaction.conversation_id)
+                .order_by(func.max(Interaction.created_at).desc())
+                .limit(limit)
+            )
+        ).all()
+        if not rows:
+            return []
+
+        # 标题 = 这个会话里最早一条家长说的话。单独查一次，
+        # 避免把每条交互都拉出来在应用层筛。
+        #
+        # **DISTINCT ON 必须先按那个表达式排序**（Postgres 的硬要求），
+        # 所以先按 (conversation_id, created_at) 排，再在应用层取每个
+        # 会话的第一条 —— 不能直接 order_by(created_at)。
+        firsts = (
+            await self.session.execute(
+                select(Interaction.conversation_id, Interaction.content)
+                .where(
+                    Interaction.child_id == child_uuid,
+                    Interaction.role == "user",
+                )
+                .order_by(Interaction.conversation_id, Interaction.created_at)
+            )
+        ).all()
+        titles: dict[str, str] = {}
+        for cid, content in firsts:
+            if cid not in titles:
+                titles[cid] = content
+
+        return [
+            {
+                "conversation_id": r.conversation_id,
+                "title": (titles.get(r.conversation_id) or "").strip()[:40],
+                "message_count": int(r.n),
+                "last_at": r.last_at.isoformat() if r.last_at else None,
+            }
+            for r in rows
+        ]
+
     async def save_evidence_bundle(
         self,
         *,
