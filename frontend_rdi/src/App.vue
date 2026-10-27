@@ -54,6 +54,8 @@ const loadingConversations = ref(false)
 const newName = ref('')
 // 日历控件选出来的年月（YYYY-MM）
 const newBirth = ref('')
+// 建账号的表单默认收着 —— 点「＋ 新建账号」才展开。
+const showAccountForm = ref(false)
 
 const messages = ref([])
 const status = ref('')
@@ -452,6 +454,7 @@ async function createAccount() {
   if (!data) return
   newName.value = ''
   newBirth.value = ''
+  showAccountForm.value = false
   await loadChildren()
   childId.value = data.child_id
   familyId.value = data.family_id
@@ -945,9 +948,22 @@ onMounted(async () => {
             >
               新会话
             </button>
+            <button
+              style="align-self:flex-end"
+              :disabled="busy"
+              title="新建一个测试账号（每个账号一套独立记忆）"
+              @click="showAccountForm = !showAccountForm"
+            >
+              {{ showAccountForm ? '收起' : '＋ 新建账号' }}
+            </button>
           </div>
 
-          <div class="row" style="margin-bottom:10px;align-items:flex-end">
+          <!--
+            建账号的表单**默认收起来**。
+            平时用不到它，却一直占着半屏，还让人以为"必须填了才能说话"。
+            点「＋ 新建账号」才展开。
+          -->
+          <div v-if="showAccountForm" class="row" style="margin-bottom:10px;align-items:flex-end">
             <div class="field" style="flex:1;margin:0">
               <label>姓名 / 孩子的描述</label>
               <!--
@@ -976,16 +992,16 @@ onMounted(async () => {
               :title="canCreateAccount ? '' : '姓名和出生年月都要填'"
               @click="createAccount"
             >
-              ＋ 新建账号
+              建这个账号
             </button>
           </div>
-          <div v-if="!canCreateAccount" class="small muted" style="margin:-4px 0 10px">
+          <div v-if="showAccountForm && !canCreateAccount" class="small muted" style="margin:-4px 0 10px">
             还差：{{ missingAccountFields.join('、') }}。
           </div>
 
           <div class="msgs">
             <div v-if="!messages.length" class="small muted">
-              还没开始。先「新建账号」或从下拉选一个，再在下面说孩子的表现。
+              还没开始。先从下拉选一个账号，或点「＋ 新建账号」，再在下面说孩子的表现。
             </div>
             <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
               <div class="who">{{ m.role === 'user' ? '家长' : '教练' }} · {{ m.at }}</div>
