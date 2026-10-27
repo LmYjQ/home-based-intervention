@@ -8,7 +8,7 @@
 //
 // 走通的顺序：建会话 → 发消息（可能停在追问）→ 答完追问
 // → 停在方案选择 → 选一张 → trial 落库 → 录反馈。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { api, streamMessage } from './api.js'
 import PlanCard from './components/PlanCard.vue'
 import FeedbackForm from './components/FeedbackForm.vue'
@@ -155,6 +155,56 @@ const planGroups = computed(() => {
       archived: version < currentPlanVersion.value,
     }))
 })
+
+// ---- 方案卡翻页（和追问一样：一次只显示一张，上边一排按钮切换） ----
+//
+// 为什么要翻页：3 张卡堆在一起是一屏家长读不完的文字，
+// 而"这版有几张卡、每张叫什么"家长其实只需要知道标题。
+// 翻页后卡片占固定位置，标题按钮就是目录。
+const activeVersion = ref(null)
+const activeCardIndex = ref({})
+
+// 新版本出来（修订过）时自动切到最新那版；老版本还在按钮里可以翻回去看。
+const lastVersion = ref(0)
+watch(
+  () => currentPlanVersion.value,
+  (version) => {
+    if (!version) {
+      activeVersion.value = null
+      lastVersion.value = 0
+      return
+    }
+    // 版本号变大 = 刚修订过 → 切到新版本
+    if (version > lastVersion.value) {
+      activeVersion.value = version
+    } else if (!planGroups.value.some((g) => g.version === activeVersion.value)) {
+      // 换会话/清库后版本号会变小 —— 跟着回到那一版，
+      // 不能停在旧会话的第 2 版上（那一版已经不存在了）。
+      activeVersion.value = version
+    }
+    lastVersion.value = version
+  },
+  { immediate: true },
+)
+
+const activeGroup = computed(
+  () => planGroups.value.find((g) => g.version === activeVersion.value) || planGroups.value[0] || null,
+)
+
+const activeCard = computed(() => {
+  const group = activeGroup.value
+  if (!group) return null
+  const idx = activeCardIndex.value[group.version] || 0
+  return group.plans[idx] || group.plans[0] || null
+})
+
+function selectVersion(version) {
+  activeVersion.value = version
+}
+
+function selectCard(version, index) {
+  activeCardIndex.value = { ...activeCardIndex.value, [version]: index }
+}
 
 // 下拉里的显示名。
 //
@@ -432,6 +482,8 @@ function resetTurnState() {
   feedbackResult.value = null
   reviseNote.value = ''
   revisionTurnId.value = ''
+  activeVersion.value = null
+  activeCardIndex.value = {}
   memories.value = []
   memoryPending.value = 0
   progressSteps.value = []
@@ -915,26 +967,45 @@ onMounted(async () => {
             </span>
           </header>
           <!--
-            按版本分组：修订后的当前版本可选，旧版本灰显保留。
-            同一屏里能对照"第 1 版和第 2 版差在哪"。
+            方案卡：一次只显示一张，上边一排按钮切换。
+            第一排按钮是**版本**（第 1 版 / 第 2 版），
+            第二排是这一版里的**几张卡**。位置固定，和追问一样。
           -->
-          <div
-            v-for="g in planGroups"
-            :key="g.version"
-            class="plan-group"
-            :class="{ archived: g.archived }"
-          >
-            <div class="row plan-group-head">
-              <h4>第 {{ g.version }} 版</h4>
-              <span class="badge" :class="g.archived ? '' : 'accent'">
-                {{ g.archived ? '已归档' : '当前版本' }}
-              </span>
-              <span class="badge small">{{ g.plans.length }} 张</span>
+          <div class="plan-switcher">
+            <div class="dots">
+              <button
+                v-for="g in planGroups"
+                :key="g.version"
+                class="dot version-dot"
+                :class="{ active: g.version === activeGroup?.version, archived: g.archived }"
+                :title="`第 ${g.version} 版（${g.plans.length} 张）`"
+                @click="selectVersion(g.version)"
+              >
+                第 {{ g.version }} 版
+              </button>
+              <span v-if="activeGroup?.archived" class="badge small">已归档</span>
             </div>
-            <PlanCard v-for="p in g.plans" :key="p.plan_id" :plan="p"
+
+            <div class="dots" v-if="activeGroup">
+              <button
+                v-for="(p, i) in activeGroup.plans"
+                :key="p.plan_id"
+                class="dot card-dot"
+                :class="{ active: p.plan_id === activeCard?.plan_id }"
+                :title="p.title"
+                @click="selectCard(activeGroup.version, i)"
+              >
+                {{ i + 1 }}
+              </button>
+              <span class="badge small">{{ activeGroup.plans.length }} 张</span>
+            </div>
+          </div>
+
+          <div v-if="activeCard" class="plan-group" :class="{ archived: activeGroup?.archived }">
+            <PlanCard :plan="activeCard"
                       :evidence="evidence"
-                      :selectable="awaitingPlanSelection && !g.archived"
-                      :selected="p.plan_id === selectedPlanId"
+                      :selectable="awaitingPlanSelection && !activeGroup?.archived"
+                      :selected="activeCard.plan_id === selectedPlanId"
                       @select="selectPlan" />
           </div>
           <!-- 证据缺口：家长该知道"哪一部分我们没找到依据" -->
@@ -1100,15 +1171,19 @@ onMounted(async () => {
   </div>
 </template>
 <style scoped>
-.plan-group + .plan-group { margin-top: 14px; }
-.plan-group-head {
-  align-items: center;
-  margin-bottom: 6px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
+.plan-switcher { margin-bottom: 10px; }
+.plan-switcher .dots { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.version-dot {
+  border-radius: 14px; padding: 5px 12px; font-size: 13px; line-height: 1.2;
 }
-.plan-group-head h4 { margin: 0; }
-/* 旧版本保留可查，但灰掉 —— 一眼能看出它不是当前可选项。 */
+.version-dot.active { border-color: var(--accent); color: var(--accent); }
+.version-dot.archived { opacity: 0.6; }
+.card-dot {
+  width: 28px; height: 28px; border-radius: 50%; padding: 0;
+  font-size: 12px; line-height: 1;
+  display: flex; align-items: center; justify-content: center;
+}
+.card-dot.active { border-color: var(--accent); color: var(--accent); }
 .plan-group.archived { opacity: 0.62; }
 .revise-box {
   margin-top: 12px;
