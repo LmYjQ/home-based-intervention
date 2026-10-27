@@ -96,6 +96,12 @@ export const api = {
   revisePlan: (trialId, payload) =>
     request(`/api/trials/${trialId}/revise`, { method: 'POST', body: payload }),
 
+  // ---- LLM 设置（前端可改，立刻生效）----
+  getLLMSettings: () => request('/api/settings/llm'),
+
+  updateLLMSettings: (payload) =>
+    request('/api/settings/llm', { method: 'POST', body: payload }),
+
   // ---- 调试（阶段 5）----
   debugState: (conversationId, threadId) => {
     const query = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : ''

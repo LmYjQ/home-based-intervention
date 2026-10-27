@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -48,7 +49,7 @@ class Settings(BaseSettings):
     # 给到 120s：单次慢调用能扛住，三次重试最坏 6 分钟，
     # 但换来的是"慢"而不是"挂"。宁可慢，不要把家长的问题判成模型挂了。
     llm_timeout_s: float = 120.0
-    llm_max_attempts: int = 3
+    llm_max_attempts: int = 2
     # live / replay / capture
     demo_mode: str = "live"
     replay_dir: Path = REPO_ROOT / "rdi_agent" / "fixtures" / "responses"
@@ -147,15 +148,103 @@ class Settings(BaseSettings):
 
 _settings: Settings | None = None
 
+# 运行时覆盖（前端改的）。
+#
+# **为什么要有这一层**：模型名和超时是最常被临时改的两项 ——
+# provider 排队时把超时调短试试、换个模型对比一下效果。
+# 改 ``.env`` 要重启服务，改代码更糟。
+#
+# **只覆盖白名单里的字段**：不能拿它改数据库地址之类的东西。
+_LLM_OVERRIDE_FIELDS = ("llm_model", "llm_timeout_s")
+
+# 覆盖值。没被覆盖的字段是 None。
+_llm_overrides: dict[str, Any] = {}
+
 
 def get_settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = Settings()
+        if _llm_overrides:
+            _settings = _settings.model_copy(update=dict(_llm_overrides))
     return _settings
 
 
-def reset_settings() -> None:
-    """测试用：清掉缓存的 Settings，让改过的环境变量生效。"""
+def _reset_client() -> None:
+    """丢掉缓存的 LLM client。
+
+    **为什么要重置**：client 是按超时缓存的（``llm._CLIENTS``），
+    超时变了还拿旧 client，等于没改。
+
+    **这里 import 而不是顶层 import**：``llm`` 顶层 import ``config``，
+    反过来顶层 import 会成循环。函数内 import 时模块已经加载完，安全。
+    """
+    from rdi_agent.llm import reset_client
+
+    reset_client()
+
+
+def set_llm_overrides(
+    *, llm_model: str | None = None, llm_timeout_s: float | None = None
+) -> dict[str, Any]:
+    """改模型名和超时（前端可调），返回生效后的值。
+
+    **传 None 表示"不改"** —— 前端只填了一个字段时，另一个要保持原样。
+
+    **改完要 ``reset_client()``**：client 是按超时缓存的，
+    超时变了还拿旧 client，等于没改。
+    """
+    if llm_model is not None:
+        model = llm_model.strip()
+        if not model:
+            raise ValueError("模型名不能为空")
+        _llm_overrides["llm_model"] = model
+    if llm_timeout_s is not None:
+        timeout = float(llm_timeout_s)
+        if timeout <= 0:
+            raise ValueError("超时必须大于 0")
+        _llm_overrides["llm_timeout_s"] = timeout
+
+    global _settings
+    _settings = None  # 下一个 get_settings() 按新值重建
+    _reset_client()
+    s = get_settings()
+    return {
+        "llm_model": s.llm_model,
+        "llm_timeout_s": s.llm_timeout_s,
+        "llm_max_attempts": s.llm_max_attempts,
+    }
+
+
+def reset_llm_overrides() -> dict[str, Any]:
+    """清掉运行时覆盖，回到 ``.env`` 说的那个值。
+
+    **为什么要有这个**：覆盖是进程内存里的，重启服务就没了 ——
+    但"我想临时改一下再改回来"是常态，没有这个按钮就得靠重启。
+    """
+    _llm_overrides.clear()
     global _settings
     _settings = None
+    _reset_client()
+    return llm_overrides()
+
+
+def llm_overrides() -> dict[str, Any]:
+    """当前生效的 LLM 配置（前端回显用）。"""
+    s = get_settings()
+    return {
+        "llm_model": s.llm_model,
+        "llm_timeout_s": s.llm_timeout_s,
+        "llm_max_attempts": s.llm_max_attempts,
+    }
+
+
+def reset_settings() -> None:
+    """测试用：清掉缓存的 Settings，让改过的环境变量生效。
+
+    **连运行时覆盖一起清**：测试要的是"回到环境变量说的那个状态"，
+    留着前一次调用改的值会让测试互相影响。
+    """
+    global _settings
+    _settings = None
+    _llm_overrides.clear()

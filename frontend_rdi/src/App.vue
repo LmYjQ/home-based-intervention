@@ -84,6 +84,72 @@ const input = ref('')
 const busy = ref(false)
 const error = ref('')
 const lastRaw = ref(null)
+
+// LLM 设置（模型名、超时）—— 前端可改，改完立刻生效。
+//
+// **为什么能改**：provider 排队时把超时调短试试、换个模型对比一下效果 ——
+// 改 .env 要重启服务，改代码更糟。
+// **只影响本进程**，重启就没了（要永久改就改 .env）。
+const llmSettings = ref({ llm_model: '', llm_timeout_s: 120, llm_max_attempts: 2 })
+const llmModelInput = ref('')
+const llmTimeoutInput = ref('')
+const llmSettingsMsg = ref('')
+const llmSettingsErr = ref('')
+
+async function loadLLMSettings() {
+  try {
+    const data = await api.getLLMSettings()
+    llmSettings.value = data
+    llmModelInput.value = data.llm_model
+    llmTimeoutInput.value = String(data.llm_timeout_s)
+  } catch (e) {
+    llmSettingsErr.value = e.message
+  }
+}
+
+async function saveLLMSettings() {
+  llmSettingsMsg.value = ''
+  llmSettingsErr.value = ''
+  const timeout = Number(llmTimeoutInput.value)
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    llmSettingsErr.value = '超时必须是一个大于 0 的数字'
+    return
+  }
+  const model = llmModelInput.value.trim()
+  if (!model) {
+    llmSettingsErr.value = '模型名不能为空'
+    return
+  }
+  try {
+    const data = await api.updateLLMSettings({
+      llm_model: model,
+      llm_timeout_s: timeout,
+    })
+    llmSettings.value = data
+    llmModelInput.value = data.llm_model
+    llmTimeoutInput.value = String(data.llm_timeout_s)
+    llmSettingsMsg.value = '已生效'
+    // 顶栏那个 badge 显示的是 health 里的旧值 —— 刷一次
+    checkHealth()
+  } catch (e) {
+    llmSettingsErr.value = e.message
+  }
+}
+
+async function resetLLMSettings() {
+  llmSettingsMsg.value = ''
+  llmSettingsErr.value = ''
+  try {
+    const data = await api.updateLLMSettings({ reset: true })
+    llmSettings.value = data
+    llmModelInput.value = data.llm_model
+    llmTimeoutInput.value = String(data.llm_timeout_s)
+    llmSettingsMsg.value = '已回到 .env 的默认值'
+    checkHealth()
+  } catch (e) {
+    llmSettingsErr.value = e.message
+  }
+}
 // 追问作答组件的实例 —— 新一轮追问来时要重置它的内部状态
 const stepper = ref(null)
 
@@ -840,6 +906,7 @@ async function restoreSession() {
 
 onMounted(async () => {
   checkHealth()
+  await loadLLMSettings()
   await loadChildren()
   await restoreSession()
   // 没有可恢复的会话，但记住了孩子 —— 记忆面板也该显示这个孩子的数据
@@ -857,9 +924,38 @@ onMounted(async () => {
       <span v-if="health" class="badge" :class="health.status === 'ok' ? 'ok' : 'err'">
         后端 {{ health.status }}
       </span>
-      <span v-if="health?.llm" class="badge" :class="health.llm.llm_ok ? 'ok' : 'err'">
-        LLM {{ health.llm.model }} · {{ health.llm.mode }}
-      </span>
+      <!--
+        LLM 设置做成**顶栏里可展开的一小块**，不另开面板 ——
+        面板已经够多了，这个不常开。
+      -->
+      <details class="llm-settings">
+        <summary>
+          <span class="badge" :class="health?.llm?.llm_ok ? 'ok' : 'err'">
+            LLM {{ llmSettings.llm_model || health?.llm?.model }} · {{ health?.llm?.mode }}
+          </span>
+        </summary>
+        <div class="llm-settings-body">
+          <div class="field">
+            <label>模型名</label>
+            <input v-model="llmModelInput" placeholder="Qwen/Qwen2.5-7B-Instruct" />
+          </div>
+          <div class="field">
+            <label>超时（秒）</label>
+            <input v-model="llmTimeoutInput" type="number" min="1" step="5" />
+            <div class="small muted">
+              重试 {{ llmSettings.llm_max_attempts }} 次 —— 改这个要重启服务。
+              超时 × 重试 = 最坏等待时间。
+            </div>
+          </div>
+          <div class="row">
+            <button class="primary" :disabled="busy" @click="saveLLMSettings">应用</button>
+            <button :disabled="busy" @click="resetLLMSettings">回到默认</button>
+          </div>
+          <div v-if="llmSettingsMsg" class="small muted">{{ llmSettingsMsg }}</div>
+          <div v-if="llmSettingsErr" class="err-box">{{ llmSettingsErr }}</div>
+          <div class="small muted">只影响本进程，重启就回到 .env 的值。</div>
+        </div>
+      </details>
       <span v-if="health?.database" class="badge">{{ health.database.server?.split(' on ')[0] }}</span>
       <span v-if="health?.rerank_enabled" class="badge">rerank on</span>
 
@@ -1262,6 +1358,28 @@ onMounted(async () => {
   </div>
 </template>
 <style scoped>
+/* LLM 设置：顶栏里展开的一小块 */
+.llm-settings { position: relative; display: inline-block; }
+.llm-settings > summary {
+  list-style: none;
+  cursor: pointer;
+  display: inline-block;
+}
+.llm-settings > summary::-webkit-details-marker { display: none; }
+.llm-settings-body {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 20;
+  width: 340px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.llm-settings-body .field { margin-bottom: 10px; }
+
 .plan-switcher { margin-bottom: 10px; }
 .plan-switcher .dots { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
 .version-dot {
