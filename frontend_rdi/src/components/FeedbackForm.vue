@@ -1,9 +1,19 @@
 <script setup>
 // 反馈录入。
 //
-// 契约刻意把"执行了什么"和"结果如何"分开（schemas/feedback.py）：
-// attempted 只表示家长做了没有，孩子"今天没哭"要填进 child_response
-// 或 parent_observations —— 它是一条观察，不等于"上一轮方案有效"。
+// **只保留一个对话框**（2026-10-27 改）。
+//
+// 原来这里有 6 个输入框（执行情况、行为、情绪、说了什么、家长的观察、
+// 执行困难），家长要先想清楚每句话该填进哪一栏 —— 负担比"把情况说清楚"
+// 本身还大。反馈本来就是一段话，让家长一口气说完，剩下的由模型拆。
+//
+// **还留着执行状态那三个 radio**：它不是打字，是三个按钮，
+// 而且直接决定 trial 的状态（做了 / 中途停了 / 没做 ——
+// "能开始但停下来"比"没开始"更有信息量，见 schemas/feedback.py）。
+//
+// 契约那边没动：`implementation_notes` 接这一整段，
+// `child_response` / `parent_observations` / `difficulties` 留空。
+// 下游（分析、记忆抽取）读的都是"家长写了什么"，不关心分了哪几栏。
 import { ref, watch } from 'vue'
 import { api } from '../api.js'
 
@@ -16,12 +26,7 @@ const emit = defineEmits(['done'])
 // 做了 / 没做 / 做了但中途停了。
 // 中途停止比"没做"更有信息量：说明门槛不在第一步，而是执行不下去。
 const execution = ref('attempted')
-const implementationNotes = ref('')
-const behavior = ref('')
-const affect = ref('')
-const words = ref('')
-const parentObservations = ref('')
-const difficulties = ref('')
+const notes = ref('')
 const busy = ref(false)
 const error = ref('')
 
@@ -36,10 +41,6 @@ watch(
   },
 )
 
-function toList(text) {
-  return text.split('\n').map((s) => s.trim()).filter(Boolean)
-}
-
 async function submit() {
   busy.value = true
   error.value = ''
@@ -50,14 +51,11 @@ async function submit() {
       turn_id: turnId.value,
       attempted: execution.value !== 'not_attempted',
       stopped: execution.value === 'stopped',
-      implementation_notes: implementationNotes.value,
-      child_response: {
-        behavior: behavior.value,
-        affect: affect.value,
-        words: words.value,
-      },
-      parent_observations: toList(parentObservations.value),
-      difficulties: toList(difficulties.value),
+      // 一整段都放这儿。下游拼"家长写了什么"时就是这一段。
+      implementation_notes: notes.value.trim(),
+      child_response: { behavior: '', affect: '', words: '' },
+      parent_observations: [],
+      difficulties: [],
     })
     emit('done', result)
   } catch (e) {
@@ -89,37 +87,22 @@ async function submit() {
       </div>
     </div>
 
+    <!--
+      一个框子说完。
+      **不做成多栏**：家长要先判断"这句话算执行情况还是算观察"，
+      判断的力气比打字还大。该算什么由模型拆。
+    -->
     <div class="field">
-      <label>执行情况（做了哪些、实际怎么做）</label>
-      <textarea v-model="implementationNotes" placeholder="例如：只在门口抱了 3 分钟就放下，没坚持到平时回家的时长" />
-    </div>
-
-    <div class="field">
-      <label>孩子的反应</label>
-      <div class="grid3">
-        <div>
-          <label class="small muted">行为</label>
-          <input v-model="behavior" placeholder="蹲下、拍手" />
-        </div>
-        <div>
-          <label class="small muted">情绪</label>
-          <input v-model="affect" placeholder="平静、焦虑" />
-        </div>
-        <div>
-          <label class="small muted">说了什么</label>
-          <input v-model="words" placeholder="原话" />
-        </div>
+      <label>这周做了什么、看到了什么</label>
+      <textarea
+        v-model="notes"
+        rows="6"
+        placeholder="例如：只在门口抱了 3 分钟就放下，没坚持到平时回家的时长&#10;今天没有哭，但抱着我的手抓得更紧了&#10;还是老人帮忙送的，我控制不了流程"
+      />
+      <div class="small muted">
+        想到什么说什么，不用分栏 —— 执行了什么、孩子什么反应、哪里卡住了，
+        写在一段里就行。
       </div>
-    </div>
-
-    <div class="field">
-      <label>家长的观察（一行一条）</label>
-      <textarea v-model="parentObservations" placeholder="今天没有哭&#10;但抱着我的手抓得更紧了" />
-    </div>
-
-    <div class="field">
-      <label>执行困难（一行一条）</label>
-      <textarea v-model="difficulties" placeholder="老人帮忙送，无法控制流程" />
     </div>
 
     <button class="primary" :disabled="busy" @click="submit">
@@ -129,7 +112,5 @@ async function submit() {
 </template>
 
 <style scoped>
-.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-@media (max-width: 620px) { .grid3 { grid-template-columns: 1fr; } }
 label.row { cursor: pointer; }
 </style>
