@@ -38,17 +38,20 @@ class TestLoadContext:
         async def fake_load(**_kwargs):
             return {
                 "child_context_patch": {
-                    "confirmed_facts": ["孩子 5 岁"],
+                    "summaries": [{"content": "在幼儿园门口会哭"}],
                     "preferences": ["不希望用药"],
-                    "memories": {"observations": [], "hypotheses": []},
+                    "inferences": [],
+                    "memories": {"summaries": [], "preferences": [], "inferences": []},
                 },
-                "memory_context": {"confirmed_facts": ["孩子 5 岁"]},
+                "memory_context": {"summaries": []},
                 "forbidden_facts": ["孩子 4 岁"],
             }
 
         monkeypatch.setattr(memory_service, "load_memory_context", fake_load)
         result = await chat_nodes.load_context(_state())
-        assert result["child_context"]["confirmed_facts"] == ["孩子 5 岁"]
+        assert result["child_context"]["summaries"] == [
+            {"content": "在幼儿园门口会哭"}
+        ]
         assert result["memory_forbidden_facts"] == ["孩子 4 岁"]
 
     async def test_db_failure_degrades_instead_of_raising(self, monkeypatch):
@@ -122,7 +125,7 @@ class TestForbiddenFacts:
 
 
 class TestSufficiencyPrompt:
-    async def test_known_facts_reach_the_prompt(self, monkeypatch):
+    async def test_known_memory_reaches_the_prompt(self, monkeypatch):
         captured: list[str] = []
 
         async def fake_chat_json(**kwargs):
@@ -136,16 +139,20 @@ class TestSufficiencyPrompt:
         state = _state(
             case_summary={"observed_facts": ["早上出门会哭"]},
             child_context={
-                "confirmed_facts": ["孩子 5 岁"],
+                "summaries": [{"content": "在幼儿园门口会哭"}],
                 "preferences": ["不希望用药"],
                 "known_contexts": ["在读幼儿园"],
-                "memories": {"hypotheses": [{"content": "可能在分离时紧张"}]},
+                "memories": {
+                    "summaries": [{"content": "在幼儿园门口会哭"}],
+                    "preferences": ["不希望用药"],
+                    "inferences": [{"content": "可能在分离时紧张"}],
+                },
             },
         )
         await chat_nodes.check_sufficiency(state)
 
         payload = json.loads(captured[0])
-        assert payload["known_facts"] == ["孩子 5 岁"]
+        assert payload["known_summaries"][0]["content"] == "在幼儿园门口会哭"
         assert payload["known_preferences"] == ["不希望用药"]
         assert payload["known_contexts"] == ["在读幼儿园"]
-        assert payload["active_hypotheses"][0]["content"] == "可能在分离时紧张"
+        assert payload["known_inferences"][0]["content"] == "可能在分离时紧张"

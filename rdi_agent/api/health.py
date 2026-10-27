@@ -64,9 +64,10 @@ async def _check_fulltext(conn: AsyncConnection) -> dict[str, Any]:
 
 
 async def _check_memory_schema(conn: AsyncConnection) -> dict[str, Any]:
-    """阶段 3 的记忆表结构是不是最新的。
+    """记忆表结构是不是最新的。
 
-    **为什么要单独查**：005 迁移加的是"溯源 / 软删 / 去重"的列。
+    **为什么要单独查**：005 迁移加的是"溯源 / 软删 / 去重"的列，
+    012 迁移把记忆改成两层（``memory_items`` 一张表）。
     没跑迁移的话，记忆节点会在第一次写库时炸 —— 而它被设计成**失败降级**，
     于是线上表现是"记忆悄无声息地不生效"，不是报错。
     这种静默失败必须在 /health 上暴露出来。
@@ -78,8 +79,7 @@ async def _check_memory_schema(conn: AsyncConnection) -> dict[str, Any]:
                     """
                     SELECT table_name, column_name
                     FROM information_schema.columns
-                    WHERE (table_name = 'observations' AND column_name IN ('content_hash', 'deleted_at', 'status'))
-                       OR (table_name = 'hypotheses' AND column_name IN ('content_hash', 'deleted_at'))
+                    WHERE (table_name = 'memory_items' AND column_name IN ('content_hash', 'deleted_at', 'status', 'category'))
                        OR (table_name = 'memory_events' AND column_name = 'content_hash')
                     """
                 )
@@ -87,11 +87,10 @@ async def _check_memory_schema(conn: AsyncConnection) -> dict[str, Any]:
         ).all()
         found = {(r[0], r[1]) for r in rows}
         required = {
-            ("observations", "content_hash"),
-            ("observations", "deleted_at"),
-            ("observations", "status"),
-            ("hypotheses", "content_hash"),
-            ("hypotheses", "deleted_at"),
+            ("memory_items", "content_hash"),
+            ("memory_items", "deleted_at"),
+            ("memory_items", "status"),
+            ("memory_items", "category"),
             ("memory_events", "content_hash"),
         }
         missing = sorted(f"{t}.{c}" for t, c in required - found)

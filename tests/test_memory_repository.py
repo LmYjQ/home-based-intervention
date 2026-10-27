@@ -3,9 +3,9 @@
 **测的是计划 §10.7 的验收**，不是实现细节：
 
 - 同一内容写两次只有一条（重试/恢复不重复）
-- 纠正之后 ``child_context`` 只出新值（旧值不再进 prompt）
+- 纠正之后旧的那条不再进 prompt
 - 删除之后列表和上下文都没有它
-- 反例让假设 ``weakened`` 且置信度降一档
+- 偏好和推断照写，但**不参与合并**
 - 跨家庭读不到别人的记忆
 """
 
@@ -18,11 +18,11 @@ import pytest
 from sqlalchemy import select, text
 
 from rdi_agent.db.engine import dispose_engine, get_engine, session_scope
-from rdi_agent.db.models import Child, Hypothesis, MemoryEvent, Observation
+from rdi_agent.db.models import Child, MemoryEvent, MemoryItem
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.db.repositories.memory import list_memories
 from rdi_agent.memory import service
-from rdi_agent.memory.ids import content_hash
+from rdi_agent.memory.ids import note_content_hash
 from rdi_agent.schemas.memory import MemoryCandidate
 
 
@@ -41,41 +41,27 @@ def _needs_db() -> bool:
 pytestmark = pytest.mark.skipif(not _needs_db(), reason="本地没有 Postgres")
 
 
-def _fact(content: str, *, quote: str, decision: str = "auto_commit", replaces: str = "") -> MemoryCandidate:
+def _note(
+    content: str,
+    *,
+    quote: str,
+    category: str = "other",
+    decision: str = "auto_commit",
+    replaces: str = "",
+    is_preference: bool = False,
+    inference: bool = False,
+) -> MemoryCandidate:
     return MemoryCandidate(
-        memory_type="fact",
         content=content,
+        category=category,
+        is_preference=is_preference,
+        inference=inference,
         source_quote=quote,
         proposed_decision=decision,  # type: ignore[arg-type]
         replaces_memory_id=replaces,
-        content_hash=content_hash("fact", content),
-    )
-
-
-def _episode(
-    content: str, *, quote: str, contradiction_ids: list[str] | None = None
-) -> MemoryCandidate:
-    return MemoryCandidate(
-        memory_type="episode",
-        content=content,
-        source_quote=quote,
-        observable_behavior="抱着腿不说话",
-        setting="家门口",
-        contradicts_memory_ids=list(contradiction_ids or []),
-        proposed_decision="auto_commit",
-        content_hash=content_hash("episode", content),
-    )
-
-
-def _hypothesis(content: str) -> MemoryCandidate:
-    return MemoryCandidate(
-        memory_type="hypothesis",
-        content=content,
-        source_quote="",
-        inference=True,
-        proposed_decision="needs_confirmation",
-        scope_conditions=["早上出门时"],
-        content_hash=content_hash("hypothesis", content),
+        content_hash=note_content_hash(
+            content, is_preference=is_preference, inference=inference
+        ),
     )
 
 
@@ -111,7 +97,7 @@ async def child():
     yield {"child_id": child_id, "family_id": str(family_id)}
     async with session_scope() as session:
         uid = uuid.UUID(child_id)
-        for model in (MemoryEvent, Observation, Hypothesis):
+        for model in (MemoryEvent, MemoryItem):
             await session.execute(
                 model.__table__.delete().where(model.child_id == uid)
             )
@@ -119,59 +105,71 @@ async def child():
     await dispose_engine()
 
 
-async def _context(child_id: str) -> dict:
+async def _rows(child_id: str) -> list[MemoryItem]:
     async with session_scope() as session:
-        return await Repository(session).child_context(child_id)
+        return list(
+            (
+                await session.execute(
+                    select(MemoryItem).where(
+                        MemoryItem.child_id == uuid.UUID(child_id)
+                    )
+                )
+            ).scalars().all()
+        )
 
 
-class TestFacts:
-    async def test_same_fact_twice_is_stored_once(self, child):
+async def _context(child_id: str) -> dict:
+    """进 prompt 的那份记忆上下文。"""
+    ctx = await service.load_memory_context(child_id=child_id, query="")
+    return ctx["memory_context"]
+
+
+class TestNotes:
+    async def test_same_note_twice_is_stored_once(self, child):
         cid = child["child_id"]
         text_ = "孩子今年五岁了"
-        await _commit(cid, text_, [_fact("孩子 5 岁", quote="孩子今年五岁了")])
+        await _commit(cid, text_, [_note("孩子 5 岁", quote="孩子今年五岁了")])
         await _commit(
             cid,
             text_,
-            [_fact("孩子 5 岁", quote="孩子今年五岁了")],
+            [_note("孩子 5 岁", quote="孩子今年五岁了")],
             turn_id="t2",
         )
-        ctx = await _context(cid)
-        assert ctx["confirmed_facts"] == ["孩子 5 岁"]
+        rows = await _rows(cid)
+        assert len(rows) == 1
 
-    async def test_correction_replaces_the_value_in_context(self, child):
+    async def test_correction_supersedes_the_old_value(self, child):
         cid = child["child_id"]
-        await _commit(cid, "孩子今年四岁了", [_fact("孩子 4 岁", quote="孩子今年四岁了")])
-
-        async with session_scope() as session:
-            from rdi_agent.db.repositories.memory import MemoryRepository
-
-            items = await MemoryRepository(session).load_fact_items(cid)
-        old_id = items[0].id
+        await _commit(cid, "孩子今年四岁了", [_note("孩子 4 岁", quote="孩子今年四岁了")])
+        rows = await _rows(cid)
+        old_id = f"mi_{rows[0].id.hex}"
 
         result = await _commit(
             cid,
             "不是四岁，是五岁",
-            [_fact("孩子 5 岁", quote="不是四岁，是五岁", replaces=old_id)],
+            [_note("孩子 5 岁", quote="不是四岁，是五岁", replaces=old_id)],
             turn_id="t2",
         )
         assert result.superseded_facts == ["孩子 4 岁"]
 
-        ctx = await _context(cid)
-        assert ctx["confirmed_facts"] == ["孩子 5 岁"]
+        rows = await _rows(cid)
+        statuses = {r.content: r.status for r in rows}
+        assert statuses["孩子 4 岁"] == "superseded"
+        assert statuses["孩子 5 岁"] == "active"
 
     async def test_delete_hides_memory_everywhere(self, child):
         cid = child["child_id"]
-        await _commit(cid, "孩子今年五岁了", [_fact("孩子 5 岁", quote="孩子今年五岁了")])
-        async with session_scope() as session:
-            from rdi_agent.db.repositories.memory import MemoryRepository
-
-            items = await MemoryRepository(session).load_fact_items(cid)
+        await _commit(cid, "孩子今年五岁了", [_note("孩子 5 岁", quote="孩子今年五岁了")])
+        rows = await _rows(cid)
+        memory_id = f"mi_{rows[0].id.hex}"
 
         await service.delete_memory(
-            child_id=cid, family_id=child["family_id"], memory_id=items[0].id
+            child_id=cid, family_id=child["family_id"], memory_id=memory_id
         )
         ctx = await _context(cid)
-        assert ctx["confirmed_facts"] == []
+        assert not ctx["summaries"]
+        assert not ctx["preferences"]
+        assert not ctx["inferences"]
 
         async with session_scope() as session:
             listed = await list_memories(
@@ -181,7 +179,7 @@ class TestFacts:
 
     async def test_events_are_not_duplicated_on_retry(self, child):
         cid = child["child_id"]
-        candidate = _fact("孩子 5 岁", quote="孩子今年五岁了")
+        candidate = _note("孩子 5 岁", quote="孩子今年五岁了")
         await _commit(cid, "孩子今年五岁了", [candidate], turn_id="same")
         await _commit(cid, "孩子今年五岁了", [candidate], turn_id="same")
 
@@ -196,58 +194,29 @@ class TestFacts:
             ).scalars().all()
         assert len(count) == 1
 
-
-class TestObservations:
-    async def test_duplicate_observation_is_stored_once(self, child):
-        cid = child["child_id"]
-        candidate = _episode("早上出门抱着腿不说话", quote="早上出门一直抱着我的腿")
-        await _commit(cid, "早上出门一直抱着我的腿", [candidate])
-        await _commit(
-            cid, "早上出门一直抱着我的腿", [candidate], turn_id="t2"
-        )
-        async with session_scope() as session:
-            rows = (
-                await session.execute(
-                    select(Observation).where(
-                        Observation.child_id == uuid.UUID(cid)
-                    )
-                )
-            ).scalars().all()
-        assert len(rows) == 1
-
-    async def test_counter_example_weakens_hypothesis(self, child):
-        """验收第 7 条：反例要真的削弱假设，不能只是记一笔。"""
+    async def test_preference_is_stored_but_not_merged(self, child):
+        """偏好是硬约束：照写，但**不进类目小结**。"""
         cid = child["child_id"]
         await _commit(
             cid,
-            "每天早上出门一直抱着我的腿",
-            [_hypothesis("可能在和妈妈分开时会紧张")],
+            "我不希望他被批评",
+            [_note("我不希望他被批评", quote="我不希望他被批评", is_preference=True)],
         )
-        async with session_scope() as session:
-            hyp = (
-                await session.execute(
-                    select(Hypothesis).where(
-                        Hypothesis.child_id == uuid.UUID(cid)
-                    )
-                )
-            ).scalars().one()
-        hyp_id = f"hyp_{hyp.id.hex}"
+        ctx = await _context(cid)
+        assert ctx["preferences"] == ["我不希望他被批评"]
+        assert not ctx["summaries"]
 
+    async def test_inference_is_stored_but_not_merged(self, child):
+        """推断照写、标出来，但**不进类目小结** —— 合并会把猜测变成事实。"""
+        cid = child["child_id"]
         await _commit(
             cid,
-            "今天出门他主动跟我挥手了",
-            [_episode("今天出门主动挥手告别", quote="今天出门他主动跟我挥手了", contradiction_ids=[hyp_id])],
-            turn_id="t2",
+            "他最近不太想去幼儿园",
+            [_note("可能是分离焦虑", quote="", inference=True)],
         )
-
-        async with session_scope() as session:
-            updated = await session.get(Hypothesis, hyp.id)
-        assert updated is not None
-        assert updated.status == "weakened"
-        assert updated.confidence_level == "low"
-        # 反例列表里存的是**观察**的 id（哪一次观察推翻了这个假设）
-        ids = updated.contradicting_observation_ids_json or []
-        assert len(ids) == 1 and ids[0].startswith("obs_")
+        ctx = await _context(cid)
+        assert [x["content"] for x in ctx["inferences"]] == ["可能是分离焦虑"]
+        assert not ctx["summaries"]
 
 
 class TestExtraction:
@@ -264,23 +233,16 @@ class TestExtraction:
                 MemoryExtractionResult(
                     candidates=[
                         MemoryCandidateDraft(
-                            memory_type="fact",
                             content="孩子 5 岁",
+                            category="other",
+                            is_preference=False,
+                            inference=False,
                             source_quote="孩子今年五岁了",
                             confidence=0.9,
-                            inference=False,
                             proposed_decision="auto_commit",
                             reason="家长明确说了",
                             replaces_memory_id="",
-                            contradicts_memory_ids=[],
                             scope_conditions=[],
-                            setting="",
-                            antecedent="",
-                            observable_behavior="",
-                            adult_response="",
-                            child_response="",
-                            outcome="",
-                            is_attempt=False,
                         )
                     ],
                     notes=[],
@@ -328,23 +290,16 @@ class TestGraphIntegration:
         )
 
         draft = MemoryCandidateDraft(
-            memory_type="fact",
             content="孩子 5 岁",
+            category="other",
+            is_preference=False,
+            inference=False,
             source_quote="孩子今年五岁了",
             confidence=0.9,
-            inference=False,
             proposed_decision="auto_commit",
             reason="家长明确说了",
             replaces_memory_id="",
-            contradicts_memory_ids=[],
             scope_conditions=[],
-            setting="",
-            antecedent="",
-            observable_behavior="",
-            adult_response="",
-            child_response="",
-            outcome="",
-            is_attempt=False,
         )
 
         async def fake_chat_json(**kwargs):
@@ -388,8 +343,8 @@ class TestGraphIntegration:
 
         # 停在追问中断上 —— 这一轮的记忆应该已经写完了
         assert result.get("__interrupt__")
-        ctx = await _context(cid)
-        assert "孩子 5 岁" in ctx["confirmed_facts"]
+        rows = await _rows(cid)
+        assert [r.content for r in rows] == ["孩子 5 岁"]
         assert result["memory_update_result"]["created"]
 
 
@@ -405,16 +360,13 @@ class TestIsolation:
 
     async def test_other_family_cannot_delete(self, child):
         cid = child["child_id"]
-        await _commit(cid, "孩子今年五岁了", [_fact("孩子 5 岁", quote="孩子今年五岁了")])
-        async with session_scope() as session:
-            from rdi_agent.db.repositories.memory import MemoryRepository
-
-            items = await MemoryRepository(session).load_fact_items(cid)
+        await _commit(cid, "孩子今年五岁了", [_note("孩子 5 岁", quote="孩子今年五岁了")])
+        rows = await _rows(cid)
         assert (
             await service.delete_memory(
                 child_id=cid,
                 family_id=str(uuid.uuid4()),
-                memory_id=items[0].id,
+                memory_id=f"mi_{rows[0].id.hex}",
             )
             is None
         )

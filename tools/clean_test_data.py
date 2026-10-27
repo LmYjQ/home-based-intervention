@@ -44,8 +44,7 @@ BUSINESS_TABLES = [
     "plans",
     "trials",
     "feedbacks",
-    "observations",
-    "hypotheses",
+    "memory_items",
     "memory_events",
 ]
 

@@ -103,19 +103,16 @@ class Repository:
     async def child_context(self, child_id: str) -> dict[str, Any]:
         """给 prompt 用的最小上下文。刻意很薄，别把整张表塞进去。
 
-        **事实只给"活着的"**：阶段 3 之后 ``confirmed_facts_json`` 里
-        可能躺着已作废、已删除的条目（审计要留）。把它们喂给模型，
-        家长纠正过的旧信息就又回来了 —— 这正是阶段 3 要防的事。
-
-        旧数据是裸字符串数组，:func:`normalize_fact_items` 兼容。
+        **这里只有"这个孩子是谁"**：年龄、家里什么情况、已知背景。
+        记忆（类目小结 / 偏好 / 推断）由记忆层单独装配
+        （见 :func:`rdi_agent.memory.service.load_memory_context`），
+        两者在图里合成同一个 ``child_context``。
         """
         from rdi_agent.age import describe_age
-        from rdi_agent.memory.facts import active_facts, normalize_fact_items
 
         child = await self.session.get(Child, uuid.UUID(str(child_id)))
         if child is None:
             return {}
-        live = active_facts(normalize_fact_items(child.confirmed_facts_json))
         # **年龄每次现算**：家长可能用这个系统好几年，
         # 存下来的年龄过一年就是错的。
         age = describe_age(child.birth_date)
@@ -129,12 +126,6 @@ class Repository:
             "age_band": age.get("age_band") or child.age_band,
             "family_goals": child.family_goals_json or [],
             "known_contexts": child.known_contexts_json or [],
-            "confirmed_facts": [
-                x.content for x in live if x.memory_type == "fact"
-            ],
-            "preferences": [
-                x.content for x in live if x.memory_type == "preference"
-            ],
             "communication_profile": child.communication_profile_json or {},
             "strengths_interests": child.strengths_interests_json or [],
             "support_preferences": child.support_preferences_json or {},

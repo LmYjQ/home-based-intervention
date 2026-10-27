@@ -607,23 +607,12 @@ async function refreshMemories() {
   }
 }
 
-async function onMemoryConfirm(item) {
-  const data = await run(() =>
-    api.confirmMemory(childId.value, item.memory_id, memoryActionPayload()),
-  )
-  if (data) await refreshMemories()
-}
-
-async function onMemoryCorrect({ memory, content }) {
-  const data = await run(() =>
-    api.correctMemory(childId.value, memory.memory_id, {
-      ...memoryActionPayload(),
-      content,
-    }),
-  )
-  if (data) await refreshMemories()
-}
-
+// 记忆现在是**自动维护**的 —— 面板只留"删除"。
+//
+// 2026-10-27：去掉了"确认"和"纠正"两个按钮。
+// "确认"那一档已经不存在了（没有待确认队列）；
+// "纠正"走对话更自然：家长在聊天里说"不是这样，是五岁"，
+// 系统走的是同一套纠正链路，但不用先来面板里逐条点一遍。
 async function onMemoryDelete(item) {
   const data = await run(() =>
     api.deleteMemory(childId.value, item.memory_id, memoryActionPayload()),
@@ -1259,10 +1248,7 @@ onMounted(async () => {
       <div>
         <MemoryPanel
           :memories="memories"
-          :pending="memoryPending"
           :busy="busy"
-          @confirm="onMemoryConfirm"
-          @correct="onMemoryCorrect"
           @delete="onMemoryDelete"
         />
 

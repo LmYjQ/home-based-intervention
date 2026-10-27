@@ -6,7 +6,7 @@
 - ``knowledge_chunks.embedding`` 是 pgvector 的 ``vector(1024)``。
 - ``content_tsv`` 是生成列（STORED），由 Postgres 维护，迁移里用
   ``GENERATED ALWAYS AS ... STORED`` 建，ORM 这边只是普通列。
-- 不建"什么都能装"的 memory_items：四类记忆落四张语义表。
+- 记忆只有两张表：``memory_items``（短句）和 ``children`` 上的类目小结。
 """
 
 from __future__ import annotations
@@ -205,7 +205,18 @@ class Child(Base):
     support_preferences_json: Mapped[dict] = mapped_column(JSONB, default=dict)
     family_goals_json: Mapped[list] = mapped_column(JSONB, default=list)
     known_contexts_json: Mapped[list] = mapped_column(JSONB, default=list)
-    confirmed_facts_json: Mapped[list] = mapped_column(JSONB, default=list)
+    # **类目小结**：按类目归纳出来的"这个孩子目前是什么样"。
+    #
+    # **为什么和 memory_items 分开放**：
+    # 那边是**家长说过的一句句短话**，这边是**系统归纳**出来的。
+    # 语义不同、状态不同、生命周期不同 —— 混在一列里，
+    # 代码就得靠某个字段去猜这条是家长说的还是系统推的。
+    #
+    # 每个类目同时只有一条活的（status='active'），
+    # 新的归纳出来会把旧的标 superseded（见 memory/summaries.py）。
+    memory_summaries_json: Mapped[list] = mapped_column(
+        JSONB, default=list, server_default="[]"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -355,27 +366,49 @@ class Feedback(Base):
     )
 
 
-class Observation(Base):
-    """情境观察（L2）。只写"发生了什么"，不写"孩子就是XX型"。"""
+class MemoryItem(Base):
+    """短句记忆（两层设计的第一层产物）。
 
-    __tablename__ = "observations"
+    **它是什么**：家长的一段话被拆成的**短句**，每句只讲一件事，
+    而且已经归好类目（第二层）。同类合并之后变成
+    ``children.memory_summaries_json`` 里的类目小结 ——
+    **进 prompt 的是小结，不是短句**。
+
+    **为什么不再分事实 / 观察 / 假设**：那三种类型让"这条记忆怎么用"
+    取决于它被归成哪一类，而不是取决于它说了什么。
+    家长说的"在幼儿园门口哭"和"我不希望他被批评"都是他说的，
+    但后者是硬约束、不能被合并 —— 那是**用途**的区别，
+    所以用两个开关（``is_preference`` / ``inference``）来区分，
+    而不是三种类型。
+
+    **两个开关各自的作用**：
+    - ``is_preference`` —— 家长希望怎样 / 不希望怎样。**不参与合并**，
+      直接进 prompt 当硬约束。
+    - ``inference`` —— 系统自己推断的，家长没这么说。
+      **不参与合并**（合并会把猜测写成事实），
+      进 prompt 时标成"未验证的推测"。
+
+    两个都关掉的才是普通短句 —— 只有它们参与类目合并。
+    """
+
+    __tablename__ = "memory_items"
     __table_args__ = (
-        Index("idx_observations_child_time", "child_id", "observed_at"),
-        # 同一条观察重复抽到只留一行。谓词把已作废/已删除的排除掉 ——
-        # 以后同样的事再发生一次，是一条**新的**观察，不该被旧行挡住。
+        Index("idx_memory_items_child_time", "child_id", "observed_at"),
+        # 同一条短句重复抽到只留一行。谓词把已作废/已删除的排除掉 ——
+        # 以后同样的事再发生一次，是一条**新的**短句，不该被旧行挡住。
         Index(
-            "uq_observations_child_content",
+            "uq_memory_items_child_content",
             "child_id",
             "content_hash",
             unique=True,
             postgresql_where=text(
                 "deleted_at IS NULL "
-                "AND status IN ('active', 'pending_confirmation') "
+                "AND status = 'active' "
                 "AND content_hash IS NOT NULL"
             ),
         ),
         Index(
-            "idx_observations_child_status_time",
+            "idx_memory_items_child_status_time",
             "child_id",
             "status",
             "observed_at",
@@ -393,27 +426,27 @@ class Observation(Base):
     observed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
-    setting: Mapped[str | None] = mapped_column(String(128))
-    participants_json: Mapped[list] = mapped_column(JSONB, default=list)
-    antecedent: Mapped[str] = mapped_column(Text, default="")
-    observable_behavior: Mapped[str] = mapped_column(Text, default="")
-    adult_response: Mapped[str] = mapped_column(Text, default="")
-    child_response: Mapped[str] = mapped_column(Text, default="")
-    outcome: Mapped[str] = mapped_column(Text, default="")
+    # **一句短句，只讲一件事**。
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # 这条属于哪一类（见 ``memory/categories.py``）。**合并的分组键**。
+    category: Mapped[str | None] = mapped_column(String(32))
+    # 家长希望怎样 / 不希望怎样。**不参与合并**，直接进 prompt。
+    is_preference: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # 系统推断的，家长没这么说。**不参与合并**，进 prompt 时标成推测。
+    inference: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # 成立条件（"在幼儿园门口""每次交接时"）。
+    scope_conditions_json: Mapped[list] = mapped_column(JSONB, default=list)
     source_kind: Mapped[str] = mapped_column(String(32), default="parent_report")
     confidence: Mapped[float | None] = mapped_column()
 
     # ---- 阶段 3：可追溯 / 可纠正 / 不重复 ----
     #
-    # ``content_hash`` 是去重键（memory_type + 归一化内容），跨 turn 生效：
+    # ``content_hash`` 是去重键（用途 + 归一化内容），跨 turn 生效：
     # 追问恢复会换新的 turn_id，按 turn 去重挡不住重复抽取。
     content_hash: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(
         String(16), default="active", nullable=False
     )
-    # 家长说"我们试过 X"记成观察时置 true。**不能**用系统给过的建议反推 ——
-    # "建议过"不等于"做过"，那是 trials 的事。
-    is_attempt: Mapped[bool] = mapped_column(default=False, nullable=False)
     source_interaction_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("interactions.id", ondelete="SET NULL")
     )
@@ -422,69 +455,6 @@ class Observation(Base):
     )
     source_turn_id: Mapped[str | None] = mapped_column(String(64))
     # 家长原话，逐字。审核者靠它核对，没有它这条记忆不可信。
-    source_quote: Mapped[str] = mapped_column(Text, default="", nullable=False)
-    supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
-    superseded_by_memory_id: Mapped[str | None] = mapped_column(String(64))
-    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-
-class Hypothesis(Base):
-    """待验证假设（L3）。模型生成默认 status='candidate'，不能自动升级为事实。"""
-
-    __tablename__ = "hypotheses"
-    __table_args__ = (
-        Index("idx_hypotheses_child_status", "child_id", "status"),
-        Index(
-            "uq_hypotheses_child_content",
-            "child_id",
-            "content_hash",
-            unique=True,
-            postgresql_where=text(
-                "deleted_at IS NULL "
-                "AND status IN ('candidate', 'active', 'weakened') "
-                "AND content_hash IS NOT NULL"
-            ),
-        ),
-        Index(
-            "idx_hypotheses_child_status_updated",
-            "child_id",
-            "status",
-            "updated_at",
-            postgresql_where=text("deleted_at IS NULL"),
-        ),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=_uuid
-    )
-    child_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("children.id"), nullable=False
-    )
-    hypothesis_text: Mapped[str] = mapped_column(Text, nullable=False)
-    supporting_observation_ids_json: Mapped[list] = mapped_column(JSONB, default=list)
-    contradicting_observation_ids_json: Mapped[list] = mapped_column(JSONB, default=list)
-    confidence_level: Mapped[str] = mapped_column(String(16), default="low")
-    scope_conditions_json: Mapped[list] = mapped_column(JSONB, default=list)
-    status: Mapped[str] = mapped_column(String(16), default="candidate")
-    created_by: Mapped[str] = mapped_column(String(32), default="llm")
-    last_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-
-    # ---- 阶段 3 ----
-    content_hash: Mapped[str | None] = mapped_column(String(64))
-    source_interaction_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("interactions.id", ondelete="SET NULL")
-    )
-    source_feedback_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("feedbacks.id", ondelete="SET NULL")
-    )
-    source_turn_id: Mapped[str | None] = mapped_column(String(64))
     source_quote: Mapped[str] = mapped_column(Text, default="", nullable=False)
     supersedes_memory_id: Mapped[str | None] = mapped_column(String(64))
     superseded_by_memory_id: Mapped[str | None] = mapped_column(String(64))

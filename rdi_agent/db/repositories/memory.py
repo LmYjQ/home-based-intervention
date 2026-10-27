@@ -3,12 +3,12 @@
 和 :class:`rdi_agent.db.repositories.case.Repository` 一样：**不自己 commit**，
 事务边界归调用方的 ``session_scope()``。
 
-**这一层只做"取/存"，不做判断**。哪条能自动记、哪条要问家长，
+**这一层只做"取/存"，不做判断**。哪条能记、哪条要丢，
 是 :mod:`rdi_agent.memory.merge` 的事 —— 那部分要能脱离数据库单测。
 
-**事实为什么单独走 JSON**：见 :mod:`rdi_agent.memory.facts` ——
-计划 §10.2 把 L1 放在 ``children`` 上。代价是它没有数据库级唯一约束，
-所以写入前必须 :meth:`lock_child` 拿行锁，否则两个并发请求会各写一份。
+**记忆只有一张表**：``memory_items``（一句短句 + 它的类目）。
+类目小结存在 ``children.memory_summaries_json`` 上 ——
+它是**派生产物**，由短句归纳而来，不是一句一句攒出来的。
 """
 
 from __future__ import annotations
@@ -23,29 +23,22 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from rdi_agent.age import describe_age
 from rdi_agent.db.models import (
     Child,
-    Hypothesis,
     Interaction,
     MemoryEvent,
-    Observation,
+    MemoryItem,
     Plan,
     Trial,
-)
-from rdi_agent.memory.facts import (
-    FactItem,
-    active_facts,
-    forbidden_fact_texts,
-    new_fact_item,
-    normalize_fact_items,
-    pending_facts,
 )
 from rdi_agent.memory.ids import (
     attempt_memory_id,
     content_hash,
-    fact_memory_id,
-    hypothesis_memory_id,
-    observation_memory_id,
+    note_memory_id,
 )
 from rdi_agent.memory.merge import ExistingSnapshot
+from rdi_agent.memory.summaries import (
+    SummaryItem,
+    normalize_summary_items,
+)
 from rdi_agent.schemas.memory import MemoryCandidate
 
 
@@ -57,45 +50,23 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def observation_content(row: Observation) -> str:
-    """把结构化观察拼成一句能读的话。
+def item_content(row: MemoryItem) -> str:
+    """一句短句的正文。
 
-    列表展示、prompt 背景、去重哈希都用它 —— 三处必须是同一份文本，
-    否则"同一条观察"在不同地方算出不同哈希，去重就形同虚设。
+    短句就是一句话，所以正文就是 ``content`` 本身 ——
+    没有结构化字段要拼。
     """
-    parts: list[str] = []
-    if row.setting:
-        parts.append(f"在{row.setting}")
-    if row.antecedent:
-        parts.append(f"当时{row.antecedent}")
-    if row.observable_behavior:
-        parts.append(row.observable_behavior)
-    if row.adult_response:
-        parts.append(f"大人{row.adult_response}")
-    if row.child_response:
-        parts.append(f"孩子{row.child_response}")
-    if row.outcome:
-        parts.append(f"结果{row.outcome}")
-    return "；".join(parts)
+    return row.content or ""
 
 
-_CONFIDENCE_TO_LEVEL = ((0.7, "high"), (0.4, "medium"))
-_LEVEL_TO_CONFIDENCE = {"high": 0.8, "medium": 0.55, "low": 0.3}
-
-
-def confidence_level(value: float) -> str:
-    for threshold, level in _CONFIDENCE_TO_LEVEL:
-        if value >= threshold:
-            return level
-    return "low"
-
-
-def _observation_candidate(row: Observation) -> MemoryCandidate:
+def _item_candidate(row: MemoryItem) -> MemoryCandidate:
     return MemoryCandidate(
-        memory_id=observation_memory_id(row.id),
-        memory_type="episode",
-        content=observation_content(row),
+        memory_id=note_memory_id(row.id),
+        content=item_content(row),
         status=row.status,
+        category=row.category or "other",
+        is_preference=bool(row.is_preference),
+        inference=bool(row.inference),
         content_hash=row.content_hash or "",
         source_interaction_id=str(row.source_interaction_id or ""),
         source_feedback_id=str(row.source_feedback_id or ""),
@@ -103,48 +74,7 @@ def _observation_candidate(row: Observation) -> MemoryCandidate:
         source_kind="feedback" if row.source_feedback_id else "interaction",
         source_quote=row.source_quote or "",
         confidence=float(row.confidence or 0.5),
-        setting=row.setting or "",
-        antecedent=row.antecedent or "",
-        observable_behavior=row.observable_behavior or "",
-        adult_response=row.adult_response or "",
-        child_response=row.child_response or "",
-        outcome=row.outcome or "",
-        is_attempt=bool(row.is_attempt),
-    )
-
-
-def _hypothesis_candidate(row: Hypothesis) -> MemoryCandidate:
-    return MemoryCandidate(
-        memory_id=hypothesis_memory_id(row.id),
-        memory_type="hypothesis",
-        content=row.hypothesis_text,
-        status=row.status,
-        content_hash=row.content_hash or "",
-        source_interaction_id=str(row.source_interaction_id or ""),
-        source_feedback_id=str(row.source_feedback_id or ""),
-        source_turn_id=row.source_turn_id or "",
-        source_kind="feedback" if row.source_feedback_id else "interaction",
-        source_quote=row.source_quote or "",
-        confidence=_LEVEL_TO_CONFIDENCE.get(row.confidence_level, 0.3),
         scope_conditions=[str(x) for x in (row.scope_conditions_json or [])],
-    )
-
-
-def fact_to_candidate(item: FactItem) -> MemoryCandidate:
-    return MemoryCandidate(
-        memory_id=item.id,
-        memory_type=item.memory_type,  # type: ignore[arg-type]
-        content=item.content,
-        status=item.status,
-        content_hash=item.content_hash,
-        source_interaction_id=item.source_interaction_id,
-        source_feedback_id=item.source_feedback_id,
-        source_turn_id=item.source_turn_id,
-        source_kind=item.source_kind,  # type: ignore[arg-type]
-        source_quote=item.source_quote,
-        confidence=item.confidence,
-        scope_conditions=list(item.scope_conditions),
-        replaces_memory_id=item.supersedes_memory_id or "",
     )
 
 
@@ -162,11 +92,11 @@ class MemoryRepository:
         return child
 
     async def lock_child(self, child_id: str) -> Child | None:
-        """锁住 ``children`` 那一行，串行化事实 JSON 的读-改-写。
+        """锁住 ``children`` 那一行，串行化小结 JSON 的读-改-写。
 
-        **为什么必须在事务里**：``confirmed_facts_json`` 上没有唯一索引，
+        **为什么必须在事务里**：``memory_summaries_json`` 上没有唯一索引，
         两个并发请求各自读到同一份数组、各自追加、最后一个覆盖前一个 ——
-        其中一条记忆就这么没了，而且没有任何报错。
+        其中一条小结就这么没了，而且没有任何报错。
         """
         row = (
             await self.session.execute(
@@ -176,48 +106,104 @@ class MemoryRepository:
         return row
 
     # ------------------------------------------------------------ 读取
-    async def load_fact_items(self, child_id: str) -> list[FactItem]:
-        child = await self.session.get(Child, _uid(child_id))
-        if child is None:
-            return []
-        return normalize_fact_items(child.confirmed_facts_json)
-
-    async def load_observations(
-        self, child_id: str, *, limit: int = 20, include_pending: bool = True
-    ) -> list[Observation]:
-        statuses = ["active"] + (["pending_confirmation"] if include_pending else [])
+    async def load_items(
+        self, child_id: str, *, limit: int = 200, include_history: bool = False
+    ) -> list[MemoryItem]:
+        """这个孩子的全部短句。**按时间倒序** —— 最近说的在最前面。"""
+        conds = [MemoryItem.child_id == _uid(child_id)]
+        if include_history:
+            conds.append(MemoryItem.deleted_at.is_(None))
+        else:
+            conds.append(MemoryItem.status == "active")
+            conds.append(MemoryItem.deleted_at.is_(None))
         rows = (
             await self.session.execute(
-                select(Observation)
-                .where(
-                    Observation.child_id == _uid(child_id),
-                    Observation.status.in_(statuses),
-                    Observation.deleted_at.is_(None),
-                )
-                .order_by(Observation.observed_at.desc())
+                select(MemoryItem)
+                .where(*conds)
+                .order_by(MemoryItem.observed_at.desc())
                 .limit(limit)
             )
         ).scalars().all()
         return list(rows)
 
-    async def load_hypotheses(
-        self, child_id: str, *, limit: int = 20
-    ) -> list[Hypothesis]:
+    async def load_merging_items(
+        self, child_id: str, *, limit: int = 200
+    ) -> list[MemoryItem]:
+        """**参与类目合并**的短句。
+
+        只有普通短句参与：偏好是硬约束（合并会丢掉强度），
+        推断是猜测（合并会变成事实）。
+
+        **没有类目的不参与** —— 老行没类目，让模型给它们补类目
+        只会得到一堆编的分类。
+        """
         rows = (
             await self.session.execute(
-                select(Hypothesis)
+                select(MemoryItem)
                 .where(
-                    Hypothesis.child_id == _uid(child_id),
-                    Hypothesis.status.in_(
-                        ["candidate", "active", "weakened"]
+                    MemoryItem.child_id == _uid(child_id),
+                    MemoryItem.status == "active",
+                    MemoryItem.deleted_at.is_(None),
+                    MemoryItem.category.is_not(None),
+                    MemoryItem.is_preference.is_(False),
+                    MemoryItem.inference.is_(False),
+                )
+                .order_by(MemoryItem.observed_at.desc())
+                .limit(limit)
+            )
+        ).scalars().all()
+        return list(rows)
+
+    async def load_preferences(self, child_id: str) -> list[MemoryItem]:
+        """家长的偏好（硬约束）。不参与合并，直接进 prompt。"""
+        rows = (
+            await self.session.execute(
+                select(MemoryItem)
+                .where(
+                    MemoryItem.child_id == _uid(child_id),
+                    MemoryItem.status == "active",
+                    MemoryItem.deleted_at.is_(None),
+                    MemoryItem.is_preference.is_(True),
+                )
+                .order_by(MemoryItem.observed_at.desc())
+            )
+        ).scalars().all()
+        return list(rows)
+
+    async def load_inferences(self, child_id: str) -> list[MemoryItem]:
+        """系统推断出来的短句。进 prompt 时标成"未验证的推测"。"""
+        rows = (
+            await self.session.execute(
+                select(MemoryItem)
+                .where(
+                    MemoryItem.child_id == _uid(child_id),
+                    MemoryItem.status == "active",
+                    MemoryItem.deleted_at.is_(None),
+                    MemoryItem.inference.is_(True),
+                )
+                .order_by(MemoryItem.observed_at.desc())
+            )
+        ).scalars().all()
+        return list(rows)
+
+    async def load_forbidden_texts(self, child_id: str) -> list[str]:
+        """已作废 / 已删除的短句原文。
+
+        **只给代码用**（``parse_parent_input`` 拿它过滤累积事实），
+        **永远不进 prompt** —— 否则家长删掉的隐私会被重新喂回模型。
+        """
+        rows = (
+            await self.session.execute(
+                select(MemoryItem.content).where(
+                    MemoryItem.child_id == _uid(child_id),
+                    (
+                        MemoryItem.status.in_(["superseded", "deleted"])
+                        | MemoryItem.deleted_at.is_not(None)
                     ),
-                    Hypothesis.deleted_at.is_(None),
                 )
-                .order_by(Hypothesis.updated_at.desc())
-                .limit(limit)
             )
         ).scalars().all()
-        return list(rows)
+        return [str(x) for x in rows if x]
 
     async def load_attempts(self, child_id: str, *, limit: int = 3) -> list[dict[str, Any]]:
         rows = (
@@ -247,17 +233,9 @@ class MemoryRepository:
 
     async def load_snapshot(self, child_id: str, source_text: str) -> ExistingSnapshot:
         """合并判定需要的那一份"现有记忆快照"。"""
-        facts = await self.load_fact_items(child_id)
-        observations = await self.load_observations(child_id, limit=30)
-        hypotheses = await self.load_hypotheses(child_id, limit=30)
+        rows = await self.load_items(child_id, limit=300)
         return ExistingSnapshot(
-            facts=[
-                fact_to_candidate(x)
-                for x in facts
-                if x.status in ("confirmed", "pending_confirmation")
-            ],
-            hypotheses=[_hypothesis_candidate(x) for x in hypotheses],
-            observations=[_observation_candidate(x) for x in observations],
+            items=[_item_candidate(x) for x in rows],
             source_text=source_text,
         )
 
@@ -282,71 +260,33 @@ class MemoryRepository:
         return str(found or "")
 
     # ------------------------------------------------------------ 写入
-    async def update_fact_items(self, child: Child, items: list[FactItem]) -> None:
-        """整份替换事实数组。
+    async def update_summary_items(
+        self, child: Child, items: list[SummaryItem]
+    ) -> None:
+        """整份替换小结数组。
 
         **必须重新赋值而不是原地改 list**：SQLAlchemy 对 JSONB 的原地
         变更是看不见的（它比较的是对象身份），改完不会生成 UPDATE。
         """
-        child.confirmed_facts_json = [item.to_dict() for item in items]
+        child.memory_summaries_json = [item.to_dict() for item in items]
         child.updated_at = datetime.now(timezone.utc)
 
-    async def insert_observation(
-        self, *, child_id: str, candidate: MemoryCandidate, status: str
-    ) -> tuple[Observation, bool]:
+    async def insert_item(
+        self, *, child_id: str, candidate: MemoryCandidate, status: str = "active"
+    ) -> tuple[MemoryItem, bool]:
         values = {
             "id": uuid.uuid4(),
             "child_id": _uid(child_id),
             "conversation_id": candidate.conversation_id or None,
-            "setting": candidate.setting or None,
-            "antecedent": candidate.antecedent,
-            "observable_behavior": candidate.observable_behavior or candidate.content,
-            "adult_response": candidate.adult_response,
-            "child_response": candidate.child_response,
-            "outcome": candidate.outcome,
+            "content": candidate.content,
+            "category": candidate.category or None,
+            "is_preference": bool(candidate.is_preference),
+            "inference": bool(candidate.inference),
+            "scope_conditions_json": list(candidate.scope_conditions),
             "source_kind": "parent_report",
             "confidence": candidate.confidence,
             "content_hash": candidate.content_hash,
             "status": status,
-            "is_attempt": candidate.is_attempt,
-            "source_interaction_id": _opt_uuid(candidate.source_interaction_id),
-            "source_feedback_id": _opt_uuid(candidate.source_feedback_id),
-            "source_turn_id": candidate.source_turn_id or None,
-            "source_quote": candidate.source_quote,
-        }
-        stmt = (
-            pg_insert(Observation)
-            .values(**values)
-            .on_conflict_do_nothing()
-            .returning(Observation.id)
-        )
-        new_id = (await self.session.execute(stmt)).scalar_one_or_none()
-        if new_id is None:
-            existing = (
-                await self.session.execute(
-                    select(Observation).where(
-                        Observation.child_id == _uid(child_id),
-                        Observation.content_hash == candidate.content_hash,
-                        Observation.deleted_at.is_(None),
-                        Observation.status.in_(["active", "pending_confirmation"]),
-                    )
-                )
-            ).scalars().first()
-            return existing, False  # type: ignore[return-value]
-        return await self.session.get(Observation, new_id), True  # type: ignore[return-value]
-
-    async def insert_hypothesis(
-        self, *, child_id: str, candidate: MemoryCandidate, status: str
-    ) -> tuple[Hypothesis, bool]:
-        values = {
-            "id": uuid.uuid4(),
-            "child_id": _uid(child_id),
-            "hypothesis_text": candidate.content,
-            "confidence_level": confidence_level(candidate.confidence),
-            "scope_conditions_json": list(candidate.scope_conditions),
-            "status": status,
-            "created_by": "llm" if candidate.inference else "parent",
-            "content_hash": candidate.content_hash,
             "source_interaction_id": _opt_uuid(candidate.source_interaction_id),
             "source_feedback_id": _opt_uuid(candidate.source_feedback_id),
             "source_turn_id": candidate.source_turn_id or None,
@@ -354,55 +294,25 @@ class MemoryRepository:
             "supersedes_memory_id": candidate.replaces_memory_id or None,
         }
         stmt = (
-            pg_insert(Hypothesis)
+            pg_insert(MemoryItem)
             .values(**values)
             .on_conflict_do_nothing()
-            .returning(Hypothesis.id)
+            .returning(MemoryItem.id)
         )
         new_id = (await self.session.execute(stmt)).scalar_one_or_none()
         if new_id is None:
             existing = (
                 await self.session.execute(
-                    select(Hypothesis).where(
-                        Hypothesis.child_id == _uid(child_id),
-                        Hypothesis.content_hash == candidate.content_hash,
-                        Hypothesis.deleted_at.is_(None),
+                    select(MemoryItem).where(
+                        MemoryItem.child_id == _uid(child_id),
+                        MemoryItem.content_hash == candidate.content_hash,
+                        MemoryItem.deleted_at.is_(None),
+                        MemoryItem.status == "active",
                     )
                 )
             ).scalars().first()
             return existing, False  # type: ignore[return-value]
-        return await self.session.get(Hypothesis, new_id), True  # type: ignore[return-value]
-
-    async def weaken_hypothesis(
-        self, *, child_id: str, memory_id: str, observation_memory_id_: str
-    ) -> Hypothesis | None:
-        """给假设挂一条反例，并降一档置信度。
-
-        **反例要真的改变结论**，不能只是记一笔了事 ——
-        计划 §10.5 的原话是"降低置信度或标记 weakened"。
-        所以这里同时做三件事：状态、置信度、反例列表。
-        """
-        row = (
-            await self.session.execute(
-                select(Hypothesis).where(
-                    Hypothesis.child_id == _uid(child_id),
-                    Hypothesis.id == _uid(memory_id),
-                )
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            return None
-        contradicting = list(row.contradicting_observation_ids_json or [])
-        if observation_memory_id_ not in contradicting:
-            contradicting.append(observation_memory_id_)
-        row.contradicting_observation_ids_json = contradicting
-        row.status = "weakened"
-        order = ["low", "medium", "high"]
-        idx = order.index(row.confidence_level) if row.confidence_level in order else 0
-        row.confidence_level = order[max(0, idx - 1)]
-        row.last_reviewed_at = datetime.now(timezone.utc)
-        row.updated_at = datetime.now(timezone.utc)
-        return row
+        return await self.session.get(MemoryItem, new_id), True  # type: ignore[return-value]
 
     async def record_event(
         self,
@@ -456,72 +366,22 @@ def _opt_uuid(value: str | None) -> uuid.UUID | None:
 
 
 # ------------------------------------------------------------------ 读出来给 API 用
-def fact_item_view(item: FactItem) -> dict[str, Any]:
-    return {
-        "memory_id": item.id,
-        "kind": item.memory_type,
-        "memory_type": item.memory_type,
-        "content": item.content,
-        "status": item.status,
-        "confidence": item.confidence,
-        "scope_conditions": list(item.scope_conditions),
-        "source": {
-            "kind": item.source_kind,
-            "interaction_id": item.source_interaction_id or None,
-            "feedback_id": item.source_feedback_id or None,
-            "turn_id": item.source_turn_id or None,
-            "quote": item.source_quote,
-        },
-        "supersedes_memory_id": item.supersedes_memory_id,
-        "superseded_by_memory_id": item.superseded_by_memory_id,
-        "contradicting_observation_ids": [],
-        "is_attempt": False,
-        "created_at": item.created_at or None,
-        "updated_at": item.updated_at or None,
-    }
+def item_view(row: MemoryItem) -> dict[str, Any]:
+    """一条短句的展示口径。
 
-
-def observation_view(row: Observation) -> dict[str, Any]:
+    ``is_preference`` / ``inference`` 两个开关原样带给前端 ——
+    家长要能一眼看出"这句是他说的事实""这句是我系统猜的"。
+    """
     return {
-        "memory_id": observation_memory_id(row.id),
-        "kind": "observation",
-        "memory_type": "episode",
-        "content": observation_content(row),
+        "memory_id": note_memory_id(row.id),
+        "kind": "note",
+        "memory_type": "note",
+        "content": item_content(row),
         "status": row.status,
         "confidence": row.confidence,
-        "setting": row.setting,
-        "antecedent": row.antecedent,
-        "observable_behavior": row.observable_behavior,
-        "adult_response": row.adult_response,
-        "child_response": row.child_response,
-        "outcome": row.outcome,
-        "scope_conditions": [],
-        "source": {
-            "kind": "feedback" if row.source_feedback_id else "interaction",
-            "interaction_id": str(row.source_interaction_id) if row.source_interaction_id else None,
-            "feedback_id": str(row.source_feedback_id) if row.source_feedback_id else None,
-            "turn_id": row.source_turn_id,
-            "quote": row.source_quote,
-        },
-        "supersedes_memory_id": row.supersedes_memory_id,
-        "superseded_by_memory_id": row.superseded_by_memory_id,
-        "contradicting_observation_ids": [],
-        "is_attempt": bool(row.is_attempt),
-        "observed_at": _iso(row.observed_at),
-        "created_at": _iso(row.created_at),
-        "updated_at": _iso(row.updated_at),
-    }
-
-
-def hypothesis_view(row: Hypothesis) -> dict[str, Any]:
-    return {
-        "memory_id": hypothesis_memory_id(row.id),
-        "kind": "hypothesis",
-        "memory_type": "hypothesis",
-        "content": row.hypothesis_text,
-        "status": row.status,
-        "confidence": _LEVEL_TO_CONFIDENCE.get(row.confidence_level, 0.3),
-        "confidence_level": row.confidence_level,
+        "category": row.category,
+        "is_preference": bool(row.is_preference),
+        "inference": bool(row.inference),
         "scope_conditions": [str(x) for x in (row.scope_conditions_json or [])],
         "source": {
             "kind": "feedback" if row.source_feedback_id else "interaction",
@@ -532,13 +392,43 @@ def hypothesis_view(row: Hypothesis) -> dict[str, Any]:
         },
         "supersedes_memory_id": row.supersedes_memory_id,
         "superseded_by_memory_id": row.superseded_by_memory_id,
-        "contradicting_observation_ids": list(
-            row.contradicting_observation_ids_json or []
-        ),
-        "supporting_observation_ids": list(row.supporting_observation_ids_json or []),
-        "is_attempt": False,
+        "observed_at": _iso(row.observed_at),
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
+    }
+
+
+def summary_view(item: SummaryItem) -> dict[str, Any]:
+    """一条类目小结的展示口径。
+
+    **和 ``item_view`` 的区别**：小结多了 ``derived_from`` ——
+    家长要能点开看到"这句话是从哪几句归纳来的"。
+    没有它，系统归纳就是个黑盒，家长没法核对也没法纠正。
+    """
+    return {
+        "memory_id": item.id,
+        "kind": "summary",
+        "memory_type": "summary",
+        "content": item.content,
+        "status": item.status,
+        "confidence_level": item.confidence_level,
+        "category": item.category,
+        "derived_from": list(item.derived_from),
+        "scope_conditions": list(item.scope_conditions),
+        # direct = 明细太少、只是把原话复述了一遍（还没做归纳）。
+        # 前端据此标"仅一次记录"，提醒家长别把它当特点。
+        "source_kind": item.source_kind,
+        "source": {
+            "kind": "consolidated",
+            "interaction_id": item.source_interaction_id or None,
+            "feedback_id": None,
+            "turn_id": item.source_turn_id or None,
+            "quote": item.source_quote,
+        },
+        "supersedes_memory_id": item.supersedes_memory_id,
+        "superseded_by_memory_id": item.superseded_by_memory_id,
+        "created_at": item.created_at or None,
+        "updated_at": item.updated_at or None,
     }
 
 
@@ -557,61 +447,25 @@ async def list_memories(
     if child is None:
         return {}
 
-    wanted = types or {"fact", "preference", "observation", "hypothesis", "attempt"}
+    wanted = types or {"summary", "note", "attempt"}
     items: list[dict[str, Any]] = []
 
-    if {"fact", "preference"} & wanted:
-        for item in normalize_fact_items(child.confirmed_facts_json):
-            if item.memory_type not in wanted:
-                continue
-            # **待确认的要显示** —— 它正是"等家长点确认"的那些条目。
-            # 默认列表只藏起作废和删除的。
-            if not include_history and (
-                item.deleted_at
-                or item.status not in ("confirmed", "pending_confirmation")
-            ):
-                continue
-            items.append(fact_item_view(item))
-
-    if "observation" in wanted:
-        statuses = ["active", "pending_confirmation"]
+    if "summary" in wanted:
+        statuses = ["active"]
         if include_history:
             statuses += ["superseded", "deleted"]
-        conds = [
-            Observation.child_id == _uid(child_id),
-            Observation.status.in_(statuses),
-        ]
-        if not include_history:
-            conds.append(Observation.deleted_at.is_(None))
-        rows = (
-            await session.execute(
-                select(Observation)
-                .where(*conds)
-                .order_by(Observation.observed_at.desc())
-                .limit(limit)
-            )
-        ).scalars().all()
-        items.extend(observation_view(r) for r in rows)
+        for item in normalize_summary_items(child.memory_summaries_json):
+            if item.status not in statuses:
+                continue
+            if not include_history and item.deleted_at:
+                continue
+            items.append(summary_view(item))
 
-    if "hypothesis" in wanted:
-        statuses = ["candidate", "active", "weakened"]
-        if include_history:
-            statuses += ["superseded", "deleted"]
-        conds = [
-            Hypothesis.child_id == _uid(child_id),
-            Hypothesis.status.in_(statuses),
-        ]
-        if not include_history:
-            conds.append(Hypothesis.deleted_at.is_(None))
-        rows = (
-            await session.execute(
-                select(Hypothesis)
-                .where(*conds)
-                .order_by(Hypothesis.updated_at.desc())
-                .limit(limit)
-            )
-        ).scalars().all()
-        items.extend(hypothesis_view(r) for r in rows)
+    if "note" in wanted:
+        rows = await repo.load_items(
+            child_id, limit=limit, include_history=include_history
+        )
+        items.extend(item_view(r) for r in rows)
 
     if "attempt" in wanted:
         items.extend(await repo.load_attempts(child_id, limit=5))
@@ -630,88 +484,14 @@ async def list_memories(
         "age_band": age.get("age_band") or child.age_band,
         "memories": items[:limit],
         "counts": counts,
-        "pending_confirmation": sum(
-            1 for x in items if x["status"] == "pending_confirmation"
-        ),
         "truncated": len(items) > limit,
     }
 
 
-def build_context_patch(child: Child) -> dict[str, Any]:
-    """写完之后重新算一遍给 prompt 的上下文片段。"""
-    items = normalize_fact_items(child.confirmed_facts_json)
-    live = active_facts(items)
-    pend = pending_facts(items)
-    return {
-        "confirmed_facts": [x.content for x in live if x.memory_type == "fact"],
-        "preferences": [x.content for x in live if x.memory_type == "preference"],
-        "forbidden_fact_texts": forbidden_fact_texts(items),
-        "pending_fact_texts": [x.content for x in pend],
-    }
-
-
-def new_fact_from_candidate(
-    candidate: MemoryCandidate,
-    *,
-    existing: list[FactItem],
-    status: str,
-    supersedes_memory_id: str | None = None,
-) -> FactItem:
-    return new_fact_item(
-        memory_type=str(candidate.memory_type),
-        content=candidate.content,
-        digest=candidate.content_hash
-        or content_hash(str(candidate.memory_type), candidate.content),
-        existing=existing,
-        status=status,
-        source_interaction_id=candidate.source_interaction_id,
-        source_feedback_id=candidate.source_feedback_id,
-        source_turn_id=candidate.source_turn_id,
-        source_kind=candidate.source_kind,
-        source_quote=candidate.source_quote,
-        confidence=candidate.confidence,
-        scope_conditions=candidate.scope_conditions,
-        supersedes_memory_id=supersedes_memory_id,
-    )
-
-
-def mark_fact_superseded(
-    items: list[FactItem], target_id: str, new_id: str
-) -> FactItem | None:
-    for item in items:
-        if item.id == target_id:
-            item.status = "superseded"
-            item.superseded_by_memory_id = new_id
-            item.updated_at = datetime.now(timezone.utc).isoformat()
-            return item
-    return None
-
-
-def mark_fact_deleted(items: list[FactItem], target_id: str) -> FactItem | None:
-    for item in items:
-        if item.id == target_id:
-            item.status = "deleted"
-            item.deleted_at = datetime.now(timezone.utc).isoformat()
-            item.updated_at = item.deleted_at
-            return item
-    return None
-
-
-def find_fact(items: list[FactItem], memory_id: str) -> FactItem | None:
-    return next((x for x in items if x.id == memory_id), None)
-
-
 __all__ = [
     "MemoryRepository",
-    "build_context_patch",
-    "fact_memory_id",
-    "fact_to_candidate",
-    "find_fact",
+    "item_content",
+    "item_view",
     "list_memories",
-    "mark_fact_deleted",
-    "mark_fact_superseded",
-    "new_fact_from_candidate",
-    "observation_content",
-    "observation_view",
-    "hypothesis_view",
+    "summary_view",
 ]

@@ -46,7 +46,11 @@ async def list_memories(
     family_id: Annotated[str, Query(description="孩子所属家庭，用于校验归属")],
     types: Annotated[
         str | None,
-        Query(description="逗号分隔：fact,preference,observation,hypothesis,attempt"),
+        Query(
+            description=(
+                "逗号分隔：summary,note,attempt"
+            )
+        ),
     ] = None,
     include_history: Annotated[
         bool, Query(description="是否返回已作废/已删除的记忆")
@@ -77,7 +81,13 @@ async def list_memories(
 async def confirm_memory(
     child_id: str, memory_id: str, req: MemoryActionRequest
 ) -> dict[str, Any]:
-    """确认一条待确认的记忆。幂等：重复确认不会写第二条审计。"""
+    """确认一条待确认的记忆。幂等：重复确认不会写第二条审计。
+
+    **2026-10-27 起基本不用了** —— 记忆改成自动维护，
+    系统不再产生 ``pending_confirmation`` 状态。
+    这个接口留着，是为了处理自动维护之前攒下的历史数据
+    （那些条目确实还挂在待确认状态上）。
+    """
     result = await memory_service.confirm_memory(
         child_id=child_id,
         family_id=req.family_id,
@@ -98,6 +108,14 @@ async def correct_memory(
 
     **不覆盖历史**：新建一条，旧的标 ``superseded`` 并互相链接。
     下一次回答只看得见新的那条。
+
+    **类目小结（``summ_``）不支持纠正** —— 它是派生产物，
+    由该类目下的原始记录归纳而来，下一轮合并会按类目全量重算。
+    要改小结的内容，该改的是它归纳自的那几条原始记录
+    （家长在对话里说"不是这样"就会走那条链路）。
+
+    **2026-10-27 起前端不再调这个接口** —— 纠正走对话更自然，
+    家长不用先来面板里逐条点一遍。
     """
     if not req.content.strip():
         raise HTTPException(400, "纠正后的内容不能为空")

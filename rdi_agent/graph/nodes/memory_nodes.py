@@ -167,8 +167,9 @@ async def commit_memory(state: CoachState) -> dict[str, Any]:
         "child_context": child_context,
         "memory_forbidden_facts": forbidden,
         "memory_context": {
-            "confirmed_facts": child_context.get("confirmed_facts") or [],
+            "summaries": child_context.get("summaries") or [],
             "preferences": child_context.get("preferences") or [],
+            "inferences": child_context.get("inferences") or [],
             **(child_context.get("memories") or {}),
         },
     }
@@ -177,3 +178,41 @@ async def commit_memory(state: CoachState) -> dict[str, Any]:
 def route_after_memory(state: CoachState) -> str:
     """两条入口在记忆之后回到各自的下一步。"""
     return "feedback" if state.get("entrypoint") == "feedback" else "chat"
+
+
+async def consolidate_memories(state: CoachState) -> dict[str, Any]:
+    """把同类观察归纳成一条小结。
+
+    **放在整条链的最前面**：进 prompt 的观察记忆只有小结，
+    所以小结必须在"读上下文"之前就绪 —— 否则这一轮读到的
+    还是上一版小结，合并的效果要晚一轮才看得到。
+
+    **为什么放轮首而不是写完就合**：写完就合会拖慢家长这一轮的回答；
+    而归纳出来的内容要等下一轮才真正进 prompt（prompt 是轮首读的），
+    早合晚合对家长没有区别。
+
+    **失败一律降级**：合不了就用上一版小结（没有就当没小结），
+    这一轮照常回答 —— 合并是增强项。
+    """
+    if _disabled(state):
+        return {}
+    if not get_settings().memory_consolidation_enabled:
+        return {}
+
+    child_id = state.get("child_id") or ""
+    if not child_id:
+        return {}
+
+    try:
+        notes = await memory_service.consolidate(
+            child_id=child_id,
+            conversation_id=state.get("conversation_id") or "",
+            turn_id=state.get("turn_id") or "",
+        )
+    except Exception as e:  # noqa: BLE001 - 合并失败不该拖垮整轮
+        return {
+            "memory_notes": _note(
+                state, f"记忆合并失败（本轮用上一版小结）：{type(e).__name__}: {e}"
+            )
+        }
+    return {"memory_notes": [*notes, *(state.get("memory_notes") or [])]}

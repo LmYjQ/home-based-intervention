@@ -63,6 +63,10 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_node("extract_memories", mem.extract_memories)
     g.add_node("merge_memories", mem.merge_memories)
     g.add_node("commit_memory", mem.commit_memory)
+    # 合并（归纳）：把同类观察压成一条小结。
+    # **接在 START 之后** —— 读上下文之前就得有小结，
+    # 否则这一轮拿到的还是上一版。
+    g.add_node("consolidate_memories", mem.consolidate_memories)
 
     # ---- 聊天入口 ----
     g.add_node("load_context", chat.load_context)
@@ -98,8 +102,12 @@ def build_graph(checkpointer: Any | None = None) -> Any:
     g.add_node("finalize_feedback", fb.finalize_feedback)
 
     # ---- 分流 ----
+    #
+    # 合并先于分流：两个入口都要用到小结
+    # （聊天入口读上下文，feedback 入口的 load_feedback_context 也读）。
+    g.add_edge(START, "consolidate_memories")
     g.add_conditional_edges(
-        START,
+        "consolidate_memories",
         route_entry,
         {"chat": "load_context", "feedback": "capture_feedback"},
     )

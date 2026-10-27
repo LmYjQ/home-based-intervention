@@ -16,10 +16,10 @@ from sqlalchemy import text
 from rdi_agent.api import conversations as conv_api
 from rdi_agent.api import memory as mem_api
 from rdi_agent.db.engine import dispose_engine, get_engine, session_scope
-from rdi_agent.db.models import Child, Hypothesis, MemoryEvent, Observation
+from rdi_agent.db.models import Child, MemoryEvent, MemoryItem
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.memory import service
-from rdi_agent.memory.ids import content_hash
+from rdi_agent.memory.ids import note_content_hash
 from rdi_agent.schemas.memory import MemoryCandidate
 
 
@@ -38,13 +38,24 @@ def _needs_db() -> bool:
 pytestmark = pytest.mark.skipif(not _needs_db(), reason="本地没有 Postgres")
 
 
-def _fact(content: str, quote: str) -> MemoryCandidate:
+def _note(
+    content: str,
+    quote: str,
+    *,
+    category: str = "other",
+    is_preference: bool = False,
+    inference: bool = False,
+) -> MemoryCandidate:
     return MemoryCandidate(
-        memory_type="fact",
         content=content,
+        category=category,
+        is_preference=is_preference,
+        inference=inference,
         source_quote=quote,
         proposed_decision="auto_commit",
-        content_hash=content_hash("fact", content),
+        content_hash=note_content_hash(
+            content, is_preference=is_preference, inference=inference
+        ),
     )
 
 
@@ -72,22 +83,44 @@ async def child():
     yield {"child_id": child_id, "family_id": str(family_id)}
     async with session_scope() as session:
         uid = uuid.UUID(child_id)
-        for model in (MemoryEvent, Observation, Hypothesis):
+        for model in (MemoryEvent, MemoryItem):
             await session.execute(model.__table__.delete().where(model.child_id == uid))
         await session.execute(Child.__table__.delete().where(Child.id == uid))
     await dispose_engine()
 
 
 class TestList:
-    async def test_list_returns_seeded_fact(self, child):
-        await _seed(child["child_id"], "孩子今年五岁了", [_fact("孩子 5 岁", "孩子今年五岁了")])
+    async def test_list_returns_seeded_note(self, child):
+        await _seed(
+            child["child_id"], "孩子今年五岁了", [_note("孩子 5 岁", "孩子今年五岁了")]
+        )
         result = await mem_api.list_memories(
             child_id=child["child_id"], family_id=child["family_id"]
         )
         contents = [m["content"] for m in result["memories"]]
         assert "孩子 5 岁" in contents
-        assert result["counts"]["fact"] == 1
+        assert result["counts"]["note"] == 1
         assert result["memories"][0]["source"]["quote"] == "孩子今年五岁了"
+
+    async def test_list_marks_preference_and_inference(self, child):
+        await _seed(
+            child["child_id"],
+            "我不希望他被批评",
+            [
+                _note(
+                    "我不希望他被批评",
+                    "我不希望他被批评",
+                    category="family",
+                    is_preference=True,
+                )
+            ],
+        )
+        listed = await mem_api.list_memories(
+            child_id=child["child_id"], family_id=child["family_id"]
+        )
+        item = listed["memories"][0]
+        assert item["is_preference"] is True
+        assert item["inference"] is False
 
     async def test_wrong_family_is_not_found(self, child):
         with pytest.raises(HTTPException) as exc:
@@ -98,35 +131,10 @@ class TestList:
 
 
 class TestMutate:
-    async def test_confirm_pending_fact(self, child):
-        await _seed(
-            child["child_id"],
-            "他说不想上幼儿园",
-            [
-                MemoryCandidate(
-                    memory_type="fact",
-                    content="孩子最近不想上幼儿园",
-                    source_quote="他说不想上幼儿园",
-                    proposed_decision="needs_confirmation",
-                    content_hash=content_hash("fact", "孩子最近不想上幼儿园"),
-                )
-            ],
-        )
-        listed = await mem_api.list_memories(
-            child_id=child["child_id"], family_id=child["family_id"]
-        )
-        pending = [m for m in listed["memories"] if m["status"] == "pending_confirmation"]
-        assert pending
-
-        result = await mem_api.confirm_memory(
-            child_id=child["child_id"],
-            memory_id=pending[0]["memory_id"],
-            req=mem_api.MemoryActionRequest(family_id=child["family_id"]),
-        )
-        assert result["memory"]["status"] == "confirmed"
-
     async def test_correct_then_old_value_is_gone(self, child):
-        await _seed(child["child_id"], "孩子今年五岁了", [_fact("孩子 5 岁", "孩子今年五岁了")])
+        await _seed(
+            child["child_id"], "孩子今年五岁了", [_note("孩子 5 岁", "孩子今年五岁了")]
+        )
         listed = await mem_api.list_memories(
             child_id=child["child_id"], family_id=child["family_id"]
         )
@@ -154,38 +162,26 @@ class TestMutate:
         )
         assert "孩子 5 岁" in [m["content"] for m in history["memories"]]
 
-    async def test_correct_observation_keeps_history(self, child):
+    async def test_correct_keeps_history(self, child):
         await _seed(
             child["child_id"],
             "早上出门一直抱着我的腿",
-            [
-                MemoryCandidate(
-                    memory_type="episode",
-                    content="早上出门抱着腿不说话",
-                    source_quote="早上出门一直抱着我的腿",
-                    observable_behavior="抱着腿不说话",
-                    setting="家门口",
-                    proposed_decision="auto_commit",
-                    content_hash=content_hash("episode", "早上出门抱着腿不说话"),
-                )
-            ],
+            [_note("早上出门抱着腿不说话", "早上出门一直抱着我的腿")],
         )
         listed = await mem_api.list_memories(
             child_id=child["child_id"], family_id=child["family_id"]
         )
-        observation = next(m for m in listed["memories"] if m["kind"] == "observation")
+        note = next(m for m in listed["memories"] if m["kind"] == "note")
 
         result = await mem_api.correct_memory(
             child_id=child["child_id"],
-            memory_id=observation["memory_id"],
+            memory_id=note["memory_id"],
             req=mem_api.CorrectMemoryRequest(
                 family_id=child["family_id"], content="出门时站在门口不动"
             ),
         )
-        # 展示出来的 content 是结构化字段拼的（还带着原来的场景 "家门口"），
-        # 所以这里只断言纠正后的行为文本在里面。
-        assert "出门时站在门口不动" in result["memory"]["content"]
-        assert result["memory"]["supersedes_memory_id"] == observation["memory_id"]
+        assert result["memory"]["content"] == "出门时站在门口不动"
+        assert result["memory"]["supersedes_memory_id"] == note["memory_id"]
 
         history = await mem_api.list_memories(
             child_id=child["child_id"],
@@ -198,7 +194,9 @@ class TestMutate:
         assert superseded and superseded[0]["superseded_by_memory_id"]
 
     async def test_delete_is_idempotent(self, child):
-        await _seed(child["child_id"], "孩子今年五岁了", [_fact("孩子 5 岁", "孩子今年五岁了")])
+        await _seed(
+            child["child_id"], "孩子今年五岁了", [_note("孩子 5 岁", "孩子今年五岁了")]
+        )
         listed = await mem_api.list_memories(
             child_id=child["child_id"], family_id=child["family_id"]
         )

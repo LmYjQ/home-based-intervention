@@ -71,14 +71,17 @@ class Settings(BaseSettings):
     memory_extract_max_attempts: int = 2
     # 一轮最多处理几条候选。多了说明模型在凑数。
     memory_max_candidates_per_turn: int = 6
-    # 一个孩子的活跃事实上限。到顶之后新的只能等家长确认，
-    # 免得档案被琐碎事实撑爆。
-    memory_max_active_facts: int = 50
-    # 进 prompt 的观察/假设条数（按与当前问题的相关度挑）
-    memory_context_max_observations: int = 5
-    memory_context_max_hypotheses: int = 4
+    # 进 prompt 的**类目小结**条数（按与当前问题的相关度挑）。
+    #
+    # **为什么是小结不是短句**：短句只留在库里，
+    # 参与方案制定的只有每个类目一条归纳后的小结。
+    memory_context_max_summaries: int = 8
+    # 进 prompt 的**系统推断**条数上限。推断是猜测，给得越少越好。
+    memory_context_max_inferences: int = 4
     # prompt 里记忆部分的字符预算。中文 1 token ≈ 1–1.5 字，2000 字 ≈ 1.5k token。
     memory_context_max_chars: int = 2000
+    # 合并（归纳）要不要开。关了的话记忆照常抽取，只是没有小结。
+    memory_consolidation_enabled: bool = True
 
     # 图里要不要用重排。
     #

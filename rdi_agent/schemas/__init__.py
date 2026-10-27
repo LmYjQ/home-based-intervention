@@ -21,15 +21,16 @@ from rdi_agent.schemas.feedback import (
     FeedbackSubmission,
 )
 from rdi_agent.schemas.memory import (
+    ConsolidationResult,
     DecisionType,
     MemoryAction,
     MemoryCandidate,
     MemoryCandidateDraft,
     MemoryDecision,
     MemoryExtractionResult,
-    MemoryType,
     MemoryUpdateResult,
     SourceKind,
+    SummaryDraft,
 )
 from rdi_agent.schemas.recommendation import (
     ApplicationLabel,
@@ -44,6 +45,7 @@ __all__ = [
     "ApplicationLabel",
     "CaseSummary",
     "ChildResponse",
+    "ConsolidationResult",
     "EvidenceBundle",
     "EvidenceDecision",
     "EvidenceItem",
@@ -57,9 +59,9 @@ __all__ = [
     "MemoryCandidateDraft",
     "MemoryDecision",
     "MemoryExtractionResult",
-    "MemoryType",
     "MemoryUpdateResult",
     "SourceKind",
+    "SummaryDraft",
     "NextStep",
     "ParentAction",
     "RecommendationCard",

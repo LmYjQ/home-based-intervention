@@ -70,12 +70,23 @@ def parse_parent_input(
 # 都要遵守同一套口径。写两遍迟早会写得不一样 ——
 # 而"假设被当成事实"这种事，出一次就让家长觉得系统在给他孩子下结论。
 _MEMORY_RULES = """
-**关于 known_facts / known_preferences / known_contexts**：
-这些是以前几轮里确认过的信息。**已经知道的事不要再问一遍** ——
+**关于 known_contexts**：
+这些是以前几轮里确认过的背景。**已经知道的事不要再问一遍** ——
 换个说法问同一件事，家长会觉得在被反复盘问。
 如果 case_summary 和这里冲突，**以这里为准**（那是家长确认或纠正过的）。
 
-**关于 active_hypotheses**：这些是**还没验证的猜测**，不是事实。
+**关于 known_summaries**：这是系统把同一个方面下**多次出现**的情况
+归纳成的一句话（每条都带 `scope_conditions` 成立条件）。
+- **已经归纳出来的事不要再问一遍** —— 想问"在幼儿园会怎样"之前，
+  先看有没有相关的小结。
+- 但要注意条件：写的是"在幼儿园门口会哭"，问的时候就要问
+  "在幼儿园门口"，不能扩大成"在园会不会哭"。
+
+**关于 known_preferences**：这是家长明确说过的**硬约束**
+（"我不希望他被批评""老师说话要慢一点"）。
+建议里**绝对不能违背**。它们不是孩子的情况，是家长对怎么做的要求。
+
+**关于 known_inferences**：这些是**系统自己猜的**，家长没这么说过。
 不要当成已知情况，也不要基于它给确定性判断。可以用它来决定"还该问什么"，
 但不能把它写进给家长的建议里当作结论。
 """
@@ -171,11 +182,15 @@ def check_sufficiency(
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
             "asked_qa": asked_qa or [],
-            "known_facts": context.get("confirmed_facts") or [],
-            "known_preferences": context.get("preferences") or [],
             "known_contexts": context.get("known_contexts") or [],
-            "active_hypotheses": (context.get("memories") or {}).get(
-                "hypotheses", []
+            "known_summaries": (context.get("memories") or {}).get(
+                "summaries", []
+            ),
+            "known_preferences": (context.get("memories") or {}).get(
+                "preferences", []
+            ),
+            "known_inferences": (context.get("memories") or {}).get(
+                "inferences", []
             ),
         },
         ensure_ascii=False,
@@ -240,11 +255,15 @@ def generate_followup(
             "followup_rounds_done": followup_rounds,
             "asked_questions": asked_questions or [],
             "asked_qa": asked_qa or [],
-            "known_facts": context.get("confirmed_facts") or [],
-            "known_preferences": context.get("preferences") or [],
             "known_contexts": context.get("known_contexts") or [],
-            "active_hypotheses": (context.get("memories") or {}).get(
-                "hypotheses", []
+            "known_summaries": (context.get("memories") or {}).get(
+                "summaries", []
+            ),
+            "known_preferences": (context.get("memories") or {}).get(
+                "preferences", []
+            ),
+            "known_inferences": (context.get("memories") or {}).get(
+                "inferences", []
             ),
         },
         ensure_ascii=False,
@@ -454,11 +473,18 @@ def build_recommendation(
 
 **怎么用 child_context 里的长期记忆**：
 
-- confirmed_facts / preferences：家长确认过的事，可以当作背景用。
-  preferences 里说"不希望怎样"的，建议里**不要**违背。
-- memories.observations：每一条只是**某一次**发生的事，
-  可以拿来说明"你提到过……"，但不能概括成孩子的特点。
-- memories.hypotheses：还没验证的猜测。要么不写，要么写成
+- memories.summaries：系统把同一个方面下多次出现的情况归纳成的一句话。
+  每条都标着 `scope_conditions`（在什么情况下成立）和
+  `derived_from`（由哪几句归纳而来）。
+  - 可以当背景用，但**引用时必须带上原来的条件**。
+    "在幼儿园门口会哭" ≠ "孩子情绪不好"。
+  - **不能**把它扩大成"孩子就是这样"。
+  - `source_kind='direct'` 的那条只是**某一次**发生的事的复述
+    （还没有攒够多次出现，系统没做归纳），
+    引用时更不能概括成特点。
+- memories.preferences：家长明确说过的**硬约束**
+  （"我不希望他被批评"）。建议里**绝对不能违背**。
+- memories.inferences：系统自己猜的，还没验证。要么不写，要么写成
   "有可能……，但还需要再观察"。**不能**当结论，也不能写进
   observed_facts。
 - memories.attempts：家长真试过的事。**不要**把系统建议过的事
