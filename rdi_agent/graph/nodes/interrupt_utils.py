@@ -64,6 +64,24 @@ def build_asked_qa(
         for item in answers
         if str(item.get("question") or "").strip()
     }
+    # 这一轮只问了一道题，而家长是在**同一个输入框**里回了一段话
+    # （没带原问题）—— 那段话就是这道题的答案。
+    #
+    # **不归的话**：模型看到的是"问了但没答"，会想再问一遍
+    # —— 而家长面前只有一次追问的机会（MAX_FOLLOWUP_ROUNDS = 1）。
+    if len(questions) == 1:
+        only = str(questions[0].get("question") or "").strip()
+        orphan = next(
+            (
+                item
+                for item in answers
+                if not str(item.get("question") or "").strip()
+                and str(item.get("answer") or "").strip()
+            ),
+            None,
+        )
+        if only and orphan is not None and not answer_by_question.get(only):
+            answer_by_question[only] = str(orphan.get("answer") or "").strip()
     pairs: list[dict[str, str]] = []
     seen_questions: set[str] = set()
     for item in questions:

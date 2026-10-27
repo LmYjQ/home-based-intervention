@@ -89,14 +89,13 @@ watch(
 </script>
 
 <template>
-  <div class="card" v-if="conversationId">
-    <header>
-      <h3>调试：checkpoint</h3>
-      <span class="badge">阶段 5</span>
+  <details class="card" v-if="conversationId">
+    <summary>调试：checkpoint · 阶段 5</summary>
+    <div class="row">
       <button class="small" :disabled="busy" @click="refresh">
         {{ busy ? '读取中…' : '刷新' }}
       </button>
-    </header>
+    </div>
 
     <div class="err-box" v-if="error">{{ error }}</div>
 
@@ -159,7 +158,7 @@ watch(
       </div>
       <pre v-if="forkResult.message">{{ forkResult.message }}</pre>
     </div>
-  </div>
+  </details>
 </template>
 
 <style scoped>

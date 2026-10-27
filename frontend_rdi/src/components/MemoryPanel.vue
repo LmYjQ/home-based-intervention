@@ -11,13 +11,14 @@
 //    情绪与调节、感觉与动作、生活与自理、家庭与目标）。
 //
 // 同类合并之后，每个类目一条**小结**，那就是家长平时看到的东西。
-// 短句在下面按类目列出来，可以展开看归纳来源 —— 归纳不是黑盒。
+// 小结里点「由 N 句归纳而来」能展开看到归纳自的哪几句原话 —— 归纳不是黑盒。
 //
-// **三种短句分开显示**（它们进不进 prompt 的方式不一样）：
-// - 普通短句 —— 参与合并。
-// - 家长的要求（偏好）—— 硬约束，不参与合并。
-// - 系统的推测 —— 家长没这么说，不参与合并。
-//
+// **2026-10-27 调整面板**：
+// - **去掉「原话」那一栏** —— 短句不再单独列一遍，
+//   要看原话从小结里展开就行。
+// - **「家长的要求」和「系统的推测」暂时不显示**（模板里注释掉了）——
+//   这两类不进类目合并，是单独进 prompt 的通道，
+//   放在一起看着乱。先收起来，等确认要不要长期保留。
 // **只有"删除"按钮**：记忆是自动维护的 —— 系统自己记、自己合并、自己纠正。
 // 家长想改什么，**直接在对话里说"不是这样"就行**。
 import { computed, ref } from 'vue'
@@ -63,10 +64,8 @@ const summaries = computed(() => props.memories.filter((m) => m.kind === 'summar
 const notes = computed(() => props.memories.filter((m) => m.kind === 'note'))
 const attempts = computed(() => props.memories.filter((m) => m.kind === 'attempt'))
 
-// 三种短句分开：参与合并的、家长要求的、系统的推测。
-const plainNotes = computed(() =>
-  notes.value.filter((m) => !m.is_preference && !m.inference),
-)
+// 家长要求的、系统的推测。**暂时不显示**（模板里注释掉了），
+// 但 computed 留着 —— 要恢复显示只差模板那一段。
 const preferences = computed(() => notes.value.filter((m) => m.is_preference))
 const inferences = computed(() => notes.value.filter((m) => m.inference))
 
@@ -87,7 +86,6 @@ function groupByCategory(items) {
 }
 
 const summaryGroups = computed(() => groupByCategory(summaries.value))
-const noteGroups = computed(() => groupByCategory(plainNotes.value))
 
 // 展开状态：哪些小结要看它的原始短句。
 const expanded = ref({})
@@ -127,7 +125,6 @@ function askDelete(item) {
   <div class="card">
     <header>
       <h3>长期记忆</h3>
-      <span class="badge">{{ memories.length }} 条</span>
     </header>
 
     <div class="small muted intro">
@@ -178,7 +175,11 @@ function askDelete(item) {
       </div>
     </section>
 
-    <!-- ---- 家长的要求：硬约束，不参与合并 ---- -->
+    <!-- ---- 家长的要求：硬约束，不参与合并 ----
+         2026-10-27：暂时不显示，等确认要不要保留这一栏。
+         它不进类目合并，是单独进 prompt 的硬约束。
+         要恢复显示，把这段注释去掉即可（preferences / inferences
+         两个 computed 还留着）。
     <section v-if="preferences.length">
       <h4>家长的要求 <span class="small muted">· 不参与合并，直接影响建议</span></h4>
       <div v-for="m in preferences" :key="m.memory_id" class="mem">
@@ -193,8 +194,10 @@ function askDelete(item) {
         </div>
       </div>
     </section>
+    -->
 
-    <!-- ---- 系统的推测：家长没这么说 ---- -->
+    <!-- ---- 系统的推测：家长没这么说 ----
+         2026-10-27：同上，暂时不显示。
     <section v-if="inferences.length">
       <h4>系统的推测 <span class="small muted">· 还没验证，不能当结论</span></h4>
       <div v-for="m in inferences" :key="m.memory_id" class="mem">
@@ -212,33 +215,7 @@ function askDelete(item) {
         </div>
       </div>
     </section>
-
-    <!-- ---- 原话：作依据，同类合并成上面的小结 ---- -->
-    <section v-for="g in noteGroups" :key="`note-${g.category}`">
-      <h4>{{ g.label }} <span class="small muted">· 原话</span></h4>
-      <div v-for="m in g.items" :key="m.memory_id" class="mem">
-        <div class="row">
-          <span class="badge" :class="statusClass(m)">{{ STATUS_LABEL[m.status] || m.status }}</span>
-        </div>
-
-        <div class="content">{{ m.content }}</div>
-
-        <div v-if="m.scope_conditions?.length" class="small muted">
-          适用条件：{{ m.scope_conditions.join('、') }}
-        </div>
-        <div v-if="m.source?.quote" class="quote">原话：{{ m.source.quote }}</div>
-        <div class="small muted">
-          {{ m.source?.kind === 'feedback' ? '来自执行反馈' : '来自对话' }}
-          <span v-if="m.source?.turn_id"> · {{ m.source.turn_id }}</span>
-          <span v-if="m.supersedes_memory_id"> · 取代了 {{ m.supersedes_memory_id }}</span>
-          <span v-if="m.superseded_by_memory_id"> · 已被 {{ m.superseded_by_memory_id }} 取代</span>
-        </div>
-
-        <div class="row actions">
-          <button class="small" :disabled="busy" @click="askDelete(m)">删除</button>
-        </div>
-      </div>
-    </section>
+    -->
 
     <!-- ---- 尝试：只读投影 ---- -->
     <section v-if="attempts.length">

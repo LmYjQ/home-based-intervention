@@ -28,7 +28,7 @@
 
 追问那圈是**故意**回到 ``parse_parent_input`` 而不是接一个新节点：
 家长的回答要重新并进 CaseSummary，事实是累积的，不能问一轮丢一轮。
-收敛靠 ``followup_rounds``（阶段 1，3 轮）和 ``evidence_followup_rounds``
+收敛靠 ``followup_rounds``（阶段 1，1 轮）和 ``evidence_followup_rounds``
 （证据门控，1 轮）两个上限 —— 两个环都回 ``parse_parent_input``，
 没有上限就会互相打转。
 """

@@ -45,12 +45,13 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 
 # 追问到第几轮就强制收手。
 #
-# **两轮**（2026-10-26 改，原值 1）。
+# **一轮**（2026-10-27 改，原值 2）。
 #
-# 一轮 = 最多 3 个问题，家长**一起答完**，然后进下一轮判断。
+# 一轮 = 最多 3 个问题，家长**一起答完**。
 #
-# **为什么从 1 调回 2**：两轮够把场景补全（第一轮问"发生了什么"，
-# 第二轮问"具体什么样"），又不至于变成填表。
+# **为什么从 2 调回 1**：家长面前只该有一次追问。
+# 问完还是没说清，就带着"不确定"出方案（卡里有 uncertainty_notes），
+# 别把家长逼成填表 —— 手上只有一次机会，这一轮就该问最有用的。
 #
 # **重复提问不是靠轮数上限解决的**（2026-10-26 修）——
 # 之前把轮数压到 1 只是把症状盖住了。真正的根因是**模型看不到
@@ -68,7 +69,7 @@ from rdi_agent.schemas.recommendation import RecommendationCard
 #
 # 信息不够也要出方案 —— 建议卡里有 uncertainty_notes，方案本身就会标出
 # 哪里不确定，这比多问一轮有用。
-MAX_FOLLOWUP_ROUNDS = 2
+MAX_FOLLOWUP_ROUNDS = 1
 
 
 def plan_prefix(version: int) -> str:
@@ -307,7 +308,7 @@ async def check_sufficiency(state: CoachState) -> dict[str, Any]:
         stage="sufficiency",
         temperature=0.0,
     )
-    # 模型说够，但已经追问 3 轮还拿不准 —— 尊重模型的判断，只是不让它无休止地问下去。
+    # 模型说够，但已经追问到上限还拿不准 —— 尊重模型的判断，只是不让它无休止地问下去。
     if rounds >= MAX_FOLLOWUP_ROUNDS and decision.requires_followup:
         decision = SufficiencyDecision(
             requires_followup=False,
