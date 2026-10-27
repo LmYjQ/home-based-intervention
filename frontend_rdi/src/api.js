@@ -152,10 +152,26 @@ export const api = {
 //
 // **fetch 不能直接读 SSE**：EventSource 只支持 GET，而且不能带 body。
 // 所以这里用 fetch + ReadableStream 自己解 SSE 的帧格式。
+export async function streamFeedback(trialId, payload, { onProgress } = {}) {
+  return streamSSE(`/api/trials/${trialId}/feedback/stream`, payload, { onProgress })
+}
+
 export async function streamMessage(conversationId, payload, { onProgress } = {}) {
+  return streamSSE(
+    `/api/conversations/${conversationId}/messages/stream`,
+    payload,
+    { onProgress },
+  )
+}
+
+// SSE 的公共部分。
+//
+// **为什么抽出来**：反馈和聊天都要边跑边推进度，
+// 帧格式、错误处理、"流结束了但没收到结果"这些写两遍一定会走样。
+async function streamSSE(url, payload, { onProgress } = {}) {
   let resp
   try {
-    resp = await fetch(`/api/conversations/${conversationId}/messages/stream`, {
+    resp = await fetch(url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -174,6 +190,14 @@ export async function streamMessage(conversationId, payload, { onProgress } = {}
       if (text) detail = `HTTP ${resp.status}：${text.slice(0, 300)}`
     }
     throw new Error(detail)
+  }
+
+  // **不一定是 SSE**：反馈那条流在"已经在追问上了"或"这次反馈已经处理完"
+  // 的时候直接返回普通 JSON（不用重跑图）。按 content-type 分流 ——
+  // 硬按 SSE 解会得到"流结束了但没收到结果"。
+  const contentType = resp.headers.get('content-type') || ''
+  if (!contentType.includes('text/event-stream')) {
+    return JSON.parse((await resp.text()) || 'null')
   }
 
   const reader = resp.body.getReader()

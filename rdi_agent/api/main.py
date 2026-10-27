@@ -19,7 +19,7 @@ from rdi_agent.api.health import check_all
 from rdi_agent.api.memory import router as memory_router
 from rdi_agent.api.revision import router as revision_router
 from rdi_agent.config import get_settings
-from rdi_agent.logging_setup import setup_logging
+from rdi_agent.logging_setup import get_logger, setup_logging
 
 # 尽早配置日志 —— 导入期出的问题（配置读不到、模型连不上）
 # 也要能落到 logs/rdi.log，不能只出现在启动那一屏。
@@ -55,6 +55,32 @@ app.include_router(conversations_router)
 app.include_router(memory_router)
 app.include_router(revision_router)
 app.include_router(debug_router)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc: Exception) -> JSONResponse:
+    """没接住的异常，返回**能看懂的 JSON**，不是 "Internal Server Error"。
+
+    **为什么**：默认的 500 返回一段 HTML 或一句纯文本，
+    前端只能显示"HTTP 500"—— 家长看到的是"Internal Server Error"，
+    什么都不知道；调试的人还得去翻 logs/rdi.log 才知道是模型超时了。
+
+    这里把异常类型和消息原样带回去（**只给本地手动测试台用**，
+    线上不能这么干 —— 异常消息里可能有孩子的信息）。
+    """
+    logger = get_logger("api.error")
+    logger.error(
+        "未处理的异常 | %s %s | %s: %s",
+        request.method, request.url.path,
+        type(exc).__name__, exc, exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"{type(exc).__name__}: {exc}",
+            "type": type(exc).__name__,
+        },
+    )
 
 
 @app.get("/health")

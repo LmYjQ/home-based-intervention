@@ -21,7 +21,7 @@ import uuid
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel
 
@@ -512,33 +512,25 @@ def _turn_payload(conversation_id: str, result: dict[str, Any]) -> dict[str, Any
     }
 
 
-@router.post("/conversations/{conversation_id}/messages/stream")
-async def send_message_stream(
-    conversation_id: str, req: SendMessageRequest
+async def _sse_stream(
+    *,
+    run: Any,
+    on_result: Any,
+    label: str,
 ) -> StreamingResponse:
-    """发一条消息，**边跑边推进度**（SSE）。
+    """跑一个协程，边跑边把进度推成 SSE。
 
-    **推的是什么**：进度事件（"正在检索指南…"），不是答案正文。
-    答案要等图跑完才有一个完整形态 —— 抽取类调用走的是
-    ``json_schema`` 严格约束解码，模型必须保证 JSON 语法合法才能吐
-    token，中途吐出来的是半截 JSON，家长也看不懂。
+    **两个入口共用**（聊天的 ``/messages/stream`` 和反馈的
+    ``/feedback/stream``）：进度事件的形状、哨兵、客户端断线时
+    取消后台任务 —— 这些逻辑写两遍一定会走样。
 
-    所以这条流解决的是"它卡在哪儿"，不是"字一个字出来"。
+    ``run`` 是要跑的协程（``async () -> dict``），
+    ``on_result`` 拿它的结果翻译成最终要推的 body（可以是协程函数，会被 await）。
 
-    **和 ``/messages`` 的关系**：跑的是同一套逻辑（``_run_turn``），
-    最后推的 ``result`` 事件和非流式接口的 body **字段完全一样**。
-    前端拿它替换掉普通请求即可。
-
-    事件格式（``text/event-stream``）：
-
-    - ``event: progress`` —— 进度，data 是 ``{stage, label, kind, attempt}``
-    - ``event: result``   —— 最终结果，data 和 ``/messages`` 的 body 一样
-    - ``event: error``    —— 出错，data 是 ``{message}``
+    **推的是进度，不是半截答案**（见模块文档）：
+    抽取类调用走 ``json_schema`` 严格约束解码，模型必须保证 JSON
+    合法才能吐 token，中途吐出来的是半截 JSON，家长也看不懂。
     """
-    # 先把身份校验跑一遍 —— 错了要立刻返回 4xx，
-    # 不能已经开流了再报错（SSE 里发错误，前端只能看到流里的一条消息）。
-    await _ensure_identity(conversation_id)
-
     async def event_source():
         from rdi_agent.progress import spawn_with_progress
 
@@ -552,22 +544,21 @@ async def send_message_stream(
         async def run_graph() -> None:
             """跑图，把进度和结果都塞进出站队列。"""
             try:
-                task, progress_queue = spawn_with_progress(
-                    _run_turn(conversation_id, req)
-                )
+                task, progress_queue = spawn_with_progress(run())
                 # 一个 task 跑图，另一个把进度转成 SSE 事件。
                 pump_task = asyncio.create_task(pump(progress_queue))
                 try:
                     result = await task
                 finally:
                     pump_task.cancel()
-                put("result", _turn_payload(conversation_id, result))
+                # on_result 可能同步也可能异步（要落库、读行）——
+                # 一律 await，漏了会把协程对象塞进 JSON 里。
+                put("result", await on_result(result))
             except Exception as exc:  # noqa: BLE001 - 错误要发给前端，不是吞掉
                 # 同时落一份日志 —— 前端只显示一句话，
                 # 想知道"是哪一步、什么原因"得看 logs/rdi.log。
                 logger.error(
-                    "会话出错 | conversation_id=%s | %s: %s",
-                    conversation_id, type(exc).__name__, exc, exc_info=True,
+                    "%s出错 | %s: %s", label, type(exc).__name__, exc, exc_info=True,
                 )
                 put("error", {"message": f"{type(exc).__name__}: {exc}"})
             finally:
@@ -609,6 +600,43 @@ async def send_message_stream(
             # 关掉 nginx 的缓冲，否则 SSE 会被攒着一起发。
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+async def send_message_stream(
+    conversation_id: str, req: SendMessageRequest
+) -> StreamingResponse:
+    """发一条消息，**边跑边推进度**（SSE）。
+
+    **推的是什么**：进度事件（"正在检索指南…"），不是答案正文。
+    答案要等图跑完才有一个完整形态 —— 抽取类调用走的是
+    ``json_schema`` 严格约束解码，模型必须保证 JSON 语法合法才能吐
+    token，中途吐出来的是半截 JSON，家长也看不懂。
+
+    所以这条流解决的是"它卡在哪儿"，不是"字一个字出来"。
+
+    **和 ``/messages`` 的关系**：跑的是同一套逻辑（``_run_turn``），
+    最后推的 ``result`` 事件和非流式接口的 body **字段完全一样**。
+    前端拿它替换掉普通请求即可。
+
+    事件格式（``text/event-stream``）：
+
+    - ``event: progress`` —— 进度，data 是 ``{stage, label, kind, attempt}``
+    - ``event: result``   —— 最终结果，data 和 ``/messages`` 的 body 一样
+    - ``event: error``    —— 出错，data 是 ``{message}``
+    """
+    # 先把身份校验跑一遍 —— 错了要立刻返回 4xx，
+    # 不能已经开流了再报错（SSE 里发错误，前端只能看到流里的一条消息）。
+    await _ensure_identity(conversation_id)
+
+    async def on_result(result: dict[str, Any]) -> dict[str, Any]:
+        return _turn_payload(conversation_id, result)
+
+    return await _sse_stream(
+        run=lambda: _run_turn(conversation_id, req),
+        on_result=on_result,
+        label=f"会话出错 | conversation_id={conversation_id}",
     )
 
 
@@ -923,6 +951,77 @@ async def submit_feedback(trial_id: str, req: FeedbackSubmission) -> dict[str, A
     )
     row = await _load_feedback_row(trial_id, turn_id)
     return _feedback_payload(trial=trial, turn_id=turn_id, row=row, result=result)
+
+
+@router.post("/trials/{trial_id}/feedback/stream")
+async def submit_feedback_stream(
+    trial_id: str, req: FeedbackSubmission
+) -> StreamingResponse:
+    """提交反馈，**边跑边推进度**（SSE）。
+
+    **为什么要这条流**：反馈链上有 3 次 LLM 调用
+    （``analyze_feedback`` → ``next_step`` → 记忆抽取），
+    每次超时 120 秒、重试 3 次 —— 最坏 6 分钟。
+    非流式的时候家长面对的就是一个转圈的按钮，
+    只能猜"是卡了还是在算"。
+
+    推的仍然是**步骤进度**（"正在分析你的反馈…"），不是答案正文。
+
+    事件格式和 ``/messages/stream`` 完全一样：
+    ``progress`` / ``result`` / ``error``。
+
+    **中途失败不会丢已写的数据**：``capture_feedback`` 节点在
+    ``analyze_feedback`` **之前**就落库了，所以 LLM 超时后
+    家长重试同一条反馈，走的是缓存路径，不会重复写。
+    """
+    trial, family_id, child_id = await _ensure_identity_for_trial(trial_id)
+    if req.trial_id != trial_id:
+        raise HTTPException(400, "请求体里的 trial_id 和路径不一致")
+
+    turn_id = req.turn_id
+    config = config_for(feedback_thread_id(trial_id, turn_id))
+    row = await _load_feedback_row(trial_id, turn_id)
+
+    pending = await _pending_interrupt(config)
+    if pending is not None:
+        if pending.get("kind") != "feedback_followup":
+            raise HTTPException(409, "这条反馈没有待回答的追问")
+        # 已经在追问上了 —— 直接把问题还给前端，不开流。
+        return JSONResponse(
+            _feedback_payload(trial=trial, turn_id=turn_id, row=row, pending=pending)
+        )
+
+    if row is not None and getattr(row, "completed_at", None) is not None:
+        bundle = await _load_feedback_bundle(trial_id, turn_id)
+        return JSONResponse(
+            _feedback_payload(trial=trial, turn_id=turn_id, row=row, bundle=bundle)
+        )
+
+    async def run() -> dict[str, Any]:
+        graph = get_graph()
+        result = await graph.ainvoke(
+            {
+                "entrypoint": "feedback",
+                "conversation_id": str(trial.conversation_id),
+                "thread_id": feedback_thread_id(trial_id, turn_id),
+                "family_id": family_id,
+                "child_id": child_id,
+                "turn_id": turn_id,
+                "feedback": req.model_dump(mode="json"),
+            },
+            config=config,
+        )
+        return result
+
+    async def on_result(result: dict[str, Any]) -> dict[str, Any]:
+        fresh = await _load_feedback_row(trial_id, turn_id)
+        return _feedback_payload(trial=trial, turn_id=turn_id, row=fresh, result=result)
+
+    return await _sse_stream(
+        run=run,
+        on_result=on_result,
+        label=f"反馈出错 | trial_id={trial_id}",
+    )
 
 
 @router.post("/trials/{trial_id}/feedback/resume")

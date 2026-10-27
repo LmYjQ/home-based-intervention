@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import select, text
 
@@ -21,6 +23,7 @@ from rdi_agent.db.engine import dispose_engine, get_engine, session_scope
 from rdi_agent.db.models import Feedback, Plan, Trial
 from rdi_agent.db.repositories.case import Repository
 from rdi_agent.graph.runtime import setup_graph, shutdown_graph
+from rdi_agent.progress import emit as progress_emit
 from rdi_agent.schemas.conversation import (
     FollowupQuestion,
     FollowupQuestions,
@@ -66,6 +69,9 @@ def feedback_llm(monkeypatch):
         model_cls = kwargs["model_cls"]
         stage = kwargs.get("stage", "")
         state["calls"].append(stage)
+        # 替身也要打进度点 —— 真的 ``chat_json`` 在每次调用开头
+        # 会 emit 一次。不打的话，"流式端点推了进度"这条就测不到。
+        progress_emit(stage)
         if model_cls is FeedbackAnalysis:
             payload = FeedbackAnalysis(
                 actual_execution="提前十分钟出门，但在门口还是抱了五分钟",
@@ -157,6 +163,98 @@ def _submission(trial_id: str, turn_id: str) -> FeedbackSubmission:
         parent_observations=["哭的时间短了一点"],
         difficulties=["老人送的时候做不到"],
     )
+
+
+async def _collect(resp) -> list[dict]:
+    """把 StreamingResponse 的内容读成事件列表。"""
+    events: list[dict] = []
+    async for chunk in resp.body_iterator:
+        text = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+        for frame in text.split("\n\n"):
+            if not frame.strip():
+                continue
+            name = None
+            data_lines: list[str] = []
+            for line in frame.split("\n"):
+                if line.startswith("event:"):
+                    name = line[len("event:") :].strip()
+                elif line.startswith("data:"):
+                    data_lines.append(line[len("data:") :].strip())
+            if name is None or not data_lines:
+                continue
+            events.append({"event": name, "data": json.loads("\n".join(data_lines))})
+    return events
+
+
+@pytest.mark.asyncio
+async def test_feedback_stream_emits_progress_then_result(
+    db, graph, feedback_llm
+):
+    """反馈的流式端点：先推进度，最后推结果。
+
+    **为什么要这条流**：反馈链上有 3 次 LLM 调用，每次超时 120 秒、
+    重试 3 次 —— 最坏 6 分钟。非流式的时候家长面对的是一个不动的
+    按钮，只能猜"是卡了还是在算"。
+    """
+    conversation_id, trial_id, turn_id = await _seed_trial()
+    try:
+        resp = await api.submit_feedback_stream(
+            trial_id, _submission(trial_id, turn_id)
+        )
+        events = await _collect(resp)
+
+        names = [e["event"] for e in events]
+        assert names[-1] == "result", f"最后一个事件应该是 result，实际 {names}"
+        assert "error" not in names, f"不该有 error 事件：{events}"
+
+        # 进度要有 —— 至少得有"正在分析你的反馈"这一步
+        stages = [e["data"]["stage"] for e in events if e["event"] == "progress"]
+        assert "feedback_analyze" in stages, f"没有分析阶段的进度：{stages}"
+        # 进度标签要给家长看的中文，不是英文 stage 名
+        labels = [
+            e["data"]["label"] for e in events if e["event"] == "progress"
+        ]
+        assert all(" " not in lbl or not lbl.isascii() for lbl in labels)
+
+        result = events[-1]["data"]
+        assert result["status"]
+        assert result["analysis"]
+    finally:
+        await _cleanup(conversation_id, trial_id)
+
+
+@pytest.mark.asyncio
+async def test_feedback_stream_result_matches_non_streaming(
+    db, graph, feedback_llm
+):
+    """流式和非流式必须产出**一样的结果**。
+
+    **为什么这是最要紧的一条**：手测台的价值就在于"看到的就是真的"。
+    两条路跑不同逻辑的话，手测看到的东西就不能代表线上。
+    """
+    cid_a, trial_a, turn_a = await _seed_trial()
+    cid_b, trial_b, turn_b = await _seed_trial()
+    try:
+        streamed = await _collect(
+            await api.submit_feedback_stream(
+                trial_a, _submission(trial_a, turn_a)
+            )
+        )
+        plain = await api.submit_feedback(
+            trial_b, _submission(trial_b, turn_b)
+        )
+
+        stream_result = streamed[-1]["data"]
+        for payload in (stream_result, plain):
+            payload.pop("turn_id", None)
+            payload.pop("trial_id", None)
+
+        assert stream_result == plain, (
+            "流式和非流式的结果不一致 —— 两条路跑的不是同一套逻辑"
+        )
+    finally:
+        await _cleanup(cid_a, trial_a)
+        await _cleanup(cid_b, trial_b)
 
 
 async def _cleanup(conversation_id: str, trial_id: str) -> None:
