@@ -176,17 +176,17 @@ watch(
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  padding: 8px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--line);
-  background: #0c0e13;
-  color: var(--fg);
-  font-size: 13px;
+  padding: 10px 12px;
+  border-radius: var(--radius-button);
+  border: 1px solid var(--color-border-strong);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 15px;
   text-align: left;
 }
-.trigger:hover { border-color: var(--accent); }
-.trigger.empty { color: var(--fg-dim); }
-.caret { color: var(--fg-dim); font-size: 10px; }
+.trigger:hover { border-color: var(--color-brand); }
+.trigger.empty { color: var(--color-text-muted); }
+.caret { color: var(--color-text-secondary); font-size: 11px; }
 
 .pop {
   position: absolute;
@@ -194,18 +194,18 @@ watch(
   top: calc(100% + 4px);
   left: 0;
   width: 268px;
-  padding: 10px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--panel-2);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+  padding: 14px;
+  border-radius: var(--radius-panel);
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  box-shadow: 0 10px 28px rgba(69, 73, 67, 0.12);
 }
 
 .yrow {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  margin-bottom: 10px;
 }
 .nav { padding: 2px 10px; line-height: 1.2; }
 .year { font-weight: 600; }
@@ -213,17 +213,17 @@ watch(
 .grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 5px;
+  gap: 6px;
 }
 .cell {
-  padding: 6px 0;
-  font-size: 12px;
+  padding: 7px 0;
+  font-size: 13px;
   text-align: center;
 }
 .cell.on {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: #0b1020;
+  background: var(--color-brand-hover);
+  border-color: var(--color-brand-hover);
+  color: #ffffff;
   font-weight: 600;
 }
 </style>

@@ -191,26 +191,26 @@ function reset() {
 </template>
 
 <style scoped>
-.stepper { background: var(--panel-2); }
+.stepper { background: var(--color-surface-soft); }
 
-.dots { display: flex; gap: 8px; margin-bottom: 12px; }
+.dots { display: flex; gap: 8px; margin-bottom: 14px; }
 .dot {
-  width: 28px; height: 28px; border-radius: 50%; padding: 0;
-  position: relative; font-size: 12px; line-height: 1;
+  width: 30px; height: 30px; border-radius: 50%; padding: 0;
+  position: relative; font-size: 13px; line-height: 1;
   display: flex; align-items: center; justify-content: center;
 }
-.dot.active { border-color: var(--accent); color: var(--accent); }
-.dot.done { border-color: var(--ok); color: var(--ok); }
-.dot-check { position: absolute; right: -3px; bottom: -3px; font-size: 10px; }
+.dot.active { border-color: var(--color-brand); color: var(--color-brand-text); background: var(--color-green-soft); }
+.dot.done { border-color: var(--color-ok); color: var(--color-ok); background: var(--color-ok-soft); }
+.dot-check { position: absolute; right: -3px; bottom: -3px; font-size: 11px; }
 
-.qbox { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--panel); }
-.q-text { font-size: 15px; margin-bottom: 4px; }
-.why { margin-bottom: 10px; }
+.qbox { border: 1px solid var(--color-border); border-radius: var(--radius-panel); padding: 16px; background: var(--color-surface); }
+.q-text { font-size: 16px; margin-bottom: 4px; }
+.why { margin-bottom: 12px; }
 
-.opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
-.opt { padding: 7px 13px; border-radius: 18px; }
-.opt.picked { border-color: var(--accent); background: #14243b; color: var(--accent); }
-.opt.disabled { opacity: 0.35; }
+.opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.opt { padding: 8px 14px; border-radius: var(--radius-pill); }
+.opt.picked { border-color: var(--color-brand); background: var(--color-green-soft); color: var(--color-brand-text); font-weight: 600; }
+.opt.disabled { opacity: 0.5; }
 
-.nav { margin-top: 12px; }
+.nav { margin-top: 14px; }
 </style>

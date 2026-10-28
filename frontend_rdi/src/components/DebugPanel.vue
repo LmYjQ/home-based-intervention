@@ -163,14 +163,15 @@ watch(
 
 <style scoped>
 .debug-row {
-  border: 1px solid #2a3342;
-  border-radius: 6px;
-  padding: 6px 8px;
-  margin-bottom: 6px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
   cursor: pointer;
 }
+.debug-row:hover { border-color: var(--color-brand); }
 .debug-row.selected {
-  border-color: #4c8dff;
-  background: rgba(76, 141, 255, 0.08);
+  border-color: var(--color-info);
+  background: var(--color-info-soft);
 }
 </style>

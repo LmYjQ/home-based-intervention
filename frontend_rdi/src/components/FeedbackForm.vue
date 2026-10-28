@@ -94,12 +94,12 @@ async function submit() {
 
 <template>
   <div class="card">
-    <header><h3>记录这轮尝试的反馈</h3><span class="badge">trial {{ trialId }}</span></header>
+    <header><h3>记录这轮尝试的反馈</h3><span class="badge truncate" :title="trialId">trial {{ trialId }}</span></header>
 
     <div class="err-box" v-if="error">{{ error }}</div>
 
     <div class="field">
-      <label>这轮执行到哪一步</label>
+      <label>这周进行到哪一步</label>
       <div class="row">
         <label class="row" style="margin:0">
           <input type="radio" style="width:auto" value="attempted" v-model="execution" /> 做了
@@ -108,9 +108,10 @@ async function submit() {
           <input type="radio" style="width:auto" value="stopped" v-model="execution" /> 做了但中途停了
         </label>
         <label class="row" style="margin:0">
-          <input type="radio" style="width:auto" value="not_attempted" v-model="execution" /> 没做
+          <input type="radio" style="width:auto" value="not_attempted" v-model="execution" /> 这周没机会做
         </label>
       </div>
+      <div class="small muted">没机会做也是一种情况，记录下来我们就调整建议。</div>
     </div>
 
     <!--
@@ -126,7 +127,7 @@ async function submit() {
         placeholder="例如：只在门口抱了 3 分钟就放下，没坚持到平时回家的时长&#10;今天没有哭，但抱着我的手抓得更紧了&#10;还是老人帮忙送的，我控制不了流程"
       />
       <div class="small muted">
-        想到什么说什么，不用分栏 —— 执行了什么、孩子什么反应、哪里卡住了，
+        想到什么说什么，不用分栏 —— 做了什么、孩子什么反应、哪里卡住了，
         写在一段里就行。
       </div>
     </div>

@@ -239,30 +239,30 @@ defineExpose({ citedIds })
 </template>
 
 <style scoped>
-.action { margin-bottom: 8px; }
-.part { margin: 4px 0; }
-.cite { border-left: 2px solid var(--line); padding-left: 9px; margin-bottom: 7px; }
-code { font-size: 11px; color: var(--fg-dim); }
+.action { margin-bottom: 10px; }
+.part { margin: 6px 0; }
+.cite { border-left: 2px solid var(--color-border-strong); padding-left: 12px; margin-bottom: 10px; }
+code { font-size: 12px; color: var(--color-text-secondary); }
 /* 引用没对上证据 —— 这是要立刻看见的问题，不该灰着过去 */
-.warn-text { color: #fde68a; }
+.warn-text { color: var(--color-warn); }
 
 /* 片段里的编号角标：像脚注一样，但可点 */
 .marker {
   display: inline-block;
-  min-width: 16px;
-  height: 16px;
-  margin: 0 1px 0 3px;
-  padding: 0 4px;
-  border: 1px solid var(--accent, #7dd3fc);
-  border-radius: 8px;
+  min-width: 18px;
+  height: 18px;
+  margin: 0 1px 0 4px;
+  padding: 0 5px;
+  border: 1px solid var(--color-info);
+  border-radius: 9px;
   background: transparent;
-  color: var(--accent, #7dd3fc);
-  font-size: 11px;
-  line-height: 14px;
+  color: var(--color-info);
+  font-size: 12px;
+  line-height: 16px;
   vertical-align: super;
   cursor: pointer;
 }
-.marker:hover { background: rgba(125, 211, 252, 0.15); }
+.marker:hover { background: var(--color-info-soft); }
 
 /* 依据区块的开关 */
 .toggle {
@@ -273,27 +273,28 @@ code { font-size: 11px; color: var(--fg-dim); }
   padding: 6px 0;
   border: 0;
   background: transparent;
-  color: var(--fg-dim);
-  font-size: 12px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
 }
-.toggle:hover { color: var(--fg); }
+.toggle:hover { color: var(--color-brand-text); }
 .caret { font-size: 10px; }
 .evidence-box {
-  border-left: 2px solid var(--line);
-  padding-left: 9px;
-  margin-bottom: 8px;
+  border-left: 2px solid var(--color-border-strong);
+  padding-left: 12px;
+  margin-bottom: 10px;
 }
 .cite.active {
-  border-left-color: var(--accent, #7dd3fc);
-  background: rgba(125, 211, 252, 0.06);
+  border-left-color: var(--color-info);
+  background: var(--color-info-soft);
+  border-radius: 0 8px 8px 0;
 }
 .cite-no {
   display: inline-block;
-  min-width: 16px;
-  margin-right: 4px;
-  color: var(--accent, #7dd3fc);
+  min-width: 18px;
+  margin-right: 6px;
+  color: var(--color-info);
   font-weight: 600;
 }
 </style>

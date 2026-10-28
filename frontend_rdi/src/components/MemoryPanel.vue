@@ -132,7 +132,7 @@ function askDelete(item) {
     </div>
 
     <div v-if="!memories.length" class="small muted">
-      这个孩子还没有任何长期记忆。说几轮之后，系统会把稳定信息记下来。
+      这个孩子还没有记录。聊过几轮之后，稳定的信息会慢慢留在这里。
     </div>
 
     <!-- ---- 小结：家长平时看的就这些 ---- -->
@@ -228,23 +228,24 @@ function askDelete(item) {
 </template>
 
 <style scoped>
-section { margin-top: 10px; }
-h4 { margin: 10px 0 4px; font-size: 12px; color: var(--fg-dim); font-weight: 600; }
-.intro { margin-bottom: 6px; }
-.mem { border-top: 1px solid var(--line); padding: 8px 0; }
+section { margin-top: 12px; }
+h4 { margin: 12px 0 6px; font-size: 13.5px; color: var(--color-text-secondary); font-weight: 600; }
+.intro { margin-bottom: 8px; }
+.mem { border-top: 1px solid var(--color-border); padding: 12px 0; }
 .mem:first-of-type { border-top: none; }
-.content { margin: 4px 0; }
+.content { margin: 6px 0; }
 .quote {
-  margin: 4px 0; padding: 4px 8px;
-  border-left: 2px solid var(--line);
-  color: var(--fg-dim); font-size: 12px;
+  margin: 6px 0; padding: 6px 10px;
+  border-left: 2px solid var(--color-border-strong);
+  color: var(--color-text-secondary); font-size: 13px;
 }
-.sources { margin: 4px 0; }
-.source-list { margin-top: 4px; padding-left: 4px; border-left: 2px solid var(--line); }
-.src { margin: 2px 0; }
+.sources { margin: 6px 0; }
+.source-list { margin-top: 6px; padding-left: 6px; border-left: 2px solid var(--color-border-strong); }
+.src { margin: 3px 0; }
 button.link {
   background: none; border: none; padding: 0;
-  color: var(--fg-dim); text-decoration: underline; cursor: pointer;
+  color: var(--color-brand-text); text-decoration: underline; cursor: pointer;
 }
-.actions { margin-top: 4px; }
+button.link:hover:not(:disabled) { background: none; color: var(--color-brand-deep); }
+.actions { margin-top: 6px; }
 </style>

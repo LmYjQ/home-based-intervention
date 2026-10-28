@@ -967,6 +967,18 @@ onMounted(async () => {
       <button @click="refresh" :disabled="!conversationId || busy">刷新会话</button>
     </div>
 
+    <!--
+      欢迎区：先让人被理解，再看别的。
+      这仍然是个手动测试台，但语气不必像后台。
+    -->
+    <div class="welcome">
+      <h1>今天，我们慢慢来。</h1>
+      <p class="lede">
+        不需要一下子把所有事想清楚，说说你看到的情况就好，
+        我们从一个具体的小瞬间开始。
+      </p>
+    </div>
+
     <div v-if="health && health.status !== 'ok'" class="err-box">
       后端自检没过：{{ JSON.stringify(health, null, 2) }}
     </div>
@@ -979,7 +991,7 @@ onMounted(async () => {
         <div class="card">
           <header>
             <h3>会话</h3>
-            <span v-if="conversationId" class="badge small">{{ conversationId }}</span>
+            <span v-if="conversationId" class="badge small truncate" :title="conversationId">{{ conversationId }}</span>
           </header>
 
           <!--
@@ -1086,7 +1098,8 @@ onMounted(async () => {
 
           <div class="msgs">
             <div v-if="!messages.length" class="small muted">
-              还没开始。先从下拉选一个账号，或点「＋ 新建账号」，再在下面说孩子的表现。
+              还没开始。先从上面选一个账号，或点「＋ 新建账号」，
+              然后在下面说说你看到的孩子的情况 —— 怎么描述都可以，我们来帮你理清。
             </div>
             <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
               <div class="who">{{ m.role === 'user' ? '家长' : '教练' }} · {{ m.at }}</div>
@@ -1124,10 +1137,11 @@ onMounted(async () => {
             别处也能打字会让人以为答错了地方。
           -->
           <div v-else-if="!feedbackFollowup" class="field">
-            <label>描述孩子的情况</label>
+            <label>说说孩子的情况</label>
             <textarea v-model="input"
                       @keydown.enter.exact.prevent="send()"
-                      placeholder="Enter 直接发送" />
+                      placeholder="例如：今天出门时，他又一直想找井盖……&#10;不必使用专业术语，按自己的方式描述就好。" />
+            <div class="small muted">Enter 直接发送。</div>
           </div>
 
           <div v-if="!awaitingFollowup && !feedbackFollowup" class="row">
@@ -1213,7 +1227,7 @@ onMounted(async () => {
         </div>
 
         <div v-if="awaitingPlanSelection" class="notice">
-          还没选方案 —— 不选的话图不会往下走，trial 也不会落库。
+          选一张方案，我们就按它开始这一周。哪张都可以，之后的情况有变化也能换。
         </div>
 
         <FeedbackForm v-if="needsFeedback" :trial-id="trialId" @done="submitFeedback" />
@@ -1316,14 +1330,14 @@ onMounted(async () => {
             的历史 checkpoint 分叉，问过的事实和找到的依据都沿用。
           -->
           <div class="field revise-box">
-            <label>情况有变？重新出一版方案</label>
+            <label>情况有变化？我们可以重新出一版</label>
             <textarea
               v-model="reviseNote"
               rows="2"
               :disabled="busy"
               placeholder="补充新情况，例如：家里没人帮忙接送，只能晚上做"
             />
-            <div class="row" style="margin-top:6px;align-items:center">
+            <div class="row" style="margin-top:8px;align-items:center">
               <button
                 class="primary"
                 :disabled="busy || !reviseNote.trim()"
@@ -1366,37 +1380,67 @@ onMounted(async () => {
   display: inline-block;
 }
 .llm-settings > summary::-webkit-details-marker { display: none; }
+/* 顶栏里的折叠块不要那道上边框 —— 顶栏自己已经有一条分隔线了 */
+.llm-settings { border-top: none; margin-top: 0; padding-top: 0; }
 .llm-settings-body {
   position: absolute;
   right: 0;
   top: calc(100% + 6px);
   z-index: 20;
   width: 340px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-panel);
+  background: var(--color-surface);
+  box-shadow: 0 8px 24px rgba(69, 73, 67, 0.12);
 }
-.llm-settings-body .field { margin-bottom: 10px; }
+.llm-settings-body .field { margin-bottom: 12px; }
 
-.plan-switcher { margin-bottom: 10px; }
-.plan-switcher .dots { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+.plan-switcher { margin-bottom: 14px; }
+.plan-switcher .dots { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; flex-wrap: wrap; }
 .version-dot {
-  border-radius: 14px; padding: 5px 12px; font-size: 13px; line-height: 1.2;
+  border-radius: var(--radius-pill); padding: 6px 14px; font-size: 14px; line-height: 1.3;
 }
-.version-dot.active { border-color: var(--accent); color: var(--accent); }
-.version-dot.archived { opacity: 0.6; }
+.version-dot.active {
+  border-color: var(--color-brand);
+  background: var(--color-green-soft);
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+.version-dot.archived { opacity: 0.65; }
 .card-dot {
-  width: 28px; height: 28px; border-radius: 50%; padding: 0;
-  font-size: 12px; line-height: 1;
+  width: 30px; height: 30px; border-radius: 50%; padding: 0;
+  font-size: 13px; line-height: 1;
   display: flex; align-items: center; justify-content: center;
 }
-.card-dot.active { border-color: var(--accent); color: var(--accent); }
-.plan-group.archived { opacity: 0.62; }
+.card-dot.active {
+  border-color: var(--color-brand);
+  background: var(--color-green-soft);
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+.plan-group.archived { opacity: 0.68; }
 .revise-box {
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--line);
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+/* 欢迎区：先让人被理解，再看别的 */
+.welcome { margin-bottom: 24px; }
+.welcome h1 { font-size: 30px; line-height: 1.35; margin-bottom: 6px; }
+.welcome .lede { font-size: 15.5px; color: var(--color-text-secondary); margin: 0; }
+
+/* 轻量标签：卡片左上角那种小提示 */
+.eyebrow {
+  display: inline-block;
+  font-size: 12.5px;
+  letter-spacing: .02em;
+  color: var(--color-brand-text);
+  background: var(--color-surface);
+  border: 1px solid #d6e2cf;
+  border-radius: var(--radius-pill);
+  padding: 3px 12px;
+  margin-bottom: 12px;
 }
 </style>
