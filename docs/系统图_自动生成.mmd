@@ -1,0 +1,92 @@
+%% 自动生成：LangGraph 自己导出的原始图（未分区）
+%% 生成命令：
+%%   python -c "from rdi_agent.graph.builder import build_graph; print(build_graph().get_graph().draw_mermaid())"
+
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	extract_memories(extract_memories)
+	merge_memories(merge_memories)
+	commit_memory(commit_memory)
+	consolidate_memories(consolidate_memories)
+	load_context(load_context)
+	parse_parent_input(parse_parent_input)
+	check_sufficiency(check_sufficiency)
+	generate_followup(generate_followup)
+	await_user_answer(await_user_answer)
+	build_recommendation(build_recommendation)
+	persist_evidence_bundle(persist_evidence_bundle)
+	persist_candidate_plans(persist_candidate_plans)
+	present_plans(present_plans)
+	commit_plan_selection(commit_plan_selection)
+	rewrite_query(rewrite_query)
+	retrieve_knowledge(retrieve_knowledge)
+	rerank_and_expand(rerank_and_expand)
+	evidence_gate(evidence_gate)
+	generate_evidence_followup(generate_evidence_followup)
+	build_limited_answer(build_limited_answer)
+	safety_review(safety_review)
+	render_answer(render_answer)
+	capture_feedback(capture_feedback)
+	load_feedback_context(load_feedback_context)
+	analyze_feedback(analyze_feedback)
+	next_step(next_step)
+	generate_feedback_followup(generate_feedback_followup)
+	await_feedback_answer(await_feedback_answer)
+	prepare_feedback_retrieval(prepare_feedback_retrieval)
+	build_feedback_adjustment(build_feedback_adjustment)
+	finalize_feedback(finalize_feedback)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> consolidate_memories;
+	analyze_feedback --> next_step;
+	await_feedback_answer --> analyze_feedback;
+	await_user_answer --> extract_memories;
+	build_feedback_adjustment --> safety_review;
+	build_limited_answer --> safety_review;
+	build_recommendation -. &nbsp;limited_answer&nbsp; .-> build_limited_answer;
+	build_recommendation -. &nbsp;plans&nbsp; .-> safety_review;
+	capture_feedback --> load_feedback_context;
+	check_sufficiency -.-> generate_followup;
+	check_sufficiency -.-> rewrite_query;
+	commit_memory -. &nbsp;feedback&nbsp; .-> finalize_feedback;
+	commit_memory -. &nbsp;chat&nbsp; .-> parse_parent_input;
+	consolidate_memories -. &nbsp;feedback&nbsp; .-> capture_feedback;
+	consolidate_memories -. &nbsp;chat&nbsp; .-> load_context;
+	evidence_gate -. &nbsp;feedback_adjustment&nbsp; .-> build_feedback_adjustment;
+	evidence_gate -. &nbsp;professional_support&nbsp; .-> build_limited_answer;
+	evidence_gate -. &nbsp;recommend&nbsp; .-> build_recommendation;
+	evidence_gate -. &nbsp;followup&nbsp; .-> generate_evidence_followup;
+	extract_memories --> merge_memories;
+	generate_evidence_followup --> await_user_answer;
+	generate_feedback_followup -. &nbsp;await&nbsp; .-> await_feedback_answer;
+	generate_feedback_followup -. &nbsp;finish&nbsp; .-> extract_memories;
+	generate_followup -.-> await_user_answer;
+	generate_followup -.-> rewrite_query;
+	load_context --> extract_memories;
+	load_feedback_context --> analyze_feedback;
+	merge_memories --> commit_memory;
+	next_step -. &nbsp;finish&nbsp; .-> extract_memories;
+	next_step -. &nbsp;followup&nbsp; .-> generate_feedback_followup;
+	next_step -. &nbsp;retrieve&nbsp; .-> prepare_feedback_retrieval;
+	parse_parent_input --> check_sufficiency;
+	persist_candidate_plans --> present_plans;
+	persist_evidence_bundle --> evidence_gate;
+	prepare_feedback_retrieval --> rewrite_query;
+	present_plans --> commit_plan_selection;
+	render_answer -. &nbsp;end&nbsp; .-> __end__;
+	render_answer -. &nbsp;feedback_end&nbsp; .-> extract_memories;
+	render_answer -. &nbsp;plans&nbsp; .-> persist_candidate_plans;
+	rerank_and_expand --> persist_evidence_bundle;
+	retrieve_knowledge --> rerank_and_expand;
+	rewrite_query --> retrieve_knowledge;
+	safety_review -. &nbsp;fallback&nbsp; .-> build_limited_answer;
+	safety_review -. &nbsp;present&nbsp; .-> render_answer;
+	commit_plan_selection --> __end__;
+	finalize_feedback --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

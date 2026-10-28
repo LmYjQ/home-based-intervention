@@ -1,0 +1,152 @@
+%% 系统总图（讲解用分区版）
+%% 边集由 LangGraph 自动生成的图逐条核对：
+%%   python -c "from rdi_agent.graph.builder import build_graph; print(build_graph().get_graph().draw_mermaid())"
+%% 生成时间：2026-10-27，对应 commit 88d7264 之后的图结构（31 个节点）
+
+flowchart TD
+
+    START([开始])
+    END([结束])
+
+    %% ============ 入口分流 ============
+    subgraph P0["⛳ 入口分流"]
+        CONS["consolidate_memories<br/>归纳同类观察成一条小结"]
+    end
+
+    %% ============ 长期记忆（两条入口共用） ============
+    subgraph PM["🧠 长期记忆 · 底座"]
+        EXT["extract_memories<br/>提出记忆候选"]
+        MRG["merge_memories<br/>规则裁决 记 / 待确认 / 丢"]
+        CMT["commit_memory<br/>落库 + 作废被纠正的旧值"]
+    end
+
+    %% ============ 聊天入口 · 理解与追问 ============
+    subgraph PC["💬 聊天入口 · 理解与追问"]
+        LOAD["load_context<br/>读档案与相关记忆"]
+        PARSE["parse_parent_input<br/>结构化成案例摘要"]
+        CHK["check_sufficiency<br/>信息够不够"]
+        FUP["generate_followup<br/>收敛成 ≤3 个问题"]
+        AWAIT{{"await_user_answer<br/>⏸ 中断 等家长回答"}}
+    end
+
+    %% ============ 检索与证据（两条入口共用） ============
+    subgraph PR["📚 检索与证据 · 底座"]
+        RW["rewrite_query<br/>案例摘要 → 检索词"]
+        RET["retrieve_knowledge<br/>向量 + 关键词 双路召回"]
+        RER["rerank_and_expand<br/>去重 + 父块扩展 → 证据包"]
+        PEB["persist_evidence_bundle<br/>证据包落库"]
+        GATE["evidence_gate<br/>只判一件事 有无高风险"]
+        EFUP["generate_evidence_followup<br/>证据追问 · 已关闭"]
+    end
+
+    %% ============ 生成与安全 ============
+    subgraph PG["🛡 生成与安全"]
+        REC["build_recommendation<br/>生成 2–3 张卡 + 引用校验"]
+        LIM["build_limited_answer<br/>有限回答 · 不出卡"]
+        ADJ["build_feedback_adjustment<br/>调整建议 · 只出文字"]
+        SAFE["safety_review<br/>安全审查 · 规则优先"]
+        RENDER["render_answer<br/>渲染成家长能读的话"]
+    end
+
+    %% ============ 落地 ============
+    subgraph PP["💾 落地"]
+        PCP["persist_candidate_plans<br/>候选卡落库"]
+        PRES{{"present_plans<br/>⏸ 中断 等家长选卡"}}
+        CPS["commit_plan_selection<br/>建一次尝试"]
+    end
+
+    %% ============ 反馈入口 ============
+    subgraph PF["🔁 反馈入口"]
+        CAP["capture_feedback<br/>收反馈 + 更新执行状态"]
+        LFC["load_feedback_context<br/>方案正文 + 历史尝试"]
+        ANA["analyze_feedback<br/>分析 + 与历史对比"]
+        NS["next_step<br/>继续 / 调整 / 追问 / 停止"]
+        FFUP["generate_feedback_followup<br/>反馈追问"]
+        AWAITF{{"await_feedback_answer<br/>⏸ 中断 等家长补充"}}
+        PFR["prepare_feedback_retrieval<br/>整理成检索请求"]
+        FIN["finalize_feedback<br/>收尾落库"]
+    end
+
+    %% ============ 修订（产品化的 Time Travel） ============
+    subgraph PV["🔀 修订 · 从历史 checkpoint 分叉"]
+        REV["revise_plan<br/>家长补充「情况变了」"]
+    end
+
+    %% ================= 边 =================
+    START --> CONS
+    CONS -->|chat| LOAD
+    CONS -->|feedback| CAP
+
+    LOAD --> EXT
+    EXT --> MRG
+    MRG --> CMT
+    CMT -->|chat 继续| PARSE
+    CMT -->|feedback 收尾| FIN
+
+    PARSE --> CHK
+    CHK -->|信息不足| FUP
+    CHK -->|信息够| RW
+    FUP -->|有问题| AWAIT
+    FUP -->|没得问| RW
+    AWAIT -->|答完 回记忆| EXT
+
+    RW --> RET
+    RET --> RER
+    RER --> PEB
+    PEB --> GATE
+    GATE -->|recommend| REC
+    GATE -->|professional_support| LIM
+    GATE -->|followup · 已关闭| EFUP
+    GATE -->|feedback_adjustment| ADJ
+    EFUP --> AWAIT
+
+    REC -->|通过| SAFE
+    REC -->|引用全挂| LIM
+    LIM --> SAFE
+    ADJ --> SAFE
+    SAFE -->|通过| RENDER
+    SAFE -->|不通过 降级一次| LIM
+    RENDER -->|有卡| PCP
+    RENDER -->|无卡| END
+    RENDER -->|反馈链路收尾| EXT
+
+    PCP --> PRES
+    PRES --> CPS
+    CPS --> END
+
+    CAP --> LFC
+    LFC --> ANA
+    ANA --> NS
+    NS -->|continue / stop| EXT
+    NS -->|followup| FFUP
+    NS -->|adjust| PFR
+    FFUP -->|有追问| AWAITF
+    FFUP -->|没得问| EXT
+    AWAITF --> ANA
+    PFR --> RW
+    FIN --> END
+
+    REV -.->|"从 evidence_gate 之后的 checkpoint 分叉<br/>证据包复用 只重出卡"| REC
+
+    %% ================= 样式 =================
+    classDef io fill:#ffffff,stroke:#333333,stroke-width:2px
+    classDef entry fill:#e8eef7,stroke:#4a6fa5
+    classDef mem fill:#f0e6f7,stroke:#7a5ea8
+    classDef chat fill:#e6f4ea,stroke:#3f7f52
+    classDef retr fill:#fdf0e0,stroke:#b5762f
+    classDef gen fill:#fbe9e9,stroke:#b04a4a
+    classDef persist fill:#eef1f5,stroke:#5b6b7c
+    classDef fb fill:#fdfbe6,stroke:#9a8f3a
+    classDef rev fill:#efe6f7,stroke:#6a4a9a
+    classDef interrupt fill:#fff4e6,stroke:#d97706,stroke-width:3px
+
+    class START,END io
+    class CONS entry
+    class EXT,MRG,CMT mem
+    class LOAD,PARSE,CHK,FUP chat
+    class RW,RET,RER,PEB,GATE,EFUP retr
+    class REC,LIM,ADJ,SAFE,RENDER gen
+    class PCP,CPS persist
+    class CAP,LFC,ANA,NS,FFUP,PFR,FIN fb
+    class REV rev
+    class AWAIT,PRES,AWAITF interrupt
